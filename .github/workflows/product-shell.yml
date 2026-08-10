@@ -1,0 +1,102 @@
+name: Product shell CI
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shell-macos-arm64:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Check out pinned JUCE only
+        run: git submodule update --init --depth 1 extern/JUCE
+      - name: Configure product shell
+        run: >-
+          cmake -S . -B build -G "Unix Makefiles"
+          -DCMAKE_BUILD_TYPE=Release
+          -DPROPHECY_USE_FAKE_ENGINE=ON
+          -DPROPHECY_COPY_PLUGIN_AFTER_BUILD=OFF
+          -DBUILD_TESTING=OFF
+      - name: Build AU, VST3, standalone, and artifact host
+        run: >-
+          cmake --build build --parallel 4 --target
+          ProphecyPlugin_AU
+          ProphecyPlugin_VST3
+          ProphecyPlugin_Standalone
+          ProphecyArtifactHost
+      - name: Verify native arm64 products
+        run: |
+          for binary in \
+            build/ProphecyPlugin_artefacts/Release/AU/Profligacy.component/Contents/MacOS/Profligacy \
+            build/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3/Contents/MacOS/Profligacy \
+            build/ProphecyPlugin_artefacts/Release/Standalone/Profligacy.app/Contents/MacOS/Profligacy
+          do
+            test "$(lipo -archs "$binary")" = arm64
+          done
+      - name: Load and process the packaged VST3 without ROMs
+        env:
+          PROPHECY_FORCE_NO_ROM: "1"
+        run: >-
+          build/ProphecyArtifactHost_artefacts/Release/ProphecyArtifactHost
+          --plugin build/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3
+          --receipt "$RUNNER_TEMP/product-shell-macos-arm64.json"
+          --wav "$RUNNER_TEMP/product-shell-macos-arm64.wav"
+          --seconds 1
+      - name: Run MAME-independent publication checks
+        run: >-
+          python3 -B -m unittest
+          scripts/test_build_ci_probe_roms.py
+          scripts/test_product_identity.py
+          scripts/test_release_licensing.py
+          scripts/test_run_ci_rom_e2e.py
+
+  shell-windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Check out pinned JUCE only
+        run: git submodule update --init --depth 1 extern/JUCE
+      - name: Install pinned WebView2 SDK
+        shell: pwsh
+        run: >-
+          nuget install Microsoft.Web.WebView2
+          -Version 1.0.3485.44
+          -OutputDirectory "$env:RUNNER_TEMP/nuget"
+          -NonInteractive
+      - name: Configure product shell
+        run: >-
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DPROPHECY_USE_FAKE_ENGINE=ON
+          -DPROPHECY_COPY_PLUGIN_AFTER_BUILD=OFF
+          -DBUILD_TESTING=OFF
+          -DJUCE_WEBVIEW2_PACKAGE_LOCATION="$env:RUNNER_TEMP/nuget"
+      - name: Build VST3, standalone, and artifact host
+        run: >-
+          cmake --build build --config Release --parallel 4 --target
+          ProphecyPlugin_VST3
+          ProphecyPlugin_Standalone
+          ProphecyArtifactHost
+      - name: Load and process the packaged VST3 without ROMs
+        shell: pwsh
+        run: |
+          $env:PROPHECY_FORCE_NO_ROM = '1'
+          & build\ProphecyArtifactHost_artefacts\Release\ProphecyArtifactHost.exe `
+            --plugin build\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
+            --receipt "$env:RUNNER_TEMP\product-shell-windows-x64.json" `
+            --wav "$env:RUNNER_TEMP\product-shell-windows-x64.wav" `
+            --seconds 1
+          if ($LASTEXITCODE -ne 0) { throw "artifact host exited $LASTEXITCODE" }
+      - name: Run clean-room ROM and receipt unit tests
+        run: >-
+          python -B -m unittest
+          scripts/test_build_ci_probe_roms.py
+          scripts/test_run_ci_rom_e2e.py

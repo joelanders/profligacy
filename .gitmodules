@@ -1,0 +1,6 @@
+[submodule "extern/mame"]
+	path = extern/mame
+	url = https://github.com/joelanders/mame-profligacy.git
+[submodule "extern/JUCE"]
+	path = extern/JUCE
+	url = https://github.com/juce-framework/JUCE.git

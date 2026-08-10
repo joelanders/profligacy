@@ -1,0 +1,31 @@
+# build artifacts
+/build/
+/build-cmake/
+/build-clean-package/
+/build-real/
+/console_host
+/console_host-*
+/lifecycle_host*
+*.o
+__pycache__/
+*.py[cod]
+
+# captured audio
+*.wav
+
+# MAME runtime dirs (created next to the binary at run time)
+/cfg/
+/snap/
+/nvram/
+/sta/
+
+# macOS
+.DS_Store
+
+# MAME -log output
+/error.log
+editor_shots/
+
+# Untracked, machine-produced release receipts.  Each receipt is bound to the
+# exact Git tree and dependency gitlinks by scripts/release_preflight.py.
+/.release-evidence/

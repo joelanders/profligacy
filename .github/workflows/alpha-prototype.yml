@@ -1,0 +1,334 @@
+name: Alpha release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Release target to build
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - macos-arm64
+          - windows-x64
+
+concurrency:
+  group: alpha-release-${{ github.ref }}-${{ inputs.target }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MAME_SHA: 8bd6d492fbb40c9a8a4c6e59961bed0238f3b501
+
+jobs:
+  macos-arm64:
+    name: release-macos-arm64
+    if: inputs.target == 'both' || inputs.target == 'macos-arm64'
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Check out pinned dependencies
+        run: |
+          git submodule update --init --depth 1 extern/JUCE
+          git submodule update --init --depth 1 extern/mame
+          test "$(git -C extern/mame rev-parse HEAD)" = "$MAME_SHA"
+      - name: Build pinned static SDL2
+        run: |
+          archive="$RUNNER_TEMP/SDL2-2.32.10.tar.gz"
+          prefix="$RUNNER_TEMP/sdl2-2.32.10"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz
+          echo '5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165  '"$archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          cmake -S "$RUNNER_TEMP/SDL2-2.32.10" -B "$RUNNER_TEMP/sdl2-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$prefix" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DSDL_SHARED=OFF \
+            -DSDL_STATIC=ON \
+            -DSDL_TEST=OFF
+          cmake --build "$RUNNER_TEMP/sdl2-build" --parallel 4 --target install
+          test -f "$prefix/lib/libSDL2.a"
+          PKG_CONFIG_PATH="$prefix/lib/pkgconfig" pkg-config --exact-version 2.32.10 sdl2
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: Restore pinned MAME SDK cache
+        id: mame-sdk-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ runner.temp }}/mame-sdk-macos-arm64.zip
+          key: profligacy-mame-sdk-v2-macos-15-apple-clang-sdl2-2.32.10-${{ env.MAME_SHA }}
+      - name: Build focused native MAME archives
+        if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
+        env:
+          JOBS: "4"
+        run: >-
+          scripts/build_mame_core.sh --regen
+          SDL_INSTALL_ROOT="$RUNNER_TEMP/sdl2-2.32.10"
+      - name: Package the MAME SDK
+        if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          python3 scripts/mame_sdk.py pack \
+            --platform macos-arm64 \
+            --mame-dir extern/mame \
+            --output "$RUNNER_TEMP/mame-sdk-macos-arm64.zip" \
+            --metadata runner=macos-15 \
+            --metadata toolchain=apple-clang
+      - name: Save pinned MAME SDK cache
+        if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/mame-sdk-macos-arm64.zip
+          key: ${{ steps.mame-sdk-cache.outputs.cache-primary-key }}
+      - name: Remove the full build and restore only the MAME SDK
+        run: |
+          if test -d extern/mame/build; then
+            mv extern/mame/build "$RUNNER_TEMP/mame-build-full"
+          fi
+          python3 scripts/mame_sdk.py extract \
+            --platform macos-arm64 \
+            --mame-dir extern/mame \
+            --archive "$RUNNER_TEMP/mame-sdk-macos-arm64.zip"
+          if test -d "$RUNNER_TEMP/mame-build-full"; then
+            cmake -E remove_directory "$RUNNER_TEMP/mame-build-full"
+          fi
+      - name: Configure the real product
+        run: >-
+          cmake -S . -B build-prototype -G "Unix Makefiles"
+          -DCMAKE_BUILD_TYPE=Release
+          -DPROPHECY_USE_FAKE_ENGINE=OFF
+          -DPROPHECY_COPY_PLUGIN_AFTER_BUILD=OFF
+          -DBUILD_TESTING=ON
+          -DSDL_PREFIX="$RUNNER_TEMP/sdl2-2.32.10"
+      - name: Build real AU, VST3, standalone, tests, and artifact host
+        run: >-
+          cmake --build build-prototype --parallel 4 --target
+          ProphecyPlugin_AU
+          ProphecyPlugin_VST3
+          ProphecyPlugin_Standalone
+          ProphecyArtifactHost
+          ProphecyPluginRtSafetyTest
+          ProphecyMultiInstanceContractTest
+      - name: Run no-ROM product and publication gates
+        env:
+          PROPHECY_FORCE_NO_ROM: "1"
+        run: |
+          ctest --test-dir build-prototype --output-on-failure \
+            -R '^(mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing)$'
+          build-prototype/ProphecyArtifactHost_artefacts/Release/ProphecyArtifactHost \
+            --plugin build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 \
+            --receipt "$RUNNER_TEMP/real-engine-macos-arm64.json" \
+            --wav "$RUNNER_TEMP/real-engine-macos-arm64.wav" \
+            --seconds 1
+      - name: Run clean-room three-DSP packaged E2E
+        run: >-
+          python3 -B scripts/run_ci_rom_e2e.py
+          --artifact-host build-prototype/ProphecyArtifactHost_artefacts/Release/ProphecyArtifactHost
+          --plugin build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3
+          --work "$RUNNER_TEMP/clean-room-three-dsp"
+          --seconds 6
+          --require-jit-telemetry
+      - name: Verify native and ad-hoc-signed products
+        run: |
+          for bundle in \
+            build-prototype/ProphecyPlugin_artefacts/Release/AU/Profligacy.component \
+            build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 \
+            build-prototype/ProphecyPlugin_artefacts/Release/Standalone/Profligacy.app
+          do
+            binary="$bundle/Contents/MacOS/Profligacy"
+            test "$(lipo -archs "$binary")" = arm64
+            codesign --verify --deep --strict "$bundle"
+          done
+      - name: Package macOS alpha ZIP
+        run: |
+          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.1-macOS-arm64"
+          mkdir -p "$package"
+          ditto build-prototype/ProphecyPlugin_artefacts/Release/AU/Profligacy.component "$package/Profligacy.component"
+          ditto build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 "$package/Profligacy.vst3"
+          ditto build-prototype/ProphecyPlugin_artefacts/Release/Standalone/Profligacy.app "$package/Profligacy.app"
+          cp release/GITHUB_ALPHA_RELEASE_NOTES.md "$package/README.md"
+          ditto -c -k --sequesterRsrc --keepParent "$package" "$package.zip"
+          (cd "$RUNNER_TEMP" && shasum -a 256 "$(basename "$package.zip")") > "$package.zip.sha256"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Profligacy-1.0.0-alpha.1-macOS-arm64-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.1-macOS-arm64.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.1-macOS-arm64.zip.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  windows-x64:
+    name: release-windows-x64
+    if: inputs.target == 'both' || inputs.target == 'windows-x64'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Set up native Windows/ClangCL environment
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+      - name: Restore pinned MAME SDK cache
+        id: mame-sdk-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ runner.temp }}/mame-sdk-windows-x64-clangcl.zip
+          key: profligacy-mame-sdk-v1-windows-2022-vs2022-clangcl-${{ env.MAME_SHA }}
+      - name: Set up MAME project-generation environment
+        if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
+        uses: msys2/setup-msys2@v2.32.0
+        with:
+          msystem: UCRT64
+          install: git make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-python
+      - name: Check out pinned dependencies
+        shell: pwsh
+        run: |
+          git submodule update --init --depth 1 extern/JUCE
+          git submodule update --init --depth 1 extern/mame
+          if ((git -C extern/mame rev-parse HEAD) -ne $env:MAME_SHA) { throw 'wrong MAME revision' }
+      - name: Generate focused native MAME VS2022 project
+        if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: >-
+          make -C extern/mame -j3 vs2022_clang
+          SUBTARGET=propmin
+          SOURCES=src/mame/korg/korgprophecy.cpp
+          OSD=windows
+          PRECOMPILE=0
+          USE_QTDEBUG=0
+          NOWERROR=1
+          IGNORE_GIT=1
+          PYTHON_EXECUTABLE=python
+      - name: Build focused native MAME archives
+        if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $project = 'extern\mame\build\projects\windows\mamepropmin\vs2022-clang\propmin.vcxproj'
+          if (-not (Test-Path -LiteralPath $project)) { throw "missing generated project $project" }
+          msbuild $project /t:Build /p:Configuration=Release /p:Platform=x64 /m:4
+          if ($LASTEXITCODE -ne 0) { throw "MAME MSBuild exited $LASTEXITCODE" }
+          $bin = 'extern\mame\build\vs2022\bin\x64\Release'
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          $rev = git -C extern/mame rev-parse HEAD
+          [IO.File]::WriteAllText((Join-Path $bin '.prophecy_build_rev'), $rev, [Text.Encoding]::ASCII)
+      - name: Package the MAME SDK
+        if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:RUNNER_TEMP 'mame-sdk-windows-x64-clangcl.zip'
+          python scripts/mame_sdk.py pack `
+            --platform windows-x64-clangcl `
+            --mame-dir extern/mame `
+            --output $sdk `
+            --metadata runner=windows-2022 `
+            --metadata toolchain=vs2022-clangcl
+      - name: Save pinned MAME SDK cache
+        if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/mame-sdk-windows-x64-clangcl.zip
+          key: ${{ steps.mame-sdk-cache.outputs.cache-primary-key }}
+      - name: Remove the full build and restore only the MAME SDK
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:RUNNER_TEMP 'mame-sdk-windows-x64-clangcl.zip'
+          $full = Join-Path $env:RUNNER_TEMP 'mame-build-full'
+          if (Test-Path -LiteralPath extern\mame\build) {
+            Move-Item -LiteralPath extern\mame\build -Destination $full
+          }
+          python scripts/mame_sdk.py extract `
+            --platform windows-x64-clangcl `
+            --mame-dir extern/mame `
+            --archive $sdk
+          if ($LASTEXITCODE -ne 0) { throw "MAME SDK extraction exited $LASTEXITCODE" }
+          if (Test-Path -LiteralPath $full) {
+            Remove-Item -LiteralPath $full -Recurse -Force
+          }
+      - name: Install pinned WebView2 SDK
+        shell: pwsh
+        run: >-
+          nuget install Microsoft.Web.WebView2
+          -Version 1.0.3485.44
+          -OutputDirectory "$env:RUNNER_TEMP/nuget"
+          -NonInteractive
+      - name: Configure the real product
+        shell: pwsh
+        run: >-
+          cmake -S . -B build-prototype -G "Visual Studio 17 2022" -A x64 -T ClangCL
+          -DPROPHECY_USE_FAKE_ENGINE=OFF
+          -DPROPHECY_COPY_PLUGIN_AFTER_BUILD=OFF
+          -DBUILD_TESTING=ON
+          -DJUCE_WEBVIEW2_PACKAGE_LOCATION="$env:RUNNER_TEMP/nuget"
+      - name: Build real VST3, standalone, tests, and artifact host
+        shell: pwsh
+        run: |
+          cmake --build build-prototype --config Release --parallel 4 --target `
+            ProphecyMultiInstanceContractTest `
+            ProphecyPluginRtSafetyTest
+          if ($LASTEXITCODE -ne 0) { throw "contract-test build exited $LASTEXITCODE" }
+          cmake --build build-prototype --config Release --parallel 4 --target `
+            ProphecyPlugin_VST3 `
+            ProphecyPlugin_Standalone `
+            ProphecyArtifactHost
+          if ($LASTEXITCODE -ne 0) { throw "product build exited $LASTEXITCODE" }
+      - name: Run no-ROM product and publication gates
+        shell: pwsh
+        run: |
+          $env:PROPHECY_FORCE_NO_ROM = '1'
+          ctest --test-dir build-prototype -C Release --output-on-failure `
+            -R '^(mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing)$'
+          if ($LASTEXITCODE -ne 0) { throw "CTest exited $LASTEXITCODE" }
+          & build-prototype\ProphecyArtifactHost_artefacts\Release\ProphecyArtifactHost.exe `
+            --plugin build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
+            --receipt "$env:RUNNER_TEMP\real-engine-windows-x64.json" `
+            --wav "$env:RUNNER_TEMP\real-engine-windows-x64.wav" `
+            --seconds 1
+          if ($LASTEXITCODE -ne 0) { throw "artifact host exited $LASTEXITCODE" }
+      - name: Run clean-room three-DSP packaged E2E
+        shell: pwsh
+        run: |
+          python -B scripts/run_ci_rom_e2e.py `
+            --artifact-host build-prototype\ProphecyArtifactHost_artefacts\Release\ProphecyArtifactHost.exe `
+            --plugin build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
+            --work "$env:RUNNER_TEMP\clean-room-three-dsp" `
+            --seconds 6
+          if ($LASTEXITCODE -ne 0) { throw "clean-room E2E exited $LASTEXITCODE" }
+      - name: Upload Windows E2E diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-e2e-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}\clean-room-three-dsp
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Package Windows alpha ZIP
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.1-Windows-x64-experimental'
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+          Copy-Item -Recurse -LiteralPath `
+            build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
+            -Destination (Join-Path $package 'Profligacy.vst3')
+          Copy-Item -LiteralPath `
+            build-prototype\ProphecyPlugin_artefacts\Release\Standalone\Profligacy.exe `
+            -Destination $package
+          Copy-Item -LiteralPath release\GITHUB_ALPHA_RELEASE_NOTES.md -Destination (Join-Path $package 'README.md')
+          $zip = "$package.zip"
+          Compress-Archive -Path "$package\*" -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -Encoding ascii -NoNewline "$zip.sha256"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Profligacy-1.0.0-alpha.1-Windows-x64-experimental-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.1-Windows-x64-experimental.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.1-Windows-x64-experimental.zip.sha256
+          retention-days: 7
+          if-no-files-found: error

@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "channel": "public-github-alpha",
+  "supported_target": "native arm64, macOS 15.0 or later",
+  "distribution_warning": "Public alpha bundles are ad-hoc signed and claim neither Developer ID identity nor Apple notarization; Gatekeeper quarantine removal may be required after checksum verification",
+  "fresh_root": {
+    "author_email": "joe@joelanders.net",
+    "forbidden_tracked_paths": [
+      "HANDOVER.md",
+      "notes"
+    ]
+  },
+  "accepted_source_ref": "e12defda81135fa1a397c960e861be999b317fd9",
+  "shipping_paths": [
+    "CMakeLists.txt",
+    "README.md",
+    "entitlements",
+    "src",
+    "scripts"
+  ],
+  "dependencies": {
+    "extern/JUCE": "2cdfca8feb300fb424002ba2c2751569e5bacb64",
+    "extern/mame": "8bd6d492fbb40c9a8a4c6e59961bed0238f3b501"
+  },
+  "mandatory_ctests": [
+    "alpha_release_policy",
+    "correctness_checkpoint",
+    "multi_instance_contract",
+    "plugin_rt_safety",
+    "product_identity",
+    "editor_asset_provenance",
+    "generate_au_link_license_ledger",
+    "grade_arp_hardware_capture",
+    "promote_arm64_dynarec_receipt",
+    "release_preflight",
+    "release_licensing",
+    "run_arp_timing_suite",
+    "run_control_abba_repeatability",
+    "run_clean_mame_performance_equivalence",
+    "run_threaded_pf4_cmem_equivalence"
+  ],
+  "forbidden_tracked_text": [
+    "const GLYPHS",
+    "full HD44780 A00 ROM",
+    "HD44780 A00 glyph ROM"
+  ],
+  "asset_scan_paths": [
+    "src"
+  ],
+  "forbidden_submodule_url_fragments": [
+    "git@",
+    "github.com:Joe-Landers",
+    "/Users/"
+  ],
+  "required_evidence": [
+    "dsp_hardware_corpus_554",
+    "arm64_dynarec_interpreter_equivalence",
+    "editor_asset_provenance",
+    "multi_instance_contract",
+    "plugin_rt_safety",
+    "editor_repeated_10x45",
+    "control_abba_repeatability",
+    "pcm_matrix",
+    "midi_matrix",
+    "engine_lifecycle",
+    "clean_mame_performance",
+    "au_link_license_ledger",
+    "license_resolution",
+    "bundle_signature_dependencies",
+    "pluginval_au",
+    "pluginval_vst3",
+    "auval",
+    "daw_smoke",
+    "source_archive_provenance",
+    "sbom_and_notices"
+  ]
+}

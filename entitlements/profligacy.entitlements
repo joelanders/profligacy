@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The TMS57002 arm64 dynarec emits code at runtime (asmjit, MAP_JIT).
+	     Without this, a hardened-runtime (notarizable) build SIGKILLs on the
+	     first JIT compile. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<!-- The Standalone links the homebrew SDL2 dylib (ad-hoc, different team).
+	     Hardened-runtime library validation rejects it without this (dyld:
+	     "different Team IDs"), killing the app at launch. Bundling+re-signing
+	     SDL2 inside the .app is the eventual distribution fix. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>
