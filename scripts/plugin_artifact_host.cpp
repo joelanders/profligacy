@@ -177,6 +177,7 @@ int main(int argc, char **argv)
 		window.setUsingNativeTitleBar(false);
 		window.setContentNonOwned(editor.get(), true);
 		window.centreWithSize(editor->getWidth(), editor->getHeight());
+		window.addToDesktop();
 		window.setVisible(true);
 
 		EditorReadinessWaiter waiter;
