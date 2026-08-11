@@ -315,6 +315,39 @@ jobs:
             --require-editor `
             --seconds 1
           if ($LASTEXITCODE -ne 0) { throw "artifact host exited $LASTEXITCODE" }
+      - name: Open the standalone editor through WebView2
+        shell: pwsh
+        run: |
+          $marker = Join-Path $env:RUNNER_TEMP 'profligacy-standalone-editor-ready.txt'
+          Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+          $env:PROPHECY_FORCE_NO_ROM = '1'
+          $env:PROFLIGACY_EDITOR_SMOKE = '1'
+          $env:PROFLIGACY_EDITOR_SMOKE_RECEIPT = $marker
+          $standalone = Start-Process -FilePath 'build-prototype\ProphecyPlugin_artefacts\Release\Standalone\Profligacy.exe' -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(20)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $marker)) {
+              if ($standalone.HasExited) {
+                throw "standalone exited before its editor became ready (exit $($standalone.ExitCode))"
+              }
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not (Test-Path -LiteralPath $marker)) {
+              throw 'standalone editor did not load its embedded page and native bridge within 20 seconds'
+            }
+            $receipt = (Get-Content -LiteralPath $marker -Raw).Trim()
+            if ($receipt -ne 'profligacy-editor-v1') {
+              throw "unexpected standalone editor receipt: $receipt"
+            }
+            Write-Host 'standalone editor_ready=true'
+          }
+          finally {
+            if (-not $standalone.HasExited) {
+              Stop-Process -Id $standalone.Id -Force
+              $standalone.WaitForExit()
+            }
+            Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+          }
       - name: Run clean-room three-DSP packaged E2E
         shell: pwsh
         run: |
