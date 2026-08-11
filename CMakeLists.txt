@@ -395,9 +395,10 @@ juce_add_binary_data(ProphecyData SOURCES
 target_compile_definitions(ProphecyPlugin PRIVATE
 	JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
 if(WIN32)
-	# Production Windows editor: use the Chromium WebView2 backend rather than
-	# JUCE's legacy IE fallback. The runtime is supplied by Windows/WebView2.
-	target_compile_definitions(ProphecyPlugin PRIVATE JUCE_USE_WIN_WEBVIEW2=1)
+	# NEEDS_WEBVIEW2 links WebView2LoaderStatic.lib. Select the matching JUCE
+	# implementation; the editor options below explicitly select this backend.
+	target_compile_definitions(ProphecyPlugin PRIVATE
+		JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
 endif()
 
 target_link_libraries(ProphecyPlugin
@@ -420,7 +421,9 @@ target_compile_definitions(ProphecyPluginTimingHost PRIVATE
 	JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
 target_link_libraries(ProphecyPluginTimingHost PRIVATE ProphecyPlugin)
 if(WIN32)
-	target_compile_definitions(ProphecyPluginTimingHost PRIVATE JUCE_USE_WIN_WEBVIEW2=1)
+	target_compile_definitions(ProphecyPluginTimingHost PRIVATE
+		JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
+	target_link_libraries(ProphecyPluginTimingHost PRIVATE juce::juce_webview2)
 endif()
 
 # Fast no-ROM regression test for processBlock's release-critical real-time contract:
@@ -433,7 +436,9 @@ target_compile_definitions(ProphecyPluginRtSafetyTest PRIVATE
 	JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
 target_link_libraries(ProphecyPluginRtSafetyTest PRIVATE ProphecyPlugin)
 if(WIN32)
-	target_compile_definitions(ProphecyPluginRtSafetyTest PRIVATE JUCE_USE_WIN_WEBVIEW2=1)
+	target_compile_definitions(ProphecyPluginRtSafetyTest PRIVATE
+		JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
+	target_link_libraries(ProphecyPluginRtSafetyTest PRIVATE juce::juce_webview2)
 endif()
 if(BUILD_TESTING)
 	add_test(NAME plugin_rt_safety COMMAND $<TARGET_FILE:ProphecyPluginRtSafetyTest>)

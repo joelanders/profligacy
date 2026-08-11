@@ -24,8 +24,10 @@ struct Options
 	juce::String stateOut;
 	double sampleRate = 48000.0;
 	double seconds = 18.0;
+	double editorTimeoutSeconds = 15.0;
 	int blockSize = 256;
 	bool requireAudio = false;
+	bool requireEditor = false;
 	bool realtime = false;
 };
 
@@ -42,12 +44,15 @@ bool parseOptions(int argc, char **argv, Options &o)
 		else if (arg == "--rate" && i + 1 < argc) o.sampleRate = std::atof(argv[++i]);
 		else if (arg == "--block" && i + 1 < argc) o.blockSize = std::atoi(argv[++i]);
 		else if (arg == "--seconds" && i + 1 < argc) o.seconds = std::atof(argv[++i]);
+		else if (arg == "--editor-timeout" && i + 1 < argc) o.editorTimeoutSeconds = std::atof(argv[++i]);
 		else if (arg == "--require-audio") o.requireAudio = true;
+		else if (arg == "--require-editor") o.requireEditor = true;
 		else if (arg == "--realtime") o.realtime = true;
 		else return false;
 	}
 	return o.plugin.isNotEmpty() && o.receipt.isNotEmpty() && o.wav.isNotEmpty()
-		&& o.sampleRate >= 8000.0 && o.blockSize > 0 && o.seconds >= 1.0;
+		&& o.sampleRate >= 8000.0 && o.blockSize > 0 && o.seconds >= 1.0
+		&& o.editorTimeoutSeconds >= 1.0;
 }
 
 int fail(const juce::String &message)
@@ -71,6 +76,40 @@ juce::MemoryBlock unwrapVst3ComponentState(const juce::MemoryBlock &hostState)
 	return hostState;
 }
 
+class EditorReadinessWaiter final : private juce::Timer
+{
+public:
+	bool wait(const juce::File &markerToWatch, double timeoutSeconds)
+	{
+		marker = markerToWatch;
+		deadline = juce::Time::getMillisecondCounterHiRes() + timeoutSeconds * 1000.0;
+		startTimer(20);
+		juce::MessageManager::getInstance()->runDispatchLoop();
+		stopTimer();
+		return ready;
+	}
+
+private:
+	void timerCallback() override
+	{
+		const double now = juce::Time::getMillisecondCounterHiRes();
+		if (!ready && marker.loadFileAsString().trim() == "profligacy-editor-v1")
+		{
+			ready = true;
+			readyAt = now;
+		}
+		// Let the WebView message queue settle before the host destroys the editor
+		// that owns the bridge.
+		if ((ready && now - readyAt >= 500.0) || now >= deadline)
+			juce::MessageManager::getInstance()->stopDispatchLoop();
+	}
+
+	juce::File marker;
+	double deadline = 0.0;
+	double readyAt = 0.0;
+	bool ready = false;
+};
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -78,8 +117,21 @@ int main(int argc, char **argv)
 	Options options;
 	if (!parseOptions(argc, argv, options))
 		return fail("usage: --plugin PATH --receipt FILE --wav FILE [--rate HZ] "
-			"[--block N] [--seconds N] [--require-audio] [--realtime] "
+			"[--block N] [--seconds N] [--require-audio] [--require-editor] "
+			"[--editor-timeout N] [--realtime] "
 			"[--expect-state-marker TEXT] [--state-out FILE]");
+	const juce::File editorReadyMarker(options.receipt + ".editor-ready");
+	if (options.requireEditor)
+	{
+		editorReadyMarker.deleteFile();
+	#if JUCE_WINDOWS
+		_putenv_s("PROFLIGACY_EDITOR_SMOKE", "1");
+		_putenv_s("PROFLIGACY_EDITOR_SMOKE_RECEIPT", editorReadyMarker.getFullPathName().toRawUTF8());
+	#else
+		setenv("PROFLIGACY_EDITOR_SMOKE", "1", 1);
+		setenv("PROFLIGACY_EDITOR_SMOKE_RECEIPT", editorReadyMarker.getFullPathName().toRawUTF8(), 1);
+	#endif
+	}
 
 	juce::ScopedJuceInitialiser_GUI juceInitialiser;
 	juce::AudioPluginFormatManager formats;
@@ -112,6 +164,31 @@ int main(int argc, char **argv)
 			+ " outputs=" + juce::String(outputChannels));
 	if (!instance->acceptsMidi())
 		return fail("plug-in instance does not accept MIDI");
+
+	bool editorReady = false;
+	if (options.requireEditor)
+	{
+		std::unique_ptr<juce::AudioProcessorEditor> editor(instance->createEditorAndMakeActive());
+		if (editor == nullptr)
+			return fail("plug-in did not create an editor");
+
+		juce::DocumentWindow window("Profligacy packaged editor smoke",
+			juce::Colours::black, juce::DocumentWindow::closeButton, false);
+		window.setUsingNativeTitleBar(false);
+		window.setContentNonOwned(editor.get(), true);
+		window.centreWithSize(editor->getWidth(), editor->getHeight());
+		window.setVisible(true);
+
+		EditorReadinessWaiter waiter;
+		editorReady = waiter.wait(editorReadyMarker, options.editorTimeoutSeconds);
+
+		window.setVisible(false);
+		window.clearContentComponent();
+		editorReadyMarker.deleteFile();
+		if (!editorReady)
+			return fail("packaged editor did not load its embedded page and native bridge within "
+				+ juce::String(options.editorTimeoutSeconds, 1) + " seconds");
+	}
 
 	juce::MemoryBlock state;
 	instance->getStateInformation(state);
@@ -210,7 +287,8 @@ int main(int argc, char **argv)
 
 	juce::DynamicObject::Ptr receiptObject = new juce::DynamicObject();
 	receiptObject->setProperty("schema", "profligacy-artifact-host-v1");
-	receiptObject->setProperty("success", identityOk && audioOk && stateMarkerOk);
+	receiptObject->setProperty("success", identityOk && audioOk && stateMarkerOk
+		&& (!options.requireEditor || editorReady));
 	receiptObject->setProperty("plugin_path", options.plugin);
 	receiptObject->setProperty("name", description.name);
 	receiptObject->setProperty("manufacturer", description.manufacturerName);
@@ -231,6 +309,9 @@ int main(int argc, char **argv)
 	receiptObject->setProperty("peak", (double)peak);
 	receiptObject->setProperty("rms", rms);
 	receiptObject->setProperty("audio_required", options.requireAudio);
+	receiptObject->setProperty("editor_required", options.requireEditor);
+	receiptObject->setProperty("editor_ready", editorReady);
+	receiptObject->setProperty("editor_timeout_seconds", options.editorTimeoutSeconds);
 	receiptObject->setProperty("final_state_bytes", (juce::int64)finalState.getSize());
 	receiptObject->setProperty("component_state_bytes", (juce::int64)componentState.getSize());
 	receiptObject->setProperty("expected_state_marker", options.expectStateMarker);
@@ -246,5 +327,6 @@ int main(int argc, char **argv)
 	if (!stateMarkerOk)
 		std::fprintf(stderr, "artifact host: expected state marker '%s' was absent\n",
 			options.expectStateMarker.toRawUTF8());
-	return identityOk && audioOk && stateMarkerOk ? 0 : 1;
+	return identityOk && audioOk && stateMarkerOk
+		&& (!options.requireEditor || editorReady) ? 0 : 1;
 }

@@ -753,6 +753,8 @@ class ProphecyEditor : public juce::AudioProcessorEditor, private juce::Timer
 public:
 	explicit ProphecyEditor(ProphecyAudioProcessor &p) : AudioProcessorEditor(p), m_proc(p)
 	{
+		if (std::getenv("PROFLIGACY_EDITOR_SMOKE") != nullptr)
+			std::fprintf(stderr, "[editor-smoke] editor created; waiting for embedded page bridge\n");
 		if (std::getenv("PROFLIGACY_DIAGNOSTICS") != nullptr)
 		{
 			m_diag.reset(juce::FileLogger::createDateStampedLogger(
@@ -787,6 +789,16 @@ public:
 	void resized() override { m_web.setBounds(getLocalBounds()); }
 
 private:
+	#if JUCE_WINDOWS
+	static juce::File webView2UserDataFolder()
+	{
+		const auto host = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+			.getFileNameWithoutExtension();
+		return juce::File::getSpecialLocation(juce::File::tempDirectory)
+			.getChildFile("Profligacy-WebView2").getChildFile(host);
+	}
+	#endif
+
 	void diag(const juce::String &message)
 	{
 		if (m_diag == nullptr) return;
@@ -835,26 +847,41 @@ private:
 
 	static std::optional<juce::WebBrowserComponent::Resource> provide(const juce::String &url)
 	{
-		if (url == "/" || url == "/index.html")
+		const bool smoke = std::getenv("PROFLIGACY_EDITOR_SMOKE") != nullptr;
+		if (smoke)
+			std::fprintf(stderr, "[editor-smoke] resource request: %s\n", url.toRawUTF8());
+		if (smoke && url == "/")
+		{
+			static constexpr char smokeHtml[] = R"html(<!doctype html><html><body><script>
+window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('profligacyEditorReadyV1', {
+  token: 'profligacy-editor-v1', rowCount: 1425, canvasPixels: 1
+}));
+</script></body></html>)html";
+			const auto *data = reinterpret_cast<const std::byte *>(smokeHtml);
+			return juce::WebBrowserComponent::Resource{
+				std::vector<std::byte>(data, data + sizeof(smokeHtml) - 1), juce::String("text/html") };
+		}
+		const auto path = url.upToFirstOccurrenceOf("?", false, false);
+		if (path == "/" || path == "/index.html")
 		{
 			const auto *d = reinterpret_cast<const std::byte *>(BinaryData::index_html);
 			return juce::WebBrowserComponent::Resource{
 				std::vector<std::byte>(d, d + (size_t) BinaryData::index_htmlSize), juce::String("text/html") };
 		}
-		if (url == "/assets/NotoSans-Bold.ttf")
+		if (path == "/assets/NotoSans-Bold.ttf")
 		{
 			const auto *d = reinterpret_cast<const std::byte *>(BinaryData::NotoSansBold_ttf);
 			return juce::WebBrowserComponent::Resource{
 				std::vector<std::byte>(d, d + (size_t) BinaryData::NotoSansBold_ttfSize), juce::String("font/ttf") };
 		}
-		if (url == "/assets/hd44780-a00-glyphs.bin")
+		if (path == "/assets/hd44780-a00-glyphs.bin")
 		{
 			std::vector<std::byte> rows(ProphecyEngine::kLcdA00GlyphRowBytes);
 			ProphecyEngine::lcdA00GlyphRows(reinterpret_cast<std::uint8_t *>(rows.data()));
 			return juce::WebBrowserComponent::Resource{
 				std::move(rows), juce::String("application/octet-stream") };
 		}
-		if (url == "/assets/deep_editor_manifest.js")
+		if (path == "/assets/deep_editor_manifest.js")
 		{
 			const auto *d = reinterpret_cast<const std::byte *>(BinaryData::deep_editor_manifest_js);
 			return juce::WebBrowserComponent::Resource{
@@ -869,10 +896,32 @@ private:
 	double m_diagStartMs = 0.0;
 	juce::WebBrowserComponent m_web {
 		juce::WebBrowserComponent::Options{}
+	#if JUCE_WINDOWS
+			.withBackend(juce::WebBrowserComponent::Options::Backend::webview2)
+			.withWinWebView2Options(
+				juce::WebBrowserComponent::Options::WinWebView2{}
+					.withUserDataFolder(webView2UserDataFolder()))
+	#endif
 			.withNativeIntegrationEnabled()
 	#if JUCE_WEB_BROWSER_RESOURCE_PROVIDER_AVAILABLE
 			.withResourceProvider([](const auto &url) { return provide(url); })
 	#endif
+			.withEventListener("profligacyEditorReadyV1",
+				[this](const juce::var &payload)
+				{
+					const auto *object = payload.getDynamicObject();
+					const bool ready = object != nullptr
+						&& object->getProperty("token").toString() == "profligacy-editor-v1"
+						&& (int)object->getProperty("rowCount") == 1425
+						&& (int)object->getProperty("canvasPixels") > 0;
+					if (std::getenv("PROFLIGACY_EDITOR_SMOKE") != nullptr)
+						std::fprintf(stderr, "[editor-smoke] bridge callback ready=%d\n", (int)ready);
+					diag("UI editorReady ready=" + juce::String((int)ready));
+					if (ready)
+						if (const char *path = std::getenv("PROFLIGACY_EDITOR_SMOKE_RECEIPT"))
+							(void)juce::File(juce::String::fromUTF8(path))
+								.replaceWithText("profligacy-editor-v1\n");
+				})
 			.withNativeFunction("selectPatch",
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
 				{

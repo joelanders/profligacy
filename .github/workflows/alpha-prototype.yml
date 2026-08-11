@@ -289,6 +289,7 @@ jobs:
             --plugin build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
             --receipt "$env:RUNNER_TEMP\real-engine-windows-x64.json" `
             --wav "$env:RUNNER_TEMP\real-engine-windows-x64.wav" `
+            --require-editor `
             --seconds 1
           if ($LASTEXITCODE -ne 0) { throw "artifact host exited $LASTEXITCODE" }
       - name: Run clean-room three-DSP packaged E2E

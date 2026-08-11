@@ -85,7 +85,7 @@ jobs:
           ProphecyPlugin_VST3
           ProphecyPlugin_Standalone
           ProphecyArtifactHost
-      - name: Load and process the packaged VST3 without ROMs
+      - name: Load, open, and process the packaged VST3 without ROMs
         shell: pwsh
         run: |
           $env:PROPHECY_FORCE_NO_ROM = '1'
@@ -93,6 +93,7 @@ jobs:
             --plugin build\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
             --receipt "$env:RUNNER_TEMP\product-shell-windows-x64.json" `
             --wav "$env:RUNNER_TEMP\product-shell-windows-x64.wav" `
+            --require-editor `
             --seconds 1
           if ($LASTEXITCODE -ne 0) { throw "artifact host exited $LASTEXITCODE" }
       - name: Run clean-room ROM and receipt unit tests
