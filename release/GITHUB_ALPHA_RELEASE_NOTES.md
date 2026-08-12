@@ -1,8 +1,16 @@
-# Profligacy 1.0.0 public alpha
+# Profligacy 1.0.0 alpha 2
 
 Profligacy is an independent AU, VST3, and standalone software instrument
 compatible with user-supplied Korg Prophecy firmware. It is not affiliated with
 or endorsed by Korg.
+
+## Changes in alpha 2
+
+- Fixed the Windows standalone and VST3 editors selecting JUCE's legacy browser
+  backend instead of Microsoft Edge WebView2, which could display a
+  "JUCE backend page was not found" error.
+- Added Windows release gates that open the packaged standalone and VST3
+  editors through WebView2 before a release candidate can pass.
 
 ## Supported systems
 
