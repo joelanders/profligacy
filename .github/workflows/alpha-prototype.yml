@@ -258,6 +258,29 @@ jobs:
           -Version 1.0.3485.44
           -OutputDirectory "$env:RUNNER_TEMP/nuget"
           -NonInteractive
+      - name: Ensure WebView2 Runtime is installed
+        shell: pwsh
+        run: |
+          $client = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $machineKey = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$client"
+          $userKey = "HKCU:\Software\Microsoft\EdgeUpdate\Clients\$client"
+          function Get-WebView2Version {
+            @(
+              (Get-ItemProperty -LiteralPath $machineKey -ErrorAction SilentlyContinue).pv
+              (Get-ItemProperty -LiteralPath $userKey -ErrorAction SilentlyContinue).pv
+            ) | Where-Object { $_ -and $_ -ne '0.0.0.0' } | Select-Object -First 1
+          }
+          $version = Get-WebView2Version
+          if (-not $version) {
+            $setup = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebview2Setup.exe'
+            Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $setup
+            $install = Start-Process -FilePath $setup -ArgumentList '/silent', '/install' -Wait -PassThru
+            if ($install.ExitCode -ne 0) { throw "WebView2 Runtime installer exited $($install.ExitCode)" }
+            $version = Get-WebView2Version
+          }
+          if (-not $version) { throw 'WebView2 Runtime is unavailable after installation' }
+          Write-Host "WebView2 Runtime $version"
+
       - name: Configure the real product
         shell: pwsh
         run: >-
@@ -289,8 +312,42 @@ jobs:
             --plugin build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
             --receipt "$env:RUNNER_TEMP\real-engine-windows-x64.json" `
             --wav "$env:RUNNER_TEMP\real-engine-windows-x64.wav" `
+            --require-editor `
             --seconds 1
           if ($LASTEXITCODE -ne 0) { throw "artifact host exited $LASTEXITCODE" }
+      - name: Open the standalone editor through WebView2
+        shell: pwsh
+        run: |
+          $marker = Join-Path $env:RUNNER_TEMP 'profligacy-standalone-editor-ready.txt'
+          Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+          $env:PROPHECY_FORCE_NO_ROM = '1'
+          $env:PROFLIGACY_EDITOR_SMOKE = '1'
+          $env:PROFLIGACY_EDITOR_SMOKE_RECEIPT = $marker
+          $standalone = Start-Process -FilePath 'build-prototype\ProphecyPlugin_artefacts\Release\Standalone\Profligacy.exe' -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(20)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $marker)) {
+              if ($standalone.HasExited) {
+                throw "standalone exited before its editor became ready (exit $($standalone.ExitCode))"
+              }
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not (Test-Path -LiteralPath $marker)) {
+              throw 'standalone editor did not load its embedded page and native bridge within 20 seconds'
+            }
+            $receipt = (Get-Content -LiteralPath $marker -Raw).Trim()
+            if ($receipt -ne 'profligacy-editor-v1') {
+              throw "unexpected standalone editor receipt: $receipt"
+            }
+            Write-Host 'standalone editor_ready=true'
+          }
+          finally {
+            if (-not $standalone.HasExited) {
+              Stop-Process -Id $standalone.Id -Force
+              $standalone.WaitForExit()
+            }
+            Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+          }
       - name: Run clean-room three-DSP packaged E2E
         shell: pwsh
         run: |
