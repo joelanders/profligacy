@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import unittest
 
 
@@ -41,6 +42,14 @@ class AlphaReleasePolicyTests(unittest.TestCase):
         self.assertIn("pluginval_vst3", alpha_evidence)
         self.assertIn("auval", alpha_evidence)
         self.assertIn("daw_smoke", alpha_evidence)
+
+    def test_release_workflow_uses_manifest_mame_revision(self) -> None:
+        alpha = json.loads((ROOT / "release/v1_alpha_preflight.json").read_text())
+        workflow = (ROOT / ".github/workflows/alpha-prototype.yml").read_text()
+        match = re.search(r"(?m)^\s*MAME_SHA:\s*([0-9a-f]{40})\s*$", workflow)
+
+        self.assertIsNotNone(match, "release workflow has no pinned 40-hex MAME_SHA")
+        self.assertEqual(alpha["dependencies"]["extern/mame"], match.group(1))
 
 
 if __name__ == "__main__":
