@@ -10,9 +10,11 @@ or endorsed by Korg.
   release test system this raised sustained whole-emulator throughput from
   about 1.50x to 1.98x real time; the portable interpreter remains available
   as a troubleshooting fallback.
-- Kept native DSP execution active while firmware coefficient updates are
-  pending. The focused coefficient-loading workload improved by about 40% on
-  Windows x64 and 41% on Apple Silicon, with no measurable steady-path penalty.
+- Kept native DSP execution active throughout firmware coefficient packet
+  upload and application. The focused coefficient-loading workload improved by
+  about 40% on Windows x64 and 41% on Apple Silicon, and removing the remaining
+  CLOAD-active fallback churn added about 4.4% in an Apple Silicon dense-control
+  core benchmark, with byte-identical audio.
 - Retained the alpha 2 WebView2 editor fix and its packaged Windows editor gates.
 
 ## Supported systems
