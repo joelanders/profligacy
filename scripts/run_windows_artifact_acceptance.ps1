@@ -108,7 +108,9 @@ if ($RomRoot) {
     $env:PROPHECY_FORCE_NO_ROM = $null
     $env:PROPHECY_ROMPATH = $RomRoot
     $env:PROPHECY_NVRAM = $NvramRoot
-    $env:KPROP_DSP_PERFRAME = '4'
+    # Validate the packaged product default rather than forcing a diagnostic mode.
+    $env:PROPHECY_DSP_ENGINE = $null
+    $env:KPROP_DSP_PERFRAME = $null
     New-Item -ItemType Directory -Path $NvramRoot -Force | Out-Null
     $romReceipt = Join-Path $receipts 'artifact-host-rom.json'
     $romWav = Join-Path $logs 'artifact-host-rom.wav'

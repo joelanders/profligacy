@@ -1,16 +1,19 @@
-# Profligacy 1.0.0 alpha 2
+# Profligacy 1.0.0 alpha 3
 
 Profligacy is an independent AU, VST3, and standalone software instrument
 compatible with user-supplied Korg Prophecy firmware. It is not affiliated with
 or endorsed by Korg.
 
-## Changes in alpha 2
+## Changes in alpha 3
 
-- Fixed the Windows standalone and VST3 editors selecting JUCE's legacy browser
-  backend instead of Microsoft Edge WebView2, which could display a
-  "JUCE backend page was not found" error.
-- Added Windows release gates that open the packaged standalone and VST3
-  editors through WebView2 before a release candidate can pass.
+- Enabled the repaired native TMS57002 JIT by default on Windows x64. On the
+  release test system this raised sustained whole-emulator throughput from
+  about 1.50x to 1.98x real time; the portable interpreter remains available
+  as a troubleshooting fallback.
+- Kept native DSP execution active while firmware coefficient updates are
+  pending. The focused coefficient-loading workload improved by about 40% on
+  Windows x64 and 41% on Apple Silicon, with no measurable steady-path penalty.
+- Retained the alpha 2 WebView2 editor fix and its packaged Windows editor gates.
 
 ## Supported systems
 
@@ -32,9 +35,11 @@ built-in folder picker to select a directory containing either:
 - `korgprop.zip`.
 
 The persistent default location is
-`~/Library/Application Support/Profligacy/roms`. The LCD character table is a
-license-clean datasheet reconstruction compiled into the public MAME dependency;
-no separate LCD ROM is required.
+`~/Library/Application Support/Profligacy/roms` on macOS and
+`%APPDATA%\Profligacy\roms` on Windows. These are per-user locations; no `C:\`
+path is hardcoded. The LCD character table is a license-clean datasheet
+reconstruction compiled into the public MAME dependency; no separate LCD ROM
+is required.
 
 ## Installation
 
@@ -74,15 +79,15 @@ an experimental preview and does not include an installer or code signature.
 - Intel Macs and macOS releases older than 15.0 are unsupported by this alpha.
 - Windows x64 is supplied as an unsigned experimental preview; macOS arm64 is
   the primary supported alpha target.
-- The Windows alpha uses the conservative TMS57002 interpreter. The pooled x64
-  JIT is disabled pending investigation of an access violation exposed by the
-  clean-room DSP sentinel; macOS arm64 continues to use and validate its JIT.
+- The native TMS57002 JIT is the default on both Windows x64 and macOS arm64.
+  For troubleshooting, set `PROPHECY_DSP_ENGINE=interpreter` before launch.
 
 ## Verification scope
 
 The public source includes a 554-case hardware-derived TMS57002 replay corpus,
 23 self-contained focused tests, ARM64 interpreter/dynarec equivalence gates,
-host validation, editor tests, and publication/licensing audits. Historical
+Windows native-JIT telemetry gates, host validation, editor tests, and
+publication/licensing audits. Historical
 underdeclared captures and unavailable research diagnostics are preserved
 outside the release denominator; they are not represented as current product
 failures.

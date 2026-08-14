@@ -147,7 +147,7 @@ jobs:
           done
       - name: Package macOS alpha ZIP
         run: |
-          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.2-macOS-arm64"
+          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.3-macOS-arm64"
           mkdir -p "$package"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/AU/Profligacy.component "$package/Profligacy.component"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 "$package/Profligacy.vst3"
@@ -157,10 +157,10 @@ jobs:
           (cd "$RUNNER_TEMP" && shasum -a 256 "$(basename "$package.zip")") > "$package.zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.2-macOS-arm64-${{ github.sha }}
+          name: Profligacy-1.0.0-alpha.3-macOS-arm64-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.2-macOS-arm64.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.2-macOS-arm64.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.3-macOS-arm64.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.3-macOS-arm64.zip.sha256
           retention-days: 7
           if-no-files-found: error
 
@@ -355,7 +355,8 @@ jobs:
             --artifact-host build-prototype\ProphecyArtifactHost_artefacts\Release\ProphecyArtifactHost.exe `
             --plugin build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
             --work "$env:RUNNER_TEMP\clean-room-three-dsp" `
-            --seconds 6
+            --seconds 6 `
+            --require-jit-telemetry
           if ($LASTEXITCODE -ne 0) { throw "clean-room E2E exited $LASTEXITCODE" }
       - name: Upload Windows E2E diagnostics on failure
         if: failure()
@@ -368,7 +369,7 @@ jobs:
       - name: Package Windows alpha ZIP
         shell: pwsh
         run: |
-          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.2-Windows-x64-experimental'
+          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.3-Windows-x64-experimental'
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item -Recurse -LiteralPath `
             build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
@@ -383,9 +384,9 @@ jobs:
           "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -Encoding ascii -NoNewline "$zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.2-Windows-x64-experimental-${{ github.sha }}
+          name: Profligacy-1.0.0-alpha.3-Windows-x64-experimental-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.2-Windows-x64-experimental.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.2-Windows-x64-experimental.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.3-Windows-x64-experimental.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.3-Windows-x64-experimental.zip.sha256
           retention-days: 7
           if-no-files-found: error

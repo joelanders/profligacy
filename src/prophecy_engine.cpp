@@ -806,18 +806,17 @@ void apply_audio_config()
 	setenv("KPROP_DSP2_INPUT_ROUTE", "normal", 1);
 	setenv("KPROP_TXSM_FALLBACK_FIX", "1", 0);
 	setenv("KPROP_DSP_SERIAL_FRAME_MODEL", "0", 1);
-	// Enable the TMS57002 pooled dynarec (~1.9x real-time on AArch64). The
+	// Enable the TMS57002 pooled dynarec. The
 	// default patch's DSP programs compile during the ~2 s boot, before the host pulls at
 	// real-time, so there's no first-note stall; a patch change compiles a new program on
 	// first use (a brief one-time cost). Byte-identical to the interpreter (pf4 gate-green).
-	// The Windows alpha uses the conservative interpreter: the clean-room DSP1 sentinel
-	// exposes an x64 pooled-code access violation before the first frame. Leave an explicit
-	// environment setting available so diagnostics can override either platform default.
-#if defined(_WIN32)
-	setenv("KPROP_DSP_PERFRAME", "0", 0);
-#else
-	setenv("KPROP_DSP_PERFRAME", "4", 0);
-#endif
+	// Windows x64 uses the same default now that the native-call ABI, shadow-space, and
+	// CMEM guards are covered by its packaged and real-firmware gates. The low-level
+	// KPROP_DSP_PERFRAME variable remains the highest-priority diagnostic override;
+	// PROPHECY_DSP_ENGINE=interpreter is the readable emergency fallback for users.
+	const char *dsp_engine = std::getenv("PROPHECY_DSP_ENGINE");
+	setenv("KPROP_DSP_PERFRAME",
+		(dsp_engine && std::string(dsp_engine) == "interpreter") ? "0" : "4", 0);
 	// Keep pooled execution active while firmware coefficient updates are pending. The
 	// per-CMEM-op guard deopts only the read that must consume the update queue. This was
 	// formerly blocked by a threaded partial-frame discrepancy; the reconciled clean A64

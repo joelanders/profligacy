@@ -75,7 +75,9 @@ def main() -> int:
     receipt_path = args.work / "ci-rom-e2e.json"
 
     environment = os.environ.copy()
-    for name in ("PROPHECY_FORCE_NO_ROM",):
+    # Exercise the product default, not a caller's diagnostic override. Requiring
+    # JIT telemetry below therefore proves the packaged default is native.
+    for name in ("PROPHECY_FORCE_NO_ROM", "PROPHECY_DSP_ENGINE", "KPROP_DSP_PERFRAME"):
         environment.pop(name, None)
     environment.update({
         "PROPHECY_ROMPATH": str(rom_root),

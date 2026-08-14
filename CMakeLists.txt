@@ -239,6 +239,12 @@ endif()
 add_executable(ProphecyLifecycleHost EXCLUDE_FROM_ALL src/lifecycle_main.cpp)
 target_link_libraries(ProphecyLifecycleHost PRIVATE prophecy_engine)
 
+# Non-shipping headless engine host used by the ROM-backed integration and
+# performance gates.  Keep it out of the default product build, but make it
+# available on every supported platform (including the Azure Windows lab).
+add_executable(ProphecyConsoleHost EXCLUDE_FROM_ALL src/console_main.cpp)
+target_link_libraries(ProphecyConsoleHost PRIVATE prophecy_engine)
+
 # Fast no-ROM statement of the v1 instance contract. This distinguishes "a host can
 # construct/tear down two plugin objects" from independent simultaneous synthesis.
 add_executable(ProphecyMultiInstanceContractTest scripts/multi_instance_contract_test.cpp)
@@ -247,8 +253,10 @@ if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
 	# MAME's Windows OSD expects the Common Controls v6 activation context from
 	# its executable resource.  Add that dependency to MSBuild's generated
 	# executable manifest (JUCE executables embed an equivalent dependency).
-	target_link_options(ProphecyMultiInstanceContractTest PRIVATE
-		"/MANIFESTDEPENDENCY:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+	foreach(_prophecy_manifest_target ProphecyConsoleHost ProphecyMultiInstanceContractTest)
+		target_link_options(${_prophecy_manifest_target} PRIVATE
+			"/MANIFESTDEPENDENCY:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+	endforeach()
 endif()
 if(BUILD_TESTING)
 	add_test(NAME multi_instance_contract COMMAND $<TARGET_FILE:ProphecyMultiInstanceContractTest>)
@@ -456,7 +464,7 @@ target_link_libraries(ProphecyArtifactHost PRIVATE
 	juce::juce_audio_utils juce::juce_audio_formats)
 
 if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
-	foreach(_prophecy_windows_target prophecy_engine ProphecyPlugin ProphecyMultiInstanceContractTest ProphecyPluginTimingHost ProphecyPluginRtSafetyTest ProphecyArtifactHost)
+	foreach(_prophecy_windows_target prophecy_engine ProphecyPlugin ProphecyConsoleHost ProphecyMultiInstanceContractTest ProphecyPluginTimingHost ProphecyPluginRtSafetyTest ProphecyArtifactHost)
 		if(TARGET ${_prophecy_windows_target})
 			set_property(TARGET ${_prophecy_windows_target} PROPERTY
 				MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
