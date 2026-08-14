@@ -78,6 +78,12 @@ At runtime, choose a ROM directory containing either
 reconstruction compiled into the pinned MAME fork, so no separate LCD ROM file
 is required.
 
+The native TMS57002 engine is the default on supported 64-bit builds, including
+Windows. For troubleshooting, set `PROPHECY_DSP_ENGINE=interpreter` before
+launching the standalone or DAW to use the slower portable interpreter. The
+existing low-level `KPROP_DSP_PERFRAME` variable remains available to developers
+and takes precedence when it is already set.
+
 To build against an already-built sibling MAME tree instead of the submodule
 (skips the 30-min build while iterating):
 

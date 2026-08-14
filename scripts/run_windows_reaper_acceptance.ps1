@@ -70,7 +70,8 @@ verchk=0
 $env:PROFLIGACY_REAPER_OUTDIR = $out
 $env:PROPHECY_ROMPATH = $RomRoot
 $env:PROPHECY_NVRAM = $NvramRoot
-$env:KPROP_DSP_PERFRAME = '4'
+$env:PROPHECY_DSP_ENGINE = $null
+$env:KPROP_DSP_PERFRAME = $null
 
 function Invoke-ReaperScript([string[]]$Arguments, [string]$Report, [int]$Timeout = 90) {
     Remove-Item -Force -ErrorAction SilentlyContinue $Report

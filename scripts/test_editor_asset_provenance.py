@@ -83,7 +83,7 @@ class EditorAssetProvenanceTest(unittest.TestCase):
         self.assertIn("const g = ch*8", self.html)
         self.assertIn("const bits = lcdA00Glyphs[g+gr]", self.html)
         self.assertIn("ok('HD44780 A00 glyph route'", self.html)
-        self.assertIn('url == "/assets/hd44780-a00-glyphs.bin"', processor)
+        self.assertIn('path == "/assets/hd44780-a00-glyphs.bin"', processor)
         self.assertIn("ProphecyEngine::lcdA00GlyphRows", processor)
         self.assertIn("hd44780_a00_reconstructed_cgrom()", engine)
 

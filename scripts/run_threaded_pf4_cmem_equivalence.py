@@ -171,7 +171,9 @@ def clean_environment() -> dict[str, str]:
             "SDL_VIDEODRIVER": "dummy",
             "SDL_AUDIODRIVER": "dummy",
             "PROPHOST_BLOCK": "512",
-            "PROPHOST_RING_FRAMES": "8192",
+            # Match ProphecyEngine's shipping default (~43 ms at 48 kHz), so the
+            # deadline gate cannot pass on buffering unavailable to the plugin.
+            "PROPHOST_RING_FRAMES": "2048",
         }
     )
     return environment

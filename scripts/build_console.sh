@@ -53,23 +53,23 @@ INCLUDES="-I$MAME_DIR/src/osd -I$MAME_DIR/src/emu -I$MAME_DIR/src/devices -I$MAM
 -I$MAME_DIR/src/lib -I$MAME_DIR/src/lib/util -I$MAME_DIR/3rdparty -I$MAME_DIR/build/generated/mame/layout \
 -I$MAME_DIR/3rdparty/zlib -I$MAME_DIR/3rdparty/flac/include -I$MAME_DIR/src/osd/sdl -I$MAME_DIR/src/osd/modules \
 -I${SDL_PREFIX}/include $(sdl2-config --cflags)"
-CXXFLAGS="-std=c++17 -arch arm64 -O2 -pipe -fno-strict-aliasing -Wno-unknown-pragmas -Wno-unknown-warning-option \
+CXXFLAGS="-std=c++20 -arch arm64 -O2 -pipe -fno-strict-aliasing -Wno-unknown-pragmas -Wno-unknown-warning-option \
 -Wno-conversion -Wno-sign-compare -Wno-deprecated-declarations -Wno-unused-value -Wno-tautological-compare"
 
 echo ">> compiling src/prophecy_engine.cpp  (MAME-side, MAME_DIR=$MAME_DIR)"
 clang++ $CXXFLAGS $DEFINES $INCLUDES -Isrc -c src/prophecy_engine.cpp -o "$HOST_BUILD_DIR/prophecy_engine.o"
 
 echo ">> compiling src/console_main.cpp  (host-side, NO MAME headers)"
-clang++ -std=c++17 -arch arm64 -O2 -Isrc -c src/console_main.cpp -o "$HOST_BUILD_DIR/console_main.o"
+clang++ -std=c++20 -arch arm64 -O2 -Isrc -c src/console_main.cpp -o "$HOST_BUILD_DIR/console_main.o"
 
 echo ">> compiling src/lifecycle_main.cpp  (host-side, NO MAME headers)"
-clang++ -std=c++17 -arch arm64 -O2 -Isrc -c src/lifecycle_main.cpp -o "$HOST_BUILD_DIR/lifecycle_main.o"
+clang++ -std=c++20 -arch arm64 -O2 -Isrc -c src/lifecycle_main.cpp -o "$HOST_BUILD_DIR/lifecycle_main.o"
 
 # Static archives in dependency order (from MAME's propmin link line).
 ARCHIVES=(
 	"$BIN/mame_propmin/libmame_propmin.a" "$BIN/libfrontend.a" "$BIN/mame_propmin/liboptional.a"
 	"$BIN/libemu.a" "$BIN/libosd_sdl.a" "$BIN/libqtdbg_sdl.a" "$BIN/mame_propmin/libformats.a"
-	"$BIN/mame_propmin/libdasm.a" "$BIN/libutils.a" "$BIN/libexpat.a" "$BIN/libsoftfloat.a"
+	"$BIN/mame_propmin/libdasm.a" "$BIN/libutils.a" "$BIN/libexpat.a"
 	"$BIN/libsoftfloat3.a" "$BIN/libwdlfft.a" "$BIN/libymfm.a" "$BIN/libjpeg.a" "$BIN/lib7z.a"
 	"$BIN/libasmjit.a" "$BIN/liblua.a" "$BIN/liblualibs.a" "$BIN/liblinenoise.a" "$BIN/libzlib.a"
 	"$BIN/libzstd.a" "$BIN/libflac.a" "$BIN/libutf8proc.a" "$BIN/libsqlite3.a" "$BIN/libbgfx.a"
