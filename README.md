@@ -1,191 +1,559 @@
 # Profligacy
 
-An independent JUCE audio plug-in (VST3/AU/standalone) compatible with
-user-supplied firmware for the Korg Prophecy synthesizer. Profligacy is not
-affiliated with or endorsed by Korg.
+Profligacy is an independent JUCE audio plug-in — AU, VST3, and standalone — compatible with user-supplied firmware for the Korg Prophecy synthesizer.
 
-**Your code lives at the top level; MAME and JUCE are dependencies underneath.**
-The plugin does not fork or bury itself inside MAME — it *links the pinned public
-MAME fork as a library* (MAME's frontend `main()` is just one caller of the emu
-library; this repo is another) and drives its emulated devices through a narrow
-host seam.
+It is not affiliated with or endorsed by Korg.
 
-## Public alpha support boundary
+Profligacy uses a pinned MAME fork to emulate the Prophecy hardware and exposes that emulated synthesizer through a conventional audio plug-in interface.
 
-The first public GitHub alpha supports native Apple Silicon on macOS 15.0 or
-later. The AU, VST3, and standalone bundles are ad-hoc signed, not Developer ID
-signed or Apple-notarized. Verify the published SHA-256 before using the package;
-macOS may then require removing the downloaded archive's quarantine attribute as
-described in `release/GITHUB_ALPHA_RELEASE_NOTES.md`.
+## Current target
 
-The alpha has four important limitations:
+The primary public-alpha target is:
 
-- Korg firmware is not included. On first launch, choose a directory containing
-  `korgprop/ic12_v17.bin` and `korgprop/ic22_v17.bin`, or `korgprop.zip`.
-- One Profligacy synth engine may be active per host process. Additional plug-in
-  objects remain inert rather than sharing or corrupting the active engine.
-- DAW bounce/render must run at real-time 1x. Unrestricted faster-than-real-time
-  rendering can be silent because the emulator is paced asynchronously.
-- Existing bit-exact evidence ends at the DSP3 serial output. Analog line-output
-  coloration has not yet been certified against the physical output stage.
+* native Apple Silicon (`arm64`);
+* macOS 15.0 or later;
+* AU, VST3, and standalone formats.
 
+An experimental Windows x64 build also exists, but macOS arm64 is the primary supported alpha platform.
+
+The current Profligacy implementation targets **Korg Prophecy firmware v1.7**. The underlying MAME driver contains definitions for other Prophecy firmware revisions, but Profligacy currently boots and validates the v1.7 machine specifically.
+
+Korg firmware is not distributed with Profligacy. You must supply your own lawfully obtained firmware dump.
+
+## Firmware
+
+Profligacy uses MAME's standard ROM-set layout.
+
+For the current v1.7 target, provide either:
+
+```text
+<ROMPATH>/
+└── korgprop/
+    ├── ic12_v17.bin
+    └── ic22_v17.bin
 ```
-profligacy/                       <- this repo (your code)
+
+or:
+
+```text
+<ROMPATH>/
+└── korgprop.zip
+```
+
+where `korgprop.zip` contains the two firmware images (note that if using a zip, the filename of the firmware images must match the above required format).
+
+`IC12` and `IC22` are the physical ROM designators used by the Prophecy hardware:
+
+* `IC12` contains the main H8/3003 CPU firmware;
+* `IC22` contains the V55 sub-CPU firmware.
+
+The filenames and `korgprop` set name are MAME conventions. MAME also validates the ROM contents, so renaming an arbitrary firmware image is not sufficient.
+
+The HD44780 A00 LCD character table is reconstructed from the published datasheet and compiled into the pinned MAME fork. No separate LCD ROM is required.
+
+## Build and run
+
+### 1. Initialise the dependencies
+
+After cloning the repository:
+
+```bash
+git submodule update --init
+```
+
+The important dependencies live under:
+
+```text
+extern/
+├── mame/
+└── JUCE/
+```
+
+### 2. Build the MAME foundation
+
+MAME is built separately into static archives and then linked into Profligacy.
+
+This is the slow foundation build and normally only needs to be repeated when the pinned MAME source changes:
+
+```bash
+scripts/build_mame_core.sh
+```
+
+The script also stamps the resulting MAME archives with the exact MAME revision from which they were built.
+
+Profligacy checks this stamp and refuses to link stale archives from a different `extern/mame` revision.
+
+### 3. Build the console host
+
+The console host is a small headless harness for running the emulated Prophecy without JUCE:
+
+```bash
+./scripts/build_console.sh
+```
+
+This produces:
+
+```text
+./console_host
+```
+
+and also builds the lifecycle test host used for engine teardown/reconstruction testing.
+
+### 4. Run the console host
+
+`run_console.sh` boots the v1.7 Prophecy machine headlessly, injects a test note, captures the resulting audio, and exits.
+
+Set `ROMPATH` to the directory containing your `korgprop/` directory or `korgprop.zip`:
+
+```bash
+ROMPATH=/path/to/my/roms ./scripts/run_console.sh
+```
+
+For example:
+
+```text
+/Users/me/ProphecyROMs/
+└── korgprop/
+    ├── ic12_v17.bin
+    └── ic22_v17.bin
+```
+
+would be run with:
+
+```bash
+ROMPATH=/Users/me/ProphecyROMs ./scripts/run_console.sh
+```
+
+The normal harness writes:
+
+```text
+console_out.wav
+```
+
+The script currently defaults `ROMPATH` to a sibling `../mame/00-roms` directory when no override is supplied. That is a developer convenience rather than a required repository layout; setting `ROMPATH` explicitly is clearer.
+
+There are two harness modes:
+
+```bash
+ROMPATH=/path/to/roms ./scripts/run_console.sh
+```
+
+Rung 1: straightforward capture to WAV.
+
+```bash
+ROMPATH=/path/to/roms ./scripts/run_console.sh --ring
+```
+
+Rung 2: exercises the real-time ring-buffer/backpressure path and writes:
+
+```text
+console_ring_out.wav
+```
+
+### 5. Build the plug-in
+
+Configure the JUCE/CMake build:
+
+```bash
+cmake -B build-cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
+```
+
+Then build:
+
+```bash
+cmake --build build-cmake -j$(sysctl -n hw.ncpu)
+```
+
+This builds the AU, VST3, and standalone applications.
+
+On macOS, validate the Audio Unit with:
+
+```bash
+auval -v aumu Pflg Prfl
+```
+
+and launch the standalone application with:
+
+```bash
+open "build-cmake/ProphecyPlugin_artefacts/Release/Standalone/Profligacy.app"
+```
+
+## Using the plug-in
+
+On first launch, Profligacy looks for the v1.7 ROM set and, if necessary, presents a folder picker.
+
+The selected directory should contain either:
+
+```text
+korgprop/
+├── ic12_v17.bin
+└── ic22_v17.bin
+```
+
+or:
+
+```text
+korgprop.zip
+```
+
+The selected path is persisted for subsequent launches.
+
+The conventional per-user ROM location is:
+
+```text
+~/Library/Application Support/Profligacy/roms
+```
+
+on macOS.
+
+A `PROPHECY_ROMPATH` environment variable can also be used to specify the plug-in ROM path explicitly.
+
+### One active engine per process
+
+The current implementation supports **one active Profligacy synthesizer engine per host process**.
+
+Additional plug-in objects can exist, but remain inert rather than sharing or corrupting the active emulated machine.
+
+Independent simultaneous synth instances are therefore not currently supported.
+
+### Real-time bounce
+
+DAW bounce/render currently needs to run at real-time `1x`.
+
+Unrestricted faster-than-real-time rendering can produce silence because the emulator is paced asynchronously through the audio ring.
+
+### DSP execution engine
+
+The native TMS57002 execution engine is the default on supported 64-bit builds, including the experimental Windows x64 build.
+
+For troubleshooting, force the portable interpreter before launching the plug-in or standalone application:
+
+```bash
+PROPHECY_DSP_ENGINE=interpreter
+```
+
+The lower-level `KPROP_DSP_PERFRAME` developer variable remains available and takes precedence when explicitly set.
+
+## Alpha release notes
+
+The macOS alpha bundles are ad-hoc signed rather than Developer ID signed and are not Apple-notarized.
+
+Verify the published SHA-256 of a release package before using it. macOS may require removal of the downloaded bundle's quarantine attribute; see the release notes for the exact procedure.
+
+The current alpha also has the following important limitations:
+
+* one active synthesizer engine per host process;
+* DAW bounce/render must currently run at real-time `1x`;
+* host automation for the full deep SysEx editor is not yet exposed;
+* some unknown or packed SysEx fields remain intentionally read-only;
+* Intel Macs and macOS releases older than 15.0 are outside the current public-alpha target;
+* Windows x64 is experimental rather than the primary supported platform.
+
+Existing bit-exact evidence reaches the DSP3 serial output. Physical analogue line-output coloration has not yet been certified against the hardware output stage.
+
+---
+
+# Developer and architecture notes
+
+The sections below describe the internal architecture, validation work, build implementation, and current research status. They are not required simply to build and run Profligacy.
+
+## Repository structure
+
+The product source lives at the top level. MAME and JUCE are dependencies underneath it:
+
+```text
+profligacy/
 ├── src/
-│   └── console_main.cpp          <- headless host harness (the plugin minus JUCE)
+│   ├── PluginProcessor.cpp
+│   ├── prophecy_engine.cpp
+│   └── console_main.cpp
 ├── scripts/
-│   ├── build_console.sh          <- compile src/ + link MAME's static archives
-│   └── run_console.sh            <- boot korgprop, capture audio (--ring for RT test)
+│   ├── build_mame_core.sh
+│   ├── build_console.sh
+│   └── run_console.sh
 └── extern/
-    ├── mame/   (git submodule)   -> joelanders/mame-profligacy
-    └── JUCE/   (git submodule)   -> juce-framework/JUCE
+    ├── mame/
+    └── JUCE/
 ```
 
-## Why the driver isn't at the top level
+`console_main.cpp` is the headless host harness: effectively the engine integration without the JUCE plug-in shell.
 
-The **Prophecy driver** (`korgprophecy.cpp`) and the **TMS57002 arm64 dynarec** are
-MAME device/driver code — they use MAME's framework and are edits to MAME's own
-files — so they live inside the `extern/mame` submodule (the fork), not here.
-That is the correct seam: the *emulation* is a MAME fork (and could be upstreamed
-one day); the *product* is this top-level plugin that consumes it. Everything in
-`src/` here is pure host code with zero MAME-framework coupling — it only links MAME.
+## Why the Prophecy driver lives inside MAME
 
-## Build
+The Prophecy driver (`korgprophecy.cpp`) and the TMS57002 native execution work are MAME device/driver code.
 
-One-time: build MAME's static archives inside the submodule (the slow foundation
-build). It needs a real `python` on PATH — the asdf shim on this machine is broken
-(pins an uninstalled version), so prepend a working one:
+They use MAME's internal framework and modify MAME-owned components, so they live inside the `extern/mame` submodule rather than the Profligacy product source.
+
+That is the intended architectural boundary:
+
+```text
+MAME fork
+    ↓
+Prophecy hardware emulation
+    ↓
+narrow host seam
+    ↓
+Profligacy engine
+    ↓
+JUCE plug-in / standalone
+```
+
+The emulation work could potentially be upstreamed to MAME independently of Profligacy.
+
+The top-level `src/` product code keeps the MAME-specific dependency concentrated in `prophecy_engine.cpp`; the host-facing interface itself remains MAME-free.
+
+## MAME archive freshness
+
+MAME is deliberately treated as a separately built foundation dependency.
+
+`scripts/build_mame_core.sh` builds the required static archives and writes:
+
+```text
+.prophecy_build_rev
+```
+
+alongside them.
+
+The stamp contains the MAME Git revision used for that build.
+
+At CMake configure time and again during the build, Profligacy compares the stamp against the currently checked-out `extern/mame` revision.
+
+This prevents a particularly dangerous failure mode:
+
+```text
+update extern/mame
+        ↓
+forget to rebuild MAME
+        ↓
+link old static archives
+        ↓
+apparently successful but stale product build
+```
+
+A dirty MAME build is treated specially and should not be used for a release package.
+
+## Python and MAME build generation
+
+The MAME build requires Python.
+
+`build_mame_core.sh` locates a working `python3`, passes the resulting executable to MAME as `PYTHON_EXECUTABLE`, and currently also creates a temporary `python` alias on `PATH` for compatibility with MAME build paths that may probe that command name.
+
+This was originally added around a local version-manager environment where an `asdf` Python shim pointed at an uninstalled interpreter. Users should not need to modify their own `PATH` manually.
+
+The helper also accepts:
 
 ```bash
-git submodule update --init            # if not already checked out
-scripts/build_mame_core.sh --regen     # builds the archives AND writes the rev stamp
+scripts/build_mame_core.sh --regen
 ```
 
-(`build_mame_core.sh` handles the python-on-PATH quirk itself and stamps the build;
-CMake refuses to link archives whose stamp doesn't match the submodule HEAD.)
+which maps to MAME's `REGENIE` option and forces regeneration of the Genie-generated project files.
 
-Then build and run the host harness from this repo:
+For the currently pinned MAME makefile this flag is redundant in practice: the wrapper supplies `REGENIE=0` when the flag is absent, while MAME tests whether `REGENIE` is defined rather than whether its value is `1`. Consequently the documented build does not require `--regen`.
 
-```bash
-./scripts/build_console.sh             # -> ./console_host  (links extern/mame archives)
-./scripts/run_console.sh               # Rung 1: capture to WAV
-./scripts/run_console.sh --ring        # Rung 2: real-time ring-backpressure self-clocking
-```
+`REGENIE` itself refers only to regenerating MAME's generated build/project files; it is separate from compilation of the C++ sources.
 
-At runtime, choose a ROM directory containing either
-`korgprop/ic12_v17.bin` plus `korgprop/ic22_v17.bin`, or an equivalent
-`korgprop.zip`. The HD44780 A00 LCD character table is a documented datasheet
-reconstruction compiled into the pinned MAME fork, so no separate LCD ROM file
-is required.
+## Building against another MAME tree
 
-The native TMS57002 engine is the default on supported 64-bit builds, including
-Windows. For troubleshooting, set `PROPHECY_DSP_ENGINE=interpreter` before
-launching the standalone or DAW to use the slower portable interpreter. The
-existing low-level `KPROP_DSP_PERFRAME` variable remains available to developers
-and takes precedence when it is already set.
+For emulator development or A/B comparison work, Profligacy can use an already-built MAME worktree instead of the checked-out submodule.
 
-To build against an already-built sibling MAME tree instead of the submodule
-(skips the 30-min build while iterating):
+For example:
 
 ```bash
 MAME_DIR=../mame-profligacy ./scripts/build_console.sh
 ```
 
-## Status
+This avoids repeating the roughly 30-minute foundation build while iterating on a separate MAME tree.
 
-Validated integration status:
+Independent comparison builds can also use separate host build/output paths.
 
-- **Rung 1 (done):** link MAME archives into a non-MAME binary, own `main()`, custom
-  OSD, headless boot, audio egress — bit-identical to `propmin -wavwrite`.
-- **Rung 2 (done):** ring buffer + real-time-paced consumer; backpressure self-clocks
-  MAME to 1.0x wall-clock, 0 underruns, still bit-exact through the ring.
-- **Rung 3 (implemented):** `juce::AudioProcessor` (`src/PluginProcessor.cpp`) over
-  the engine; `extern/JUCE` (8.0.14); CMake builds AU/VST3/Standalone.
-  Source-equivalent integration builds have passed `auval -v aumu Pflg Prfl`,
-  including in-host boot, format/render (22k–192k, blocks 64–4096), 1-channel,
-  MIDI, and multi-object/teardown tests.  Final 1.0.0 validator receipts must be
-  regenerated from the exact release tree as required by `release/v1_preflight.json`.
-  A redistributable clean-room CI ROM now provides a bounded packaged-VST3 gate:
-  it boots both host CPUs, uploads programs through the real board ports, requires
-  audio to traverse DSP1 -> DSP2 -> DSP3 -> DAC, checks an LCD sentinel through
-  the public state API, and records per-DSP native-JIT telemetry. See
-  `scripts/CI_ROM_E2E.md`.
-  This does **not** mean two audible instances are supported: v1 permits one active
-  Profligacy instance per host process. A concurrent instance reports unavailable and is kept
-  inert so it cannot control or mirror the active synth. Independent simultaneous
-  instances require the post-v1 out-of-process bridge described below.
+## Firmware revisions in the MAME driver
 
-  The constraint comes from two ownership layers, not CPU performance: MAME's
-  `mame_machine_manager::s_manager` is process-global, and the Prophecy host ABI
-  currently uses process-global callbacks/rings/stores. Making every instance audible
-  in-process would require de-singletonizing both layers and auditing other MAME/JIT
-  globals. The intended post-v1 route is one service process per plugin instance,
-  which provides crash and state isolation without maintaining a broad MAME-core fork.
+The MAME fork contains definitions for three Prophecy firmware sets:
 
-### Build & validate the plugin
-
-```bash
-cmake -B build-cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build-cmake -j$(sysctl -n hw.ncpu)     # AU + VST3 + Standalone, installed to ~/Library
-auval -v aumu Pflg Prfl                              # validate the AU
-open "build-cmake/ProphecyPlugin_artefacts/Release/Standalone/Profligacy.app" # hear it
+```text
+korgpro101  → firmware v1.01
+korgprop     → firmware v1.7
+korgpro20    → firmware v2.0
 ```
 
-### SysEx editor
+The current Profligacy product, however, explicitly boots:
 
-The EDIT page combines a clickable signal-flow overview with manifest-driven
-Program, Changes, Arpeggiator, Global, and oscillator-model views. It catalogues
-all 1,425 known SysEx rows and all seven oscillator engine types without making
-unknown/reserved fields writable. Persistent text scaling is available from
-`Aa`. Signal-flow blocks open focused detailed views, while repeated
-parameter-name prefixes become scan-friendly nested headings with concise
-control labels.
-The checked-in catalogue and its provenance are documented in
-`src/editor/DATA_PROVENANCE.md`.
+```text
+korgprop
+```
 
-### Next (product work, not de-risking)
+and its ROM picker, NVRAM layout, test corpus, and product validation are built around that v1.7 target.
 
-Host-automation parameters for the curated controls; decode the remaining unknown
-SysEx fields and packed-byte read-back; add Developer ID signing/notarization; and,
-if multi-instance isolation is ever required, an out-of-process bridge.
+Adding another firmware revision to the product therefore involves more than allowing another filename. It requires validating the editor protocol, state handling, audio behaviour, and other firmware-facing assumptions against that revision.
+
+## Project status
+
+The integration work was developed in progressively stronger validation stages.
+
+### Rung 1 — complete
+
+Link MAME's archives into a non-MAME executable with:
+
+* a Profligacy-owned `main()`;
+* custom OSD integration;
+* headless Prophecy boot;
+* audio egress.
+
+The resulting capture is bit-identical to the corresponding `propmin -wavwrite` path.
+
+### Rung 2 — complete
+
+Add:
+
+* bounded audio ring;
+* real-time-paced consumer;
+* backpressure-based self-clocking.
+
+The emulator remains at `1.0x` wall-clock pace with zero underruns in the validated path while remaining bit-exact through the ring.
+
+### Rung 3 — implemented
+
+The engine is wrapped in a real `juce::AudioProcessor`, producing AU, VST3, and standalone builds.
+
+Source-equivalent integration builds have passed:
+
+* `auval -v aumu Pflg Prfl`;
+* in-host boot;
+* format/render tests from 22 kHz through 192 kHz;
+* host blocks from 64 through 4096 samples;
+* mono output;
+* MIDI input;
+* multi-object handling;
+* teardown/reconstruction testing.
+
+Final release validator receipts must still be generated from the exact release tree required by `release/v1_preflight.json`.
+
+A redistributable clean-room CI ROM also provides a bounded packaged-VST3 gate. It:
+
+* boots both host CPUs;
+* uploads programs through the real board ports;
+* requires audio to traverse DSP1 → DSP2 → DSP3 → DAC;
+* checks an LCD sentinel through the public state API;
+* records native-JIT telemetry for each DSP.
+
+This does **not** imply support for multiple simultaneously audible instances.
+
+## Why only one active instance?
+
+The current limitation is architectural rather than primarily a CPU-performance problem.
+
+Two ownership layers are process-global:
+
+1. MAME's `mame_machine_manager::s_manager`;
+2. Prophecy host ABI callbacks, rings, and stores.
+
+Supporting independent in-process instances would require de-singletonising both layers and auditing additional MAME/JIT global state.
+
+The intended post-v1 design is instead one service process per plug-in instance.
+
+That would provide instance isolation and crash isolation without requiring Profligacy to maintain a broad de-singletonised MAME fork.
+
+## SysEx editor
+
+The EDIT page combines a clickable signal-flow view with manifest-driven detailed editing.
+
+The catalogue contains all 1,425 currently known SysEx rows and covers all seven oscillator-engine types.
+
+The editor intentionally does not guess unknown or reserved fields.
+
+Persistent text scaling is available through `Aa`.
+
+Signal-flow blocks open focused detailed views, while repeated parameter-name prefixes are presented as nested headings with shorter scan-friendly control names.
+
+The editor catalogue and its provenance are documented in:
+
+```text
+src/editor/DATA_PROVENANCE.md
+```
+
+The catalogue is based on:
+
+* parameter names and grouping from publicly distributed Korg MIDI/parameter material and editor screenshots;
+* measured byte offsets;
+* transport behaviour;
+* changed-byte previews;
+* automated firmware SysEx sweeps;
+* explicit confidence metadata.
+
+It contains no Korg firmware.
+
+## Current validation boundary
+
+The public source includes hardware-derived and self-contained validation covering the TMS57002 implementation, interpreter/native equivalence, host integration, editor behaviour, release packaging, and licensing.
+
+Existing exact-audio evidence reaches the DSP3 serial output.
+
+The current U2/DAC/output model does not claim certified recreation of the Prophecy's physical analogue line-output coloration.
+
+That distinction is intentional: digital emulation accuracy and analogue output-stage modelling are treated as separate claims.
+
+## Next
+
+Remaining product work includes:
+
+* host-automation parameters for the curated controls;
+* decoding additional unknown SysEx fields;
+* packed-byte read-back;
+* Developer ID signing and notarisation;
+* optional post-v1 out-of-process multi-instance support.
+
+These are product-development tasks rather than blockers for the existing single-engine architecture.
 
 ## Wheel 2 position
 
-The Prophecy's **Wheel 2** is a free-spinning **friction wheel** — it has no spring
-and no rest detent, so wherever you leave it is where it stays. That means there is
-**no single "correct" position**: the value the synth reads on Wheel 2 depends entirely
-on where the physical wheel happened to be left. Because several factory patches route
-Wheel 2 to level or timbre, its assumed position **materially changes the sound** (a
-different Wheel 2 value has, in the past, looked like a synthesis "defect" when it was
-really just the wheel sitting somewhere else).
+The Prophecy's Wheel 2 is a free-spinning friction wheel.
 
-The plugin exposes this as a persistent **Wheel 2 position** control (MIDI panel,
-0–255, stored with your session/preset). The default is **128** (mid), which matches
-the emulator's built-in value — leaving it there reproduces the previous behavior
-exactly, byte-for-byte.
+Unlike a spring-loaded modulation wheel, it has no centre return or rest detent. Its value is simply wherever the physical wheel was last left.
 
-To **match a specific hardware unit or capture session**, set the wheel where that
-session had it. Known reference values:
+There is consequently no universal "correct" Wheel 2 value.
 
-| Session        | Wheel 2 position |
-| -------------- | ---------------- |
-| 07-04          | ≈ mid (128)      |
-| 07-10 / 07-14  | full up (255)    |
-| default        | 128 (mid)        |
+Several factory patches route Wheel 2 to level or timbral parameters, so its position can materially affect the sound. During hardware comparison work, an unexpected Wheel 2 position has previously looked like a synthesis discrepancy when the actual difference was simply the physical controller state.
 
-You can also drive Wheel 2 live from a MIDI controller: map an incoming CC to **Wheel 2**
-in the same MIDI panel (CC → controller remap). A live CC write and the resting-position
-control both target the same input (ADIN9); the most recent write wins.
+Profligacy exposes Wheel 2 as a persistent control in the MIDI panel.
+
+Its default is:
+
+```text
+128
+```
+
+which matches the emulator's previous built-in midpoint behaviour.
+
+Known reference capture positions are:
+
+| Session       |               Wheel 2 position |
+| ------------- | -----------------------------: |
+| 07-04         | approximately midpoint (`128`) |
+| 07-10 / 07-14 |                full up (`255`) |
+| default       |                          `128` |
+
+To reproduce a particular hardware capture, set Wheel 2 to the position used by that session.
+
+Wheel 2 can also be driven from an external MIDI controller by mapping an incoming CC to the Wheel 2 target.
+
+The persistent position and live CC path both ultimately write the same Prophecy input (`ADIN9`); the most recent write wins.
 
 ## License
 
-Profligacy's owned source and embedded editor assets are distributed under the
-GNU Affero General Public License, version 3 only. JUCE is used under its AGPLv3
-alternative. Linked MAME components are available under GPL-2.0-or-later or
-their more permissive per-file licenses; GPLv3 and AGPLv3 section 13 permit the
-combined distribution under the AGPL terms. See `THIRD_PARTY_NOTICES.md` and
-the pinned dependency notices for the complete licensing inventory.
+Profligacy's owned source and embedded editor assets are distributed under the GNU Affero General Public License, version 3 only.
 
-Korg firmware ROMs are not distributed. The user supplies their own lawfully
-obtained dump. The built-in LCD character table and its provenance are described
-in `THIRD_PARTY_NOTICES.md` and `src/editor/assets/README.md`.
+JUCE is used under its AGPLv3 alternative.
+
+Linked MAME components are available under GPL-2.0-or-later or their more permissive per-file licences. GPLv3 and AGPLv3 section 13 permit the combined distribution under the AGPL terms.
+
+See:
+
+```text
+THIRD_PARTY_NOTICES.md
+```
+
+for the complete third-party licensing inventory.
+
+Korg firmware ROMs are not distributed with Profligacy. Users must supply their own lawfully obtained dumps.
+
+The built-in LCD character table and its provenance are documented in `THIRD_PARTY_NOTICES.md` and `src/editor/assets/README.md`.
