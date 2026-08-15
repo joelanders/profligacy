@@ -22,6 +22,7 @@ permissions:
 
 env:
   MAME_SHA: 100fa688cee690aa811d181f87ee83c31e7ae0f9
+  MAME_TREE: 985d1a45ee8221aed9e5228880719c6cecf870ad
 
 jobs:
   macos-arm64:
@@ -36,6 +37,7 @@ jobs:
           git submodule update --init --depth 1 extern/JUCE
           git submodule update --init --depth 1 extern/mame
           test "$(git -C extern/mame rev-parse HEAD)" = "$MAME_SHA"
+          test "$(git -C extern/mame rev-parse 'HEAD^{tree}')" = "$MAME_TREE"
       - name: Build pinned static SDL2
         run: |
           archive="$RUNNER_TEMP/SDL2-2.32.10.tar.gz"
@@ -193,6 +195,7 @@ jobs:
           git submodule update --init --depth 1 extern/JUCE
           git submodule update --init --depth 1 extern/mame
           if ((git -C extern/mame rev-parse HEAD) -ne $env:MAME_SHA) { throw 'wrong MAME revision' }
+          if ((git -C extern/mame rev-parse 'HEAD^{tree}') -ne $env:MAME_TREE) { throw 'wrong MAME tree' }
       - name: Generate focused native MAME VS2022 project
         if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}

@@ -43,13 +43,16 @@ class AlphaReleasePolicyTests(unittest.TestCase):
         self.assertIn("auval", alpha_evidence)
         self.assertIn("daw_smoke", alpha_evidence)
 
-    def test_release_workflow_uses_manifest_mame_revision(self) -> None:
+    def test_release_workflow_uses_manifest_mame_revision_and_tree(self) -> None:
         alpha = json.loads((ROOT / "release/v1_alpha_preflight.json").read_text())
         workflow = (ROOT / ".github/workflows/alpha-prototype.yml").read_text()
-        match = re.search(r"(?m)^\s*MAME_SHA:\s*([0-9a-f]{40})\s*$", workflow)
+        revision = re.search(r"(?m)^\s*MAME_SHA:\s*([0-9a-f]{40})\s*$", workflow)
+        tree = re.search(r"(?m)^\s*MAME_TREE:\s*([0-9a-f]{40})\s*$", workflow)
 
-        self.assertIsNotNone(match, "release workflow has no pinned 40-hex MAME_SHA")
-        self.assertEqual(alpha["dependencies"]["extern/mame"], match.group(1))
+        self.assertIsNotNone(revision, "release workflow has no pinned 40-hex MAME_SHA")
+        self.assertIsNotNone(tree, "release workflow has no pinned 40-hex MAME_TREE")
+        self.assertEqual(alpha["dependencies"]["extern/mame"], revision.group(1))
+        self.assertEqual(alpha["dependency_trees"]["extern/mame"], tree.group(1))
 
 
 if __name__ == "__main__":
