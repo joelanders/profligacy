@@ -17,7 +17,7 @@
   ],
   "dependencies": {
     "extern/JUCE": "2cdfca8feb300fb424002ba2c2751569e5bacb64",
-    "extern/mame": "cc179f89a2a21c0ace160ebc3fa3335a77d23b53"
+    "extern/mame": "100fa688cee690aa811d181f87ee83c31e7ae0f9"
   },
   "mandatory_ctests": [
     "alpha_release_policy",

@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 env:
-  MAME_SHA: cc179f89a2a21c0ace160ebc3fa3335a77d23b53
+  MAME_SHA: 100fa688cee690aa811d181f87ee83c31e7ae0f9
 
 jobs:
   macos-arm64:
