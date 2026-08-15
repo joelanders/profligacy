@@ -40,7 +40,7 @@ or:
 └── korgprop.zip
 ```
 
-where `korgprop.zip` contains the two firmware images.
+where `korgprop.zip` contains the two firmware images (note that if using a zip, the filename of the firmware images must match the above required format).
 
 `IC12` and `IC22` are the physical ROM designators used by the Prophecy hardware:
 
