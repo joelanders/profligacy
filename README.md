@@ -72,6 +72,38 @@ Then build and run the host harness from this repo:
 ./scripts/run_console.sh --ring        # Rung 2: real-time ring-backpressure self-clocking
 ```
 
+### Headless MIDI/control stress
+
+Two unattended regressions exercise the control path without opening the editor:
+
+```bash
+# Replays the captured long-session control workload. Periodic current-program
+# dumps and an internal board-link queue invariant make the script fail on a
+# stalled MIDI path or the H8/V55 control-transport freeze.
+PROFLIGACY_REPLAY_ROMPATH=/path/to/roms \
+  ./scripts/replay_v55_control_freeze.sh
+
+# Drives the actual JUCE processBlock path across the release rate/block matrix.
+cmake --build build-cmake --config Release --target ProphecyPluginTimingHost
+./scripts/run_headless_midi_stress.py \
+  --rompath /path/to/roms --nvram-seed /path/to/sysram
+```
+
+The DAW-style stress runner continuously mixes notes, controllers, pitch bend,
+Program Change, and paced parameter SysEx. It requests a current-program dump
+every five seconds and grades the complete host -> firmware -> MIDI-out round
+trip, queue drops, response latency, and recovery after a bounded missed reply.
+Every case writes its seed, MIDI byte trace, host log, and machine-readable result
+under a new temporary output directory. Use repeated `--case RATE:BLOCK` and
+`--seed N` options to select a smaller or broader deterministic matrix.
+
+The captured replay defaults to response-relative heartbeat timing because the
+original serial fault was phase-sensitive. It also records the exact workload,
+configuration, logs, and MIDI output in its reported artifact directory. For a
+fully pre-scheduled timing baseline, set `PROFLIGACY_REPLAY_HEALTH_FIXED_SCHEDULE=1`
+and provide comma-separated emulated timestamps in
+`PROFLIGACY_REPLAY_HEALTH_TIMES`.
+
 At runtime, choose a ROM directory containing either
 `korgprop/ic12_v17.bin` plus `korgprop/ic22_v17.bin`, or an equivalent
 `korgprop.zip`. The HD44780 A00 LCD character table is a documented datasheet
