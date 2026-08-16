@@ -88,6 +88,7 @@ int main(int argc, char **argv)
 	const double      metricWarmup = env_double("PROPHOST_METRIC_WARMUP", 0.0);
 	const char       *wav       = std::getenv("PROPHOST_WAV_OUT");
 	const char       *midiTxOut = std::getenv("PROPHOST_MIDI_TX_OUT");
+	const bool        captureWav = std::getenv("PROPHOST_NO_WAV") == nullptr;
 	if (!wav) wav = ring_mode ? "console_ring_out.wav" : "console_out.wav";
 
 #if defined(__APPLE__)
@@ -148,10 +149,11 @@ int main(int argc, char **argv)
 		{
 			std::size_t got = engine.pull(L.data(), R.data(), block);
 			drainMidiTx();
-			for (std::size_t i = 0; i < got; i++) { outwav.push_back(to_s16(L[i])); outwav.push_back(to_s16(R[i])); }
+			if (captureWav)
+				for (std::size_t i = 0; i < got; i++) { outwav.push_back(to_s16(L[i])); outwav.push_back(to_s16(R[i])); }
 			if (got == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
-		if (!outwav.empty()) write_wav(wav, outwav, kRate, uint16_t(kCh));
+		if (captureWav && !outwav.empty()) write_wav(wav, outwav, kRate, uint16_t(kCh));
 		finishMidiTx();
 		std::fprintf(stderr, "\n[console] ===== capture (MAME on worker thread) =====\n"
 				"[console] produced=%llu frames (%.3f s) | wav=%s\n",
@@ -200,6 +202,40 @@ int main(int argc, char **argv)
 			while (bs >> tok) e.bytes.push_back((uint8_t)std::strtol(tok.c_str(), nullptr, 16));
 			if (!e.bytes.empty()) testMidi.push_back(std::move(e));
 		}
+	}
+	// Fixed watchdog requests must be merged with the other timed MIDI before
+	// enqueueing: the real-time SPSC queue is chronological FIFO by design.
+	const double healthInterval = env_double("PROPHOST_HEALTH_INTERVAL", 0.0);
+	const double healthStart = env_double("PROPHOST_HEALTH_START", 12.0);
+	const double healthStop = env_double("PROPHOST_HEALTH_STOP", 1.0e30);
+	const double healthTimeout = env_double("PROPHOST_HEALTH_TIMEOUT", 3.0);
+	std::vector<double> healthTimes;
+	if (const char *times = std::getenv("PROPHOST_HEALTH_TIMES"))
+	{
+		std::stringstream list(times);
+		std::string item;
+		while (std::getline(list, item, ','))
+		{
+			const double at = std::atof(item.c_str());
+			if (!item.empty() && at >= 0.0)
+				healthTimes.push_back(at);
+		}
+	}
+	const char *healthFixedEnv = std::getenv("PROPHOST_HEALTH_FIXED_SCHEDULE");
+	const bool healthFixedRequested = healthFixedEnv && std::string(healthFixedEnv) != "0";
+	if (healthTimes.empty() && healthFixedRequested && healthInterval > 0.0 && healthStop < 1.0e9)
+		for (double at = healthStart; at <= healthStop; at += healthInterval)
+			healthTimes.push_back(at);
+	std::sort(healthTimes.begin(), healthTimes.end());
+	healthTimes.erase(std::unique(healthTimes.begin(), healthTimes.end()), healthTimes.end());
+	const bool healthUseTimes = !healthTimes.empty();
+	const bool healthFixedSchedule = healthUseTimes || healthFixedRequested;
+	if (healthUseTimes)
+	{
+		const std::vector<std::uint8_t> request = {0xF0, 0x42, 0x30, 0x41, 0x10, 0x00, 0xF7};
+		for (const double at : healthTimes)
+			if (at <= healthStop)
+				testMidi.push_back(TestEvt{at, request});
 	}
 	std::stable_sort(testMidi.begin(), testMidi.end(),
 		[](const TestEvt &left, const TestEvt &right) { return left.t < right.t; });
@@ -339,6 +375,64 @@ int main(int argc, char **argv)
 			static_cast<std::uint64_t>(std::llround(dumpAt * kRate)));
 	}
 
+	// End-to-end firmware liveness watchdog. Each heartbeat sends a current-program
+	// dump request and requires a fresh, complete reply before the emulated-time
+	// deadline. This catches a wedged V55/H8 control plane even when audio production
+	// and host MIDI ingress continue normally.
+	const char *healthMissEnv = std::getenv("PROPHOST_HEALTH_MAX_CONSECUTIVE_MISSES");
+	const std::uint64_t healthMaxConsecutiveMisses = healthMissEnv
+		? std::strtoull(healthMissEnv, nullptr, 10) : 2;
+	const bool healthEnabled = healthInterval > 0.0 || healthUseTimes;
+	std::size_t healthTimeIndex = 0;
+	double healthNext = healthUseTimes ? healthTimes.front() : healthStart;
+	double healthRequestedAt = -1.0;
+	double healthMaxLatency = 0.0;
+	std::uint32_t healthBaselineVersion = 0;
+	std::uint64_t healthRequests = 0, healthReplies = 0, healthMisses = 0;
+	std::uint64_t healthConsecutiveMisses = 0, healthWorstConsecutiveMisses = 0;
+	bool healthPending = false, healthFailed = false;
+	std::string healthFailure;
+	auto failHealth = [&](const std::string &reason) {
+		if (!healthFailed)
+		{
+			healthFailed = true;
+			healthFailure = reason;
+			std::fprintf(stderr, "[health] FAIL t=%.3f %s\n",
+				double(engine.producedFrames()) / kRate, reason.c_str());
+		}
+	};
+	auto requestHealth = [&](double requestAt, std::uint32_t version, bool scheduled) {
+		const std::uint8_t request[7] = {0xF0, 0x42, 0x30, 0x41, 0x10, 0x00, 0xF7};
+		healthBaselineVersion = version;
+		healthRequestedAt = requestAt;
+		++healthRequests;
+		const bool prequeued = scheduled && healthUseTimes;
+		const bool accepted = prequeued
+			? true
+			: scheduled
+			? engine.pushMidiAtFrame(request, sizeof(request),
+				static_cast<std::uint64_t>(std::llround(requestAt * kRate)))
+			: engine.pushMidi(request, sizeof(request));
+		if (!accepted)
+			failHealth(scheduled
+				? "current-program dump request was rejected by the scheduled MIDI queue"
+				: "current-program dump request was rejected by the immediate MIDI queue");
+		else
+		{
+			healthPending = true;
+			std::fprintf(stderr, "[health] request=%llu t=%.3f baseline_version=%u%s\n",
+				(unsigned long long)healthRequests, requestAt, version,
+				scheduled ? " scheduled" : "");
+		}
+	};
+	if (healthEnabled && healthFixedSchedule && healthNext <= healthStop)
+	{
+		std::uint8_t dump[1024];
+		std::uint32_t version = 0;
+		engine.latestProgramData(dump, sizeof(dump), &version);
+		requestHealth(healthNext, version, true);
+	}
+
 	// State round-trip test (PROPHOST_STATE_TEST=1): patch A08 note (ref) -> capture its dump ->
 	// switch to A00 -> inject the captured dump -> note (should sound like A08 again = setState works).
 	const bool           stateTest = std::getenv("PROPHOST_STATE_TEST") != nullptr;
@@ -360,6 +454,72 @@ int main(int argc, char **argv)
 		if (!fast_ring)
 			std::this_thread::sleep_until(next);
 		const double emu = double(engine.producedFrames()) / kRate;
+		if (healthEnabled && !healthFailed)
+		{
+			std::uint8_t dump[1024];
+			std::uint32_t version = 0;
+			const std::size_t dumpBytes = engine.latestProgramData(dump, sizeof(dump), &version);
+			if (healthPending && version > healthBaselineVersion)
+			{
+				const double latency = emu - healthRequestedAt;
+				if (dumpBytes < 535)
+					failHealth("fresh current-program dump was shorter than 535 unpacked bytes");
+				else
+				{
+					++healthReplies;
+					healthConsecutiveMisses = 0;
+					healthMaxLatency = std::max(healthMaxLatency, latency);
+					healthPending = false;
+					if (healthUseTimes)
+					{
+						++healthTimeIndex;
+						healthNext = healthTimeIndex < healthTimes.size()
+							? healthTimes[healthTimeIndex] : 1.0e30;
+					}
+					else
+						healthNext = healthFixedSchedule
+							? healthRequestedAt + healthInterval
+							: emu + healthInterval;
+					std::fprintf(stderr,
+						"[health] reply=%llu t=%.3f latency=%.3f bytes=%zu version=%u\n",
+						(unsigned long long)healthReplies, emu, latency, dumpBytes, version);
+				}
+			}
+			else if (healthPending && emu - healthRequestedAt > healthTimeout)
+			{
+				++healthMisses;
+				++healthConsecutiveMisses;
+				healthWorstConsecutiveMisses = std::max(
+					healthWorstConsecutiveMisses, healthConsecutiveMisses);
+				if (healthConsecutiveMisses > healthMaxConsecutiveMisses)
+				{
+					std::ostringstream reason;
+					reason << healthConsecutiveMisses
+						<< " consecutive current-program dump timeouts; last attempt="
+						<< healthRequests << " waited " << (emu - healthRequestedAt)
+						<< " emulated seconds (baseline_version=" << healthBaselineVersion
+						<< ", current_version=" << version << ')';
+					failHealth(reason.str());
+				}
+				else
+				{
+					std::fprintf(stderr,
+						"[health] MISS request=%llu t=%.3f consecutive=%llu; retrying\n",
+						(unsigned long long)healthRequests, emu,
+						(unsigned long long)healthConsecutiveMisses);
+					healthPending = false;
+					requestHealth(emu, version, false);
+				}
+			}
+
+			if (!healthFailed && !healthPending && healthNext <= healthStop)
+			{
+				if (healthFixedSchedule)
+					requestHealth(healthNext, version, true);
+				else if (emu >= healthNext)
+					requestHealth(emu, version, false);
+			}
+		}
 		if (soakSecs > 0)
 		{
 			if (soakNote < 0 && emu >= soakNextNoteOn)
@@ -536,7 +696,7 @@ int main(int argc, char **argv)
 		for (std::size_t i = 0; i < got; i++)
 		{
 			int16_t l = to_s16(L[i]), r = to_s16(R[i]);
-			outwav.push_back(l); outwav.push_back(r);
+			if (captureWav) { outwav.push_back(l); outwav.push_back(r); }
 			int a = std::abs(int(l)); if (a > peak) peak = a;
 			a = std::abs(int(r));     if (a > peak) peak = a;
 		}
@@ -565,9 +725,14 @@ int main(int argc, char **argv)
 	{
 		std::size_t got = engine.pull(L.data(), R.data(), block);
 		if (!got) break;
-		for (std::size_t i = 0; i < got; i++) { outwav.push_back(to_s16(L[i])); outwav.push_back(to_s16(R[i])); }
+		if (captureWav)
+			for (std::size_t i = 0; i < got; i++) { outwav.push_back(to_s16(L[i])); outwav.push_back(to_s16(R[i])); }
 		consumed += got;
 	}
+	if (healthEnabled && !healthFailed && healthPending)
+		failHealth("machine stopped before the outstanding current-program dump reply arrived");
+	if (healthEnabled && !healthFailed && healthReplies == 0)
+		failHealth("run ended before any current-program dump heartbeat completed");
 
 	// TX seam report: parse the captured firmware sysex into messages, count 0x40 patch dumps.
 	for (std::size_t g; (g = engine.popMidiTx(txtmp, sizeof(txtmp))) > 0; )
@@ -593,13 +758,30 @@ int main(int argc, char **argv)
 	const double emulated = double(engine.producedFrames()) / kRate;
 	const double ratio    = emulated > 0 ? wall / emulated : 0.0;
 	const bool   selfclk  = ratio > 0.95 && ratio < 1.15 && underruns <= 2;
-	if (!outwav.empty()) write_wav(wav, outwav, kRate, uint16_t(kCh));
+	const std::uint64_t immediateMidiDrops = engine.droppedImmediateMidiBytes();
+	const std::uint64_t scheduledMidiDrops = engine.droppedScheduledMidiBytes();
+	const std::uint64_t scheduledPanelDrops = engine.droppedScheduledPanelEvents();
+	const std::uint64_t scheduledAdinDrops = engine.droppedScheduledAdinEvents();
+	const std::uint64_t midiTxDrops = engine.droppedMidiTxByteEvents();
+	if (healthEnabled && !healthFailed && (immediateMidiDrops != 0 || scheduledMidiDrops != 0
+			|| scheduledPanelDrops != 0 || scheduledAdinDrops != 0 || midiTxDrops != 0))
+		failHealth("a host MIDI/control diagnostic queue reported dropped traffic");
+	if (captureWav && !outwav.empty()) write_wav(wav, outwav, kRate, uint16_t(kCh));
 	finishMidiTx();
-	std::fprintf(stderr, "[console] scheduled-midi-dropped=%llu\n",
-		(unsigned long long)engine.droppedScheduledMidiBytes());
+	if (healthEnabled)
+		std::fprintf(stderr,
+			"[health] SUMMARY requests=%llu replies=%llu misses=%llu "
+			"worst_consecutive_misses=%llu max_latency=%.3f verdict=%s%s%s%s\n",
+			(unsigned long long)healthRequests, (unsigned long long)healthReplies,
+			(unsigned long long)healthMisses,
+			(unsigned long long)healthWorstConsecutiveMisses,
+			healthMaxLatency, healthFailed ? "FAIL" : "PASS",
+			healthFailed ? " reason=\"" : "", healthFailed ? healthFailure.c_str() : "",
+			healthFailed ? "\"" : "");
+	std::fprintf(stderr, "[console] immediate-midi-dropped=%llu scheduled-midi-dropped=%llu\n",
+		(unsigned long long)immediateMidiDrops, (unsigned long long)scheduledMidiDrops);
 	std::fprintf(stderr, "[console] scheduled-control-dropped=panel:%llu adin:%llu\n",
-		(unsigned long long)engine.droppedScheduledPanelEvents(),
-		(unsigned long long)engine.droppedScheduledAdinEvents());
+		(unsigned long long)scheduledPanelDrops, (unsigned long long)scheduledAdinDrops);
 	std::fprintf(stderr,
 		"[console] underrun-detail total_callbacks=%llu total_frames=%llu "
 		"post_warmup_seconds=%.3f post_warmup_callbacks=%llu post_warmup_frames=%llu "
@@ -617,6 +799,6 @@ int main(int argc, char **argv)
 			block, emulated, wall, ratio,
 			(unsigned long long)ticks, (unsigned long long)underruns, peak,
 			selfclk ? "SELF-CLOCKED via ring backpressure" : "NOT self-clocked (CPU contention?)",
-			wav);
-	return 0;
+			captureWav ? wav : "(disabled)");
+	return healthFailed ? 1 : 0;
 }

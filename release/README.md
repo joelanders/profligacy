@@ -109,3 +109,25 @@ physical-history check: deleting a private file or proprietary firmware dump in
 a later commit is not sufficient because the old blob would remain publishable.
 The reviewed HD44780 datasheet reconstruction compiled into the public source is
 intentional and is guarded by `editor_asset_provenance`.
+
+## Updating an existing public repository
+
+A clean integration worktree is a patch source, not a publication checkout.
+Create fresh clones from the public GitHub repositories and never add a research
+repository as a remote there.
+
+Before transferring anything, enumerate the complete integration delta from the
+actual public base with `git diff --name-status PUBLIC_BASE..INTEGRATION_TARGET`.
+Every path must be explicitly classified as public or excluded; an unclassified
+path fails the release. Do not replace this complete inventory with a hand-made
+source-file list. Apply the full reviewed MAME delta, then require the resulting
+public MAME root tree from `git rev-parse HEAD^{tree}` to equal the staged
+integration MAME tree from `git write-tree`. For the product repository, compare
+the Git object IDs of every declared shipping path and separately confirm that
+`notes/` and `HANDOVER.md` are absent.
+
+The release workflow pins both the public MAME commit and its complete root tree.
+Merge the MAME publication PR without squashing away the pinned commit, and
+verify that the pin is an ancestor of the public MAME branch before merging,
+tagging, or packaging the product. Only then may the product PR and release
+artifact workflow proceed.

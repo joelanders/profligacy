@@ -21,7 +21,8 @@ permissions:
   contents: read
 
 env:
-  MAME_SHA: e8d82f1e8bc07d6f01322506949bef4833ef7c36
+  MAME_SHA: 100fa688cee690aa811d181f87ee83c31e7ae0f9
+  MAME_TREE: 985d1a45ee8221aed9e5228880719c6cecf870ad
 
 jobs:
   macos-arm64:
@@ -36,6 +37,7 @@ jobs:
           git submodule update --init --depth 1 extern/JUCE
           git submodule update --init --depth 1 extern/mame
           test "$(git -C extern/mame rev-parse HEAD)" = "$MAME_SHA"
+          test "$(git -C extern/mame rev-parse 'HEAD^{tree}')" = "$MAME_TREE"
       - name: Build pinned static SDL2
         run: |
           archive="$RUNNER_TEMP/SDL2-2.32.10.tar.gz"
@@ -147,7 +149,7 @@ jobs:
           done
       - name: Package macOS alpha ZIP
         run: |
-          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.3-macOS-arm64"
+          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.4-macOS-arm64"
           mkdir -p "$package"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/AU/Profligacy.component "$package/Profligacy.component"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 "$package/Profligacy.vst3"
@@ -157,10 +159,10 @@ jobs:
           (cd "$RUNNER_TEMP" && shasum -a 256 "$(basename "$package.zip")") > "$package.zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.3-macOS-arm64-${{ github.sha }}
+          name: Profligacy-1.0.0-alpha.4-macOS-arm64-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.3-macOS-arm64.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.3-macOS-arm64.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.4-macOS-arm64.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.4-macOS-arm64.zip.sha256
           retention-days: 7
           if-no-files-found: error
 
@@ -193,6 +195,7 @@ jobs:
           git submodule update --init --depth 1 extern/JUCE
           git submodule update --init --depth 1 extern/mame
           if ((git -C extern/mame rev-parse HEAD) -ne $env:MAME_SHA) { throw 'wrong MAME revision' }
+          if ((git -C extern/mame rev-parse 'HEAD^{tree}') -ne $env:MAME_TREE) { throw 'wrong MAME tree' }
       - name: Generate focused native MAME VS2022 project
         if: steps.mame-sdk-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
@@ -369,7 +372,7 @@ jobs:
       - name: Package Windows alpha ZIP
         shell: pwsh
         run: |
-          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.3-Windows-x64-experimental'
+          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.4-Windows-x64-experimental'
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item -Recurse -LiteralPath `
             build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
@@ -384,9 +387,9 @@ jobs:
           "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -Encoding ascii -NoNewline "$zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.3-Windows-x64-experimental-${{ github.sha }}
+          name: Profligacy-1.0.0-alpha.4-Windows-x64-experimental-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.3-Windows-x64-experimental.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.3-Windows-x64-experimental.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.4-Windows-x64-experimental.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.4-Windows-x64-experimental.zip.sha256
           retention-days: 7
           if-no-files-found: error

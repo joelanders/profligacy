@@ -244,18 +244,30 @@ def evaluate(
     record("exact_dependency_gitlinks", dependency_errors)
 
     checkout_errors: list[str] = []
+    dependency_tree_errors: list[str] = []
+    expected_trees = manifest.get("dependency_trees", {})
     for path, expected in dependencies.items():
         directory = repo / path
         if not (directory / ".git").exists():
             checkout_errors.append(f"{path}: not initialized")
+            if path in expected_trees:
+                dependency_tree_errors.append(f"{path}: not initialized")
             continue
         actual = git(directory, "rev-parse", "HEAD")
         if actual != expected:
             checkout_errors.append(f"{path}: checkout {actual}, expected {expected}")
+        expected_tree = expected_trees.get(path)
+        if expected_tree is not None:
+            actual_tree = git(directory, "rev-parse", "HEAD^{tree}")
+            if actual_tree != expected_tree:
+                dependency_tree_errors.append(
+                    f"{path}: tree {actual_tree}, expected {expected_tree}"
+                )
         sub_status = git(directory, "status", "--porcelain", "--untracked-files=no")
         if sub_status:
             checkout_errors.append(f"{path}: tracked checkout is dirty")
     record("exact_dependency_checkouts", checkout_errors)
+    record("exact_dependency_trees", dependency_tree_errors)
 
     if phase == "integration":
         missing = missing_patch_equivalents(
