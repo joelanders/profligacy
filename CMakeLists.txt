@@ -26,6 +26,7 @@ if(BUILD_TESTING)
 		release_preflight
 		release_licensing
 		run_ci_rom_e2e
+		run_headless_midi_stress
 		run_arp_timing_suite
 		run_control_abba_repeatability
 		run_clean_mame_performance_equivalence

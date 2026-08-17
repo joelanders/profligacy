@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <utility>
 #include <vector>
 
@@ -65,6 +66,17 @@ public:
 		std::uint64_t droppedUiAdinEvents = 0;
 		std::uint64_t droppedAudioAdinEvents = 0;
 		std::uint64_t oversizedBlocks = 0;
+		std::uint64_t editorPatchIntents = 0;
+		std::uint64_t editorPatchSends = 0;
+		std::uint64_t editorDumpRequests = 0;
+		std::uint64_t editorDumpSends = 0;
+		std::uint64_t editorClockTicksSuppressed = 0;
+		std::uint64_t patchLoadMidiEventsSuppressed = 0;
+		std::uint64_t editorCommandsSent = 0;
+		std::uint64_t editorCommandsCoalesced = 0;
+		std::uint64_t editorCommandsCancelled = 0;
+		std::uint64_t editorCommandsDropped = 0;
+		std::size_t editorCommandsPending = 0;
 	};
 	DiagnosticSnapshot diagnosticSnapshot() const;
 
@@ -100,11 +112,11 @@ public:
 	bool maybeBootEngine();                        // boot once iff a valid ROM set is locatable
 	void selectPatch(int program);       // bank-select + program change (0..127 = A00..B63)
 	// Raw MIDI from the editor (faceplate keybed note on/off etc.) into the emulated UART.
-	void sendMidi(const std::uint8_t *bytes, std::size_t n) { (void) pushImmediateMidi(bytes, n); }
+	void sendMidi(const std::uint8_t *bytes, std::size_t n);
 	// Faceplate front-panel controls, through the engine's host seams (drained on the
 	// MAME thread at 1 kHz; SCANQ reports pulses to the firmware as real scan codes).
-	void panelPulse(int row, int bit) { m_engine.pushPanelPulse(row, bit); }
-	void setAdin(int source, int value) { (void) pushUiAdin(source, value); }
+	void panelPulse(int row, int bit);
+	void setAdin(int source, int value);
 	// CC -> analog-controller remap. Host control-change (0xB0) messages whose CC number is
 	// mapped are translated to a front-panel ADIN write (X/Y pad, ribbon Z, wheel1/2) instead
 	// of being forwarded raw. Target enum matches the editor's dropdown order.
@@ -117,6 +129,7 @@ public:
 	// Persisted in the plugin state and applied as an ADIN9 write. Default 0x80 matches the
 	// driver's built-in ADIN9 rest, so an unset/legacy session sounds byte-for-byte identical.
 	void setWheel2(int value);                   // message thread: stores + pushes ADIN9 (0..255)
+	void setWheel2FromEditor(int value);         // editor path: stores + uses the shared pacer
 	int  wheel2Pos() const { return m_wheel2Pos.load(std::memory_order_relaxed); } // 0..255
 	std::uint32_t ledSnapshot(std::uint8_t out[12]) const { return m_engine.ledSnapshot(out); }
 	std::uint32_t lcdRawSnapshot(std::uint8_t r1[40], std::uint8_t r2[40], std::uint8_t cg[64]) const
@@ -150,9 +163,9 @@ public:
 	bool getLcd(char *line1, char *line2, std::size_t cap) const { return m_engine.latestLcd(line1, line2, cap); }
 	// Param read-back: ask the firmware for the current-program dump (its 0x40 reply is captured +
 	// unpacked by the engine); the editor then reads knob values out of the raw program bytes.
-	void requestProgramDump(); // fire-and-forget dump request (result arrives async)
-	std::size_t getProgramData(std::uint8_t *out, std::size_t cap, std::uint32_t *version) const
-	{ return m_engine.latestProgramData(out, cap, version); }
+	std::uint64_t requestProgramDump(); // returns the coalesced/retried transaction generation
+	std::size_t getProgramData(std::uint8_t *out, std::size_t cap, std::uint32_t *version,
+		std::uint64_t *completedRequestGeneration = nullptr) const;
 	// Arpeggiator editor transport. Pattern numbers are the ten INT PAT slots:
 	// 0..4 = UP/DOWN/ALT1/ALT2/RANDOM, 5..9 = PAT1..PAT5.
 	void selectArpeggioPattern(int pattern);                 // documented NRPN 00/01
@@ -218,7 +231,170 @@ private:
 	};
 	ParamBurst         m_renameBurst { *this };
 	ParamBurst         m_macroBurst  { *this }; // quick-init patch macros (sendMacro)
-	void sendPatchNow(int program);
+
+	// All non-musical editor mutations share one bounded, coalescing path. The
+	// firmware can wedge its internal H8/V55 link if a patch load overlaps a burst
+	// of independent editor commands even though the host MIDI rings never drop a
+	// byte. Musical note input remains immediate; edit/control work is paced at a
+	// hardware-scale interval and held behind the patch-load barrier.
+	class EditorCommandPacer : private juce::Timer
+	{
+	public:
+		explicit EditorCommandPacer(ProphecyAudioProcessor &p) : m_proc(p) {}
+		~EditorCommandPacer() override { stopTimer(); }
+		void holdForPatchLoad(int milliseconds)
+		{
+			m_cancelled.fetch_add(m_queue.size(), std::memory_order_relaxed);
+			m_queue.clear();
+			m_holdUntilMs = juce::Time::getMillisecondCounterHiRes()
+				+ (double)std::max(milliseconds, 0);
+			startTimer(10);
+		}
+		void extendPatchLoad(int milliseconds)
+		{
+			m_holdUntilMs = std::max(m_holdUntilMs,
+				juce::Time::getMillisecondCounterHiRes()
+					+ (double)std::max(milliseconds, 0));
+			if (!isTimerRunning()) startTimer(10);
+		}
+		void enqueueMidi(int key, const std::uint8_t *bytes, std::size_t size)
+		{
+			if (bytes == nullptr || size == 0) return;
+			for (auto it = m_queue.rbegin(); it != m_queue.rend(); ++it)
+			{
+				if (key >= 0 && it->kind == Command::Kind::Midi && it->key == key)
+				{
+					it->bytes.assign(bytes, bytes + size);
+					m_coalesced.fetch_add(1, std::memory_order_relaxed);
+					return;
+				}
+			}
+			if (m_queue.size() >= kCapacity)
+			{
+				m_dropped.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+			Command command;
+			command.kind = Command::Kind::Midi;
+			command.key = key;
+			command.bytes.assign(bytes, bytes + size);
+			m_queue.push_back(std::move(command));
+			if (!isTimerRunning()) startTimer(1);
+		}
+		void enqueuePanel(int row, int bit)
+		{
+			if (m_queue.size() >= kCapacity)
+			{
+				m_dropped.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+			Command command;
+			command.kind = Command::Kind::Panel;
+			command.a = row;
+			command.b = bit;
+			m_queue.push_back(std::move(command));
+			if (!isTimerRunning()) startTimer(1);
+		}
+		void enqueueAdin(int source, int value)
+		{
+			for (auto it = m_queue.rbegin(); it != m_queue.rend(); ++it)
+			{
+				if (it->kind == Command::Kind::Adin && it->key == source)
+				{
+					it->b = value;
+					m_coalesced.fetch_add(1, std::memory_order_relaxed);
+					return;
+				}
+			}
+			if (m_queue.size() >= kCapacity)
+			{
+				m_dropped.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+			Command command;
+			command.kind = Command::Kind::Adin;
+			command.key = source;
+			command.a = source;
+			command.b = value;
+			m_queue.push_back(std::move(command));
+			if (!isTimerRunning()) startTimer(1);
+		}
+		bool busy() const
+		{
+			return !m_queue.empty()
+				|| juce::Time::getMillisecondCounterHiRes() < m_holdUntilMs
+				|| m_proc.patchLoadMidiGateActive();
+		}
+		std::uint64_t sent() const { return m_sent.load(std::memory_order_relaxed); }
+		std::uint64_t coalesced() const { return m_coalesced.load(std::memory_order_relaxed); }
+		std::uint64_t cancelled() const { return m_cancelled.load(std::memory_order_relaxed); }
+		std::uint64_t dropped() const { return m_dropped.load(std::memory_order_relaxed); }
+		std::size_t pending() const { return m_queue.size(); }
+	private:
+		struct Command
+		{
+			enum class Kind { Midi, Panel, Adin } kind = Kind::Midi;
+			int key = -1;
+			int a = 0, b = 0;
+			std::vector<std::uint8_t> bytes;
+		};
+		void timerCallback() override
+		{
+			const double now = juce::Time::getMillisecondCounterHiRes();
+			if (m_proc.patchLoadMidiGateActive())
+			{
+				// DAW Program Changes extend the frame-based gate on the audio
+				// callback. Observe that atomic gate here instead of starting or
+				// touching a JUCE timer from the real-time thread.
+				startTimer(25);
+				return;
+			}
+			if (now < m_holdUntilMs)
+			{
+				startTimer(std::max(1, (int)std::ceil(m_holdUntilMs - now)));
+				return;
+			}
+			if (m_queue.empty()) { stopTimer(); return; }
+			Command &command = m_queue.front();
+			bool accepted = true;
+			if (command.kind == Command::Kind::Midi)
+				accepted = m_proc.pushImmediateMidi(command.bytes.data(), command.bytes.size());
+			else if (command.kind == Command::Kind::Panel)
+				m_proc.m_engine.pushPanelPulse(command.a, command.b);
+			else
+				accepted = m_proc.pushUiAdin(command.a, command.b);
+			if (accepted)
+			{
+				m_queue.pop_front();
+				m_sent.fetch_add(1, std::memory_order_relaxed);
+			}
+			startTimer(accepted ? kIntervalMs : 25);
+		}
+		static constexpr std::size_t kCapacity = 256;
+		static constexpr int kIntervalMs = 75;
+		ProphecyAudioProcessor &m_proc;
+		std::deque<Command> m_queue;
+		double m_holdUntilMs = -1.0e9;
+		std::atomic<std::uint64_t> m_sent { 0 };
+		std::atomic<std::uint64_t> m_coalesced { 0 };
+		std::atomic<std::uint64_t> m_cancelled { 0 };
+		std::atomic<std::uint64_t> m_dropped { 0 };
+	};
+	EditorCommandPacer m_editorCommandPacer { *this };
+	// Program loading plus concurrent MIDI can wedge the emulated H8/V55 control
+	// link even when every host-side byte was accepted. Treat loading as an atomic
+	// transaction: releases always pass, while new musical/control work waits for a
+	// bounded host-frame window. This covers editor and DAW Program Changes.
+	void holdMidiForPatchLoad(double seconds);
+	bool patchLoadMidiGateActive() const
+	{
+		return m_audioHostFrames.load(std::memory_order_relaxed)
+			< m_patchLoadMidiGateUntilFrame.load(std::memory_order_acquire);
+	}
+	static bool suppressDuringPatchLoad(const std::uint8_t *bytes, std::size_t size);
+	static constexpr double kPatchLoadQuarantineSeconds = 2.0;
+	static constexpr double kPatchSelectMinIntervalMs = 2500.0;
+	bool sendPatchNow(int program);
 	class PatchSelectDelay : private juce::Timer
 	{
 	public:
@@ -228,18 +404,114 @@ private:
 		void schedule(int program)
 		{
 			m_program = program;
-			startTimer(150);
+			startTimer(500);
 		}
 	private:
 		void timerCallback() override
 		{
 			stopTimer();
-			m_proc.sendPatchNow(m_program);
+			if (!m_proc.sendPatchNow(m_program)) startTimer(25);
 		}
 		ProphecyAudioProcessor &m_proc;
 		int m_program = 0;
 	};
 	PatchSelectDelay   m_patchSelectDelay { *this };
+
+	// Current-program dumps share the firmware MIDI task with Program Change. Keep one
+	// editor request in flight, wait for a recently selected patch to finish loading,
+	// and retry a request the firmware discarded while busy. The WebView and headless
+	// editor-stress scenario both enter through requestProgramDump(), so this is the one
+	// production scheduling policy rather than a second test-only approximation.
+	class ProgramDumpSync : private juce::Timer
+	{
+	public:
+		explicit ProgramDumpSync(ProphecyAudioProcessor &p) : m_proc(p) {}
+		~ProgramDumpSync() override { stopTimer(); }
+		std::uint64_t request(int delayMs)
+		{
+			std::uint8_t byte = 0;
+			std::uint32_t currentVersion = 0;
+			m_proc.getProgramData(&byte, 1, &currentVersion);
+			if (isTimerRunning())
+			{
+				// Reuse a genuinely pending transaction, but do not suppress a new manual
+				// refresh merely because the completed transaction's 800 ms check has not run.
+				if (!m_sent.load(std::memory_order_acquire)
+						|| currentVersion <= m_baselineVersion.load(std::memory_order_acquire))
+					return m_generation.load(std::memory_order_acquire);
+				stopTimer();
+			}
+			m_baselineVersion.store(currentVersion, std::memory_order_release);
+			m_generation.store(m_nextGeneration.fetch_add(1, std::memory_order_relaxed) + 1,
+				std::memory_order_release);
+			m_attempts = 0;
+			m_sent.store(false, std::memory_order_release);
+			if (delayMs > 0) startTimer(delayMs);
+			else sendRequest();
+			return m_generation.load(std::memory_order_acquire);
+		}
+		void cancel()
+		{
+			stopTimer();
+			m_attempts = 0;
+			m_sent.store(false, std::memory_order_release);
+		}
+		std::uint64_t observe(std::uint32_t version) const
+		{
+			const std::uint64_t generation = m_generation.load(std::memory_order_acquire);
+			if (generation != 0 && m_sent.load(std::memory_order_acquire)
+					&& version > m_baselineVersion.load(std::memory_order_acquire))
+			{
+				std::uint64_t completed = m_completedGeneration.load(std::memory_order_relaxed);
+				while (completed < generation && !m_completedGeneration.compare_exchange_weak(
+					completed, generation, std::memory_order_release, std::memory_order_relaxed)) {}
+			}
+			return m_completedGeneration.load(std::memory_order_acquire);
+		}
+	private:
+		void sendRequest()
+		{
+			if (m_proc.m_editorCommandPacer.busy()) { startTimer(100); return; }
+			const bool firstAttempt = m_attempts == 0;
+			++m_attempts;
+			(void)m_proc.sendProgramDumpNow();
+			if (firstAttempt)
+			{
+				// A request may have waited behind a patch load for seconds. Refresh
+				// the baseline immediately after the causal enqueue boundary so an
+				// obsolete reply that arrived during that delay cannot complete this
+				// generation. The firmware cannot round-trip the new serial request
+				// before this same-thread snapshot.
+				std::uint8_t byte = 0;
+				std::uint32_t version = 0;
+				m_proc.getProgramData(&byte, 1, &version);
+				m_baselineVersion.store(version, std::memory_order_release);
+			}
+			m_sent.store(true, std::memory_order_release);
+			startTimer(800);
+		}
+		void timerCallback() override
+		{
+			if (!m_sent.load(std::memory_order_acquire)) { sendRequest(); return; }
+			std::uint8_t byte = 0;
+			std::uint32_t version = 0;
+			m_proc.getProgramData(&byte, 1, &version);
+			if (observe(version) >= m_generation.load(std::memory_order_acquire))
+				{ stopTimer(); return; }
+			if (m_attempts >= 3) { stopTimer(); return; }
+			sendRequest();
+		}
+		ProphecyAudioProcessor &m_proc;
+		std::atomic<std::uint32_t> m_baselineVersion { 0 };
+		int m_attempts = 0;
+		std::atomic<bool> m_sent { false };
+		std::atomic<std::uint64_t> m_nextGeneration { 0 };
+		std::atomic<std::uint64_t> m_generation { 0 };
+		mutable std::atomic<std::uint64_t> m_completedGeneration { 0 };
+	};
+	ProgramDumpSync    m_programDumpSync { *this };
+	bool sendProgramDumpNow();
+	double             m_lastPatchSendMs = -1.0e9;
 
 	// CC->ADIN remap table (target per CC number; 0 = Off = pass through raw). Written on
 	// the message thread, read on the audio thread. m_padXHeld/m_padYHeld gate ADIN14
@@ -301,6 +573,13 @@ private:
 	std::atomic<std::uint64_t> m_audioUnderrunFrames { 0 };
 	std::atomic<std::uint64_t> m_hostMidiEvents { 0 };
 	std::atomic<std::uint32_t> m_lastHostMidi { 0 };
+	std::atomic<std::uint64_t> m_editorPatchIntents { 0 };
+	std::atomic<std::uint64_t> m_editorPatchSends { 0 };
+	std::atomic<std::uint64_t> m_editorDumpRequests { 0 };
+	std::atomic<std::uint64_t> m_editorDumpSends { 0 };
+	std::atomic<std::uint64_t> m_patchLoadMidiGateUntilFrame { 0 };
+	std::atomic<std::uint64_t> m_editorClockTicksSuppressed { 0 };
+	std::atomic<std::uint64_t> m_patchLoadMidiEventsSuppressed { 0 };
 	std::array<std::atomic<std::uint64_t>, 2> m_activeHostNotes {};
 	bool               m_skipStateRestore = false;
 

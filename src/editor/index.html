@@ -2583,12 +2583,11 @@
   // ============================ patch nav ============================
   const bankName = n => "AB"[Math.floor(n/64)] + String(n%64).padStart(2,"0");
   let patch = 0;
-  // Every click sends its bank-select+PC immediately — the firmware sees exactly what
-  // mashing the hardware's buttons would send, and behaves as the hardware does (each
-  // load is ~0.4-0.5 s of machine time, so rapid clicking queues work, like the real
-  // unit). What IS debounced is the editor-only knob-refresh dump (619-byte reply per
-  // request): requesting one per click amplified rapid browsing into minutes of backlog
-  // (the "synth froze" playtest bug). Only the patch you settle on gets its dump read.
+  // Every click updates the visible intent and crosses the bridge. C++ coalesces rapid
+  // selections to the last requested patch because each firmware load costs ~0.4-0.5 s;
+  // forwarding every intermediate arrow click made overload indistinguishable from a
+  // frozen synth. The editor also requests only the settled patch's 619-byte read-back;
+  // C++ waits for Program Change to settle and retries a firmware-busy dropped request.
   let syncTimer = null;
   // Header name label: sysram program names, refreshed whenever the browser refetches.
   let patchNames = [];
@@ -2602,7 +2601,7 @@
     native("selectPatch", patch);
     highlightBrowser();
     clearTimeout(syncTimer);
-    syncTimer = setTimeout(syncPatch, 350); }  // pull the settled patch's values into the knobs
+    syncTimer = setTimeout(syncPatch, 350); }  // C++ defers/retries until the settled patch is readable
   document.getElementById("prev").onclick = () => setPatch(patch-1);
   document.getElementById("next").onclick = () => setPatch(patch+1);
 
@@ -2727,18 +2726,20 @@
   function syncPatch(){
     nativeAsync("getProgramData").then(pre => {
       const base = pre ? (pre.version|0) : 0;
-      native("requestDump");
-      let tries = 0;
-      const iv = setInterval(() => {
-        // ~8s budget: after a rapid browse, the dump reply queues behind the firmware's
-        // pending patch loads (~0.45s each) and arrives seconds after the last click.
-        if (++tries > 80) { clearInterval(iv); return; }
-        nativeAsync("getProgramData").then(r => {
-          if (r && r.bytes && r.bytes.length && (r.version|0) > base){
-            __dumpVer = r.version|0; clearInterval(iv); applyDump(r.bytes);
-          }
-        });
-      }, 100);
+      nativeAsync("requestDump").then(generation => {
+        generation=Number(generation)||0;
+        let tries = 0;
+        const iv = setInterval(() => {
+          // ~8s budget includes C++'s Program Change settle window and bounded dump retries.
+          if (++tries > 80) { clearInterval(iv); return; }
+          nativeAsync("getProgramData").then(r => {
+            if (r && r.bytes && r.bytes.length && (r.version|0) > base &&
+                Number(r.requestGeneration||0)>=generation){
+              __dumpVer = r.version|0; clearInterval(iv); applyDump(r.bytes);
+            }
+          });
+        }, 100);
+      });
     });
   }
 
@@ -3179,6 +3180,24 @@
       for (let i = 0; i < tries; i++){ const v = await fn(); if (v) return v; await new Promise(r => setTimeout(r, ms)); }
       return null;
     };
+    // Patch loading is deliberately latest-wins and may wait behind the prior
+    // 2.5 s firmware transaction. Send one intent, then observe it for long
+    // enough to settle instead of repeatedly resetting the production debounce.
+    const stableProgram=async(program,label)=>{
+      const state={label,attempts:0,stablePolls:0,last:''};
+      for(let attempt=0;attempt<2&&state.stablePolls<5;attempt++){
+        state.attempts++;
+        await nativeAsync('selectPatch',program);
+        state.stablePolls=0;
+        for(let poll=0;poll<80&&state.stablePolls<5;poll++){
+          await new Promise(r=>setTimeout(r,100));
+          const l=await nativeAsync('getLcd');
+          state.last=l&&l.line1||'';
+          state.stablePolls=state.last.startsWith(label+':')?state.stablePolls+1:0;
+        }
+      }
+      return state;
+    };
     try {
       // 1) font actually loaded from the resource provider
       await (document.fonts && document.fonts.ready || Promise.resolve());
@@ -3418,8 +3437,11 @@
       // true no-op (A00's stored content back to A00 — no persistent change). Then check
       // the firmware accepted it: the LCD must not show WRITE ERROR (which it would if the
       // unprotect step failed).
-      native('selectPatch', 1); await new Promise(r => setTimeout(r, 400));
-      native('selectPatch', 0); await new Promise(r => setTimeout(r, 600)); // reloads A00 from slot
+      const writeReloadA01=await stableProgram(1,'A01');
+      const writeReloadA00=await stableProgram(0,'A00');
+      if(writeReloadA01.stablePolls<5||writeReloadA00.stablePolls<5)
+        throw new Error('write reload Program Change readiness failed '+
+          JSON.stringify({a01:writeReloadA01,a00:writeReloadA00}));
       const writeState=await writePatchAndWait();
       const wrote = writeState.completed&&await until(async () => {
         const l = await nativeAsync('getLcd');
@@ -3557,21 +3579,6 @@
       // briefly clear Pattern Memory Protect.
       // Prove one real Program Change transition in each direction and require a stable
       // A00 before switching protocols. The destructive twenty-PC flood runs last.
-      const stableProgram=async(program,label)=>{
-        const state={label,attempts:0,stablePolls:0,last:''};
-        for(let attempt=0;attempt<5&&state.stablePolls<5;attempt++){
-          state.attempts++;
-          await nativeAsync('selectPatch',program);
-          state.stablePolls=0;
-          for(let poll=0;poll<20&&state.stablePolls<5;poll++){
-            await new Promise(r=>setTimeout(r,100));
-            const l=await nativeAsync('getLcd');
-            state.last=l&&l.line1||'';
-            state.stablePolls=state.last.startsWith(label+':')?state.stablePolls+1:0;
-          }
-        }
-        return state;
-      };
       const arpPreflightA01=await stableProgram(1,'A01');
       const arpPreflight=await stableProgram(0,'A00');
       if(arpPreflightA01.stablePolls<5||arpPreflight.stablePolls<5)
@@ -3633,9 +3640,9 @@
       native('selectArpPattern',0); // restore A00's displayed PAT:UP performance selection
       deepMode='program'; renderEditMode();
 
-      // 5i) Destructive scheduling stress goes last: all twenty PCs cross the real
-      // bridge, while editor-only dump sync remains debounced. No reply-dependent test
-      // follows, so the firmware may finish expensive patch loads after the report.
+      // 5i) Bridge-wiring smoke goes last: all twenty selection intents cross the real
+      // bridge, where C++ coalesces them to the latest patch. The headless
+      // rapid-patch-browse scenario owns the reply-dependent recovery regression.
       let pc = {selectPatch:0, requestDump:0};
       const en2 = native;
       window.native = function(n){if(n in pc)pc[n]++;return en2.apply(this,arguments);};
@@ -3645,7 +3652,7 @@
       for(let i=0;i<10;i++)document.getElementById('prev').click();
       await new Promise(r=>setTimeout(r,700));
       window.native=en2;
-      ok('patch clicks direct, dump sync debounced',
+      ok('patch intents direct, dump sync debounced',
          pc.selectPatch===20&&pc.requestDump<=2&&shown==='A10',
          'pc='+pc.selectPatch+' dumps='+pc.requestDump+' shown='+shown);
     } catch (err){

@@ -1,22 +1,23 @@
-# Profligacy 1.0.0 alpha 4
+# Profligacy 1.0.0 alpha 5
 
 Profligacy is an independent AU, VST3, and standalone software instrument
 compatible with user-supplied Korg Prophecy firmware. It is not affiliated with
 or endorsed by Korg.
 
-## Changes in alpha 4
+## Changes in alpha 5
 
-- Fixed a phase-sensitive timing fault in the emulated V55-to-H8 serial link
-  that could make MIDI transfers stop responding after Program Changes or an
-  extended playing/editing session while audio continued.
-- Hardened the compensated stop-bit timing across receiver clock phases after a
-  long headless soak exposed a second instance beyond the original exact-tie
-  fix.
-- Added a deterministic DAW-style MIDI stress runner, control-path health
-  heartbeats, and a low-overhead board-link flight recorder so future stalls can
-  be reproduced and diagnosed without GUI interaction.
-- Retained the alpha 3 native TMS57002 JIT performance improvements and the
-  alpha 2 WebView2 editor fix.
+- Fixed a cross-CPU scheduler race that could silently change a byte on the
+  Prophecy's internal V55/H8 serial link without raising a UART error. Both
+  directions now deliver line edges through a scheduler-synchronised boundary.
+- Bounded and paced the editor's shared SysEx command traffic. Rapid patch
+  browsing is latest-wins, obsolete edit-buffer work is cancelled, patch loads
+  are isolated from overlapping editor and DAW Program Changes, and program
+  dumps require generation-matched recovery.
+- Added an exact board-link byte oracle plus deterministic rapid-patch,
+  editor-boundary, pairwise, mixed DAW/editor storm, replay, and negative-control
+  workloads to the existing headless stress runner.
+- Retained the alpha 4 MIDI-stability fixes, alpha 3 native TMS57002 JIT
+  improvements, and alpha 2 WebView2 editor fix.
 
 ## Supported systems
 
@@ -89,8 +90,9 @@ an experimental preview and does not include an installer or code signature.
 
 The public source includes a 554-case hardware-derived TMS57002 replay corpus,
 self-contained focused tests, ARM64 interpreter/dynarec equivalence gates,
-Windows native-JIT telemetry gates, headless DAW-style MIDI/control stress
-tests, host validation, editor tests, and publication/licensing audits. Historical
+Windows native-JIT telemetry gates, deterministic headless editor/DAW stress
+tests with exact board-link grading, host validation, editor tests, and
+publication/licensing audits. Historical
 underdeclared captures and unavailable research diagnostics are preserved
 outside the release denominator; they are not represented as current product
 failures.

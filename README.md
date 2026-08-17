@@ -87,6 +87,24 @@ PROFLIGACY_REPLAY_ROMPATH=/path/to/roms \
 cmake --build build-cmake --config Release --target ProphecyPluginTimingHost
 ./scripts/run_headless_midi_stress.py \
   --rompath /path/to/roms --nvram-seed /path/to/sysram
+
+# Exercise the editor's real message-thread patch-selection and dump path. Rapid
+# selection intents must coalesce to the final patch and recover a fresh dump.
+./scripts/run_headless_midi_stress.py \
+  --scenario rapid-patch-browse \
+  --rompath /path/to/roms --nvram-seed /path/to/sysram
+
+# Cover every editor action family at scheduler boundaries, then all 100 ordered
+# pairs in four deterministic shards.  These still use the same Python entry
+# point and the same native timing-host executable.
+./scripts/run_headless_midi_stress.py --scenario editor-boundaries --seed 6
+./scripts/run_headless_midi_stress.py --scenario editor-pairwise \
+  --seed 0 --seed 1 --seed 2 --seed 3
+
+# Generate a replayable editor/DAW storm. Passing cases retain compact JSON;
+# failures retain their complete log, MIDI trace, flight recorder, and scenario.
+./scripts/run_headless_midi_stress.py --scenario editor-storm \
+  --seed 202 --action-rate 20 --seconds 40
 ```
 
 The DAW-style stress runner continuously mixes notes, controllers, pitch bend,
@@ -96,6 +114,28 @@ trip, queue drops, response latency, and recovery after a bounded missed reply.
 Every case writes its seed, MIDI byte trace, host log, and machine-readable result
 under a new temporary output directory. Use repeated `--case RATE:BLOCK` and
 `--seed N` options to select a smaller or broader deterministic matrix.
+
+`--scenario rapid-patch-browse` uses the same host and artifact format, but routes
+twenty fast patch selections and the post-browse dump through the editor-facing
+processor methods rather than synthesizing them in the DAW MIDI buffer. It fails
+unless audio remains live, the first recovery dump arrives, the final LCD names the
+last requested patch, both MIDI queues remain lossless, and the board-link flight
+recorder stays healthy.
+
+The other editor scenarios use a versioned, typed action timeline. They cover
+program/global/pattern parameters, arpeggiator reads and writes, rename/macro,
+front-panel pulses, analog controls, configuration, editor MIDI, and simultaneous
+DAW MIDI. Every failure is exactly replayable with `--replay-scenario
+PATH/scenario.json`; a frozen flight-recorder trigger also emits a proven
+trigger-prefix reduction. `--retain compact` (the default) removes large traces
+only after a passing case, while failures always retain full evidence.
+
+Final grading includes live audio, fresh generation-matched read-back, bounded
+editor work, queue drain, note drain, MIDI/ADIN drop counters, H8 SCI errors, and
+an exact V55-to-H8 wire oracle that compares every launched byte with the byte
+the H8 firmware actually reads. The two `negative-*` scenarios deliberately
+trip the MIDI-overflow and stuck-note graders to verify that a green campaign is
+not merely a permissive harness.
 
 The captured replay defaults to response-relative heartbeat timing because the
 original serial fault was phase-sensitive. It also records the exact workload,

@@ -21,8 +21,8 @@ permissions:
   contents: read
 
 env:
-  MAME_SHA: 100fa688cee690aa811d181f87ee83c31e7ae0f9
-  MAME_TREE: 985d1a45ee8221aed9e5228880719c6cecf870ad
+  MAME_SHA: d224f647ae85203a75eccd1c40ab9790c27c6a25
+  MAME_TREE: dfbfe9caa861b9b23ea5b1f6d1570ca724e61e17
 
 jobs:
   macos-arm64:
@@ -115,6 +115,7 @@ jobs:
           ProphecyPlugin_VST3
           ProphecyPlugin_Standalone
           ProphecyArtifactHost
+          ProphecyPluginTimingHost
           ProphecyPluginRtSafetyTest
           ProphecyMultiInstanceContractTest
       - name: Run no-ROM product and publication gates
@@ -122,7 +123,7 @@ jobs:
           PROPHECY_FORCE_NO_ROM: "1"
         run: |
           ctest --test-dir build-prototype --output-on-failure \
-            -R '^(mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing)$'
+            -R '^(mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
           build-prototype/ProphecyArtifactHost_artefacts/Release/ProphecyArtifactHost \
             --plugin build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 \
             --receipt "$RUNNER_TEMP/real-engine-macos-arm64.json" \
@@ -149,7 +150,7 @@ jobs:
           done
       - name: Package macOS alpha ZIP
         run: |
-          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.4-macOS-arm64"
+          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.5-macOS-arm64"
           mkdir -p "$package"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/AU/Profligacy.component "$package/Profligacy.component"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 "$package/Profligacy.vst3"
@@ -159,10 +160,10 @@ jobs:
           (cd "$RUNNER_TEMP" && shasum -a 256 "$(basename "$package.zip")") > "$package.zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.4-macOS-arm64-${{ github.sha }}
+          name: Profligacy-1.0.0-alpha.5-macOS-arm64-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.4-macOS-arm64.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.4-macOS-arm64.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.5-macOS-arm64.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.5-macOS-arm64.zip.sha256
           retention-days: 7
           if-no-files-found: error
 
@@ -297,6 +298,7 @@ jobs:
         run: |
           cmake --build build-prototype --config Release --parallel 4 --target `
             ProphecyMultiInstanceContractTest `
+            ProphecyPluginTimingHost `
             ProphecyPluginRtSafetyTest
           if ($LASTEXITCODE -ne 0) { throw "contract-test build exited $LASTEXITCODE" }
           cmake --build build-prototype --config Release --parallel 4 --target `
@@ -309,7 +311,7 @@ jobs:
         run: |
           $env:PROPHECY_FORCE_NO_ROM = '1'
           ctest --test-dir build-prototype -C Release --output-on-failure `
-            -R '^(mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing)$'
+            -R '^(mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
           if ($LASTEXITCODE -ne 0) { throw "CTest exited $LASTEXITCODE" }
           & build-prototype\ProphecyArtifactHost_artefacts\Release\ProphecyArtifactHost.exe `
             --plugin build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
@@ -372,7 +374,7 @@ jobs:
       - name: Package Windows alpha ZIP
         shell: pwsh
         run: |
-          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.4-Windows-x64-experimental'
+          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.5-Windows-x64-experimental'
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item -Recurse -LiteralPath `
             build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
@@ -387,9 +389,9 @@ jobs:
           "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -Encoding ascii -NoNewline "$zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.4-Windows-x64-experimental-${{ github.sha }}
+          name: Profligacy-1.0.0-alpha.5-Windows-x64-experimental-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.4-Windows-x64-experimental.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.4-Windows-x64-experimental.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.5-Windows-x64-experimental.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.5-Windows-x64-experimental.zip.sha256
           retention-days: 7
           if-no-files-found: error

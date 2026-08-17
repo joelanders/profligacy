@@ -58,6 +58,13 @@ void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 	m_hostSampleRate = sampleRate > 0.0 ? sampleRate : (double) ProphecyEngine::kSampleRate;
 	m_hostMidiFrameCursor = 0;
 	m_oversizedAudioBlocks.store(0, std::memory_order_relaxed);
+	m_editorPatchIntents.store(0, std::memory_order_relaxed);
+	m_editorPatchSends.store(0, std::memory_order_relaxed);
+	m_editorDumpRequests.store(0, std::memory_order_relaxed);
+	m_editorDumpSends.store(0, std::memory_order_relaxed);
+	m_patchLoadMidiGateUntilFrame.store(0, std::memory_order_relaxed);
+	m_editorClockTicksSuppressed.store(0, std::memory_order_relaxed);
+	m_patchLoadMidiEventsSuppressed.store(0, std::memory_order_relaxed);
 	// samplesPerBlock is only a host hint in JUCE. Reserve a generous fixed floor so
 	// ordinary offline/host block-size changes stay allocation-free; a still-larger block
 	// is explicitly silenced and counted in processBlock rather than resizing there.
@@ -168,6 +175,8 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 	const double nativePerHost = (double)ProphecyEngine::kSampleRate / m_hostSampleRate;
 	const std::uint64_t produced = m_engine.producedFrames();
 	const std::uint64_t midiFrameBase = std::max(produced, m_hostMidiFrameCursor);
+	const std::uint64_t hostBlockEnd = m_audioHostFrames.load(std::memory_order_relaxed);
+	const std::uint64_t hostBlockStart = hostBlockEnd - (std::uint64_t)numSamples;
 	for (const auto meta : midi)
 	{
 		// Work from MidiBuffer's borrowed metadata bytes. Constructing a MidiMessage here
@@ -180,6 +189,25 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 		const std::uint32_t data2  = numBytes > 2 ? data[2] : 0;
 		m_lastHostMidi.store(status | (data1 << 8) | (data2 << 16)
 			| ((std::uint32_t) std::min(numBytes, 255) << 24), std::memory_order_relaxed);
+		const std::uint64_t hostEventFrame = hostBlockStart
+			+ (std::uint64_t)std::max(meta.samplePosition, 0);
+		if (hostEventFrame < m_patchLoadMidiGateUntilFrame.load(std::memory_order_acquire)
+				&& suppressDuringPatchLoad(data, (std::size_t)numBytes))
+		{
+			if (numBytes == 1 && data[0] == 0xf8)
+				m_editorClockTicksSuppressed.fetch_add(1, std::memory_order_relaxed);
+			m_patchLoadMidiEventsSuppressed.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (numBytes == 2 && (data[0] & 0xf0) == 0xc0)
+		{
+			const std::uint64_t gateFrames = (std::uint64_t)std::ceil(
+				m_hostSampleRate * kPatchLoadQuarantineSeconds);
+			const std::uint64_t wanted = hostEventFrame + gateFrames;
+			std::uint64_t previous = m_patchLoadMidiGateUntilFrame.load(std::memory_order_relaxed);
+			while (previous < wanted && !m_patchLoadMidiGateUntilFrame.compare_exchange_weak(
+				previous, wanted, std::memory_order_release, std::memory_order_relaxed)) {}
+		}
 		if (numBytes >= 2)
 		{
 			const int command = data[0] & 0xf0;
@@ -314,6 +342,19 @@ ProphecyAudioProcessor::DiagnosticSnapshot ProphecyAudioProcessor::diagnosticSna
 	s.droppedUiAdinEvents = droppedUiAdinEvents();
 	s.droppedAudioAdinEvents = droppedAudioAdinEvents();
 	s.oversizedBlocks = oversizedAudioBlocks();
+	s.editorPatchIntents = m_editorPatchIntents.load(std::memory_order_relaxed);
+	s.editorPatchSends = m_editorPatchSends.load(std::memory_order_relaxed);
+	s.editorDumpRequests = m_editorDumpRequests.load(std::memory_order_relaxed);
+	s.editorDumpSends = m_editorDumpSends.load(std::memory_order_relaxed);
+	s.editorClockTicksSuppressed =
+		m_editorClockTicksSuppressed.load(std::memory_order_relaxed);
+	s.patchLoadMidiEventsSuppressed =
+		m_patchLoadMidiEventsSuppressed.load(std::memory_order_relaxed);
+	s.editorCommandsSent = m_editorCommandPacer.sent();
+	s.editorCommandsCoalesced = m_editorCommandPacer.coalesced();
+	s.editorCommandsCancelled = m_editorCommandPacer.cancelled();
+	s.editorCommandsDropped = m_editorCommandPacer.dropped();
+	s.editorCommandsPending = m_editorCommandPacer.pending();
 	return s;
 }
 
@@ -442,34 +483,92 @@ void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 void ProphecyAudioProcessor::selectPatch(int program)
 {
 	if (program < 0 || program > 127) return;
-	// A patch change discards the current edit buffer, so no parameter burst from that
-	// buffer may continue after the bank/program messages. Without this cancellation a
-	// quick rename-then-browse action interleaves the paced name SysEx with Program Change;
-	// the firmware can remain on a partially edited lowercase patch and ignore later PCs.
-	// One parameter may already be on the UART when its timer is cancelled. Give that
-	// complete SysEx one 150 ms firmware-scale settling interval, then send the latest
-	// requested patch. Ordinary browsing remains immediate; clicks during this special
-	// transition replace the pending selection so an older delayed PC cannot fire later.
-	// All three timers and this method run on JUCE's message thread.
-	const bool cancelledRename = m_renameBurst.cancel();
-	const bool cancelledMacro = m_macroBurst.cancel();
-	if (cancelledRename || cancelledMacro || m_patchSelectDelay.pending())
-	{
-		m_patchSelectDelay.schedule(program);
-		return;
-	}
-	sendPatchNow(program);
+	m_editorPatchIntents.fetch_add(1, std::memory_order_relaxed);
+	// A patch change discards the current edit buffer, so cancel work belonging to the old
+	// buffer and any obsolete read-back. Program loading costs roughly half a second inside
+	// the firmware; forwarding every arrow click can therefore create far more work than a
+	// user can consume. Always debounce to the latest requested program. This also gives a
+	// possibly in-flight rename/macro SysEx time to finish before the bank/program message.
+	// The production WebView and headless editor-stress host both use this exact method.
+	(void)m_renameBurst.cancel();
+	(void)m_macroBurst.cancel();
+	m_programDumpSync.cancel();
+	m_editorCommandPacer.holdForPatchLoad(2500);
+	// Start gating at intent time so already-debounced clicks cannot schedule more
+	// external clocks ahead of the Program Change. An accepted send refreshes the
+	// window to cover the complete firmware load.
+	holdMidiForPatchLoad(2.5);
+	m_patchSelectDelay.schedule(program);
 }
 
-void ProphecyAudioProcessor::sendPatchNow(int program)
+bool ProphecyAudioProcessor::sendPatchNow(int program)
 {
+	// A quiet-click debounce is not enough: two individually valid Program
+	// Changes can still overlap the firmware's long inter-board load transaction.
+	// PatchSelectDelay will retry, retaining only its latest program, until the
+	// prior load has completed.
+	const double now = juce::Time::getMillisecondCounterHiRes();
+	if (now - m_lastPatchSendMs < kPatchSelectMinIntervalMs)
+	{
+		// Keep both barriers closed while PatchSelectDelay retains the latest
+		// requested program and waits for the previous transaction to settle.
+		holdMidiForPatchLoad(0.2);
+		m_editorCommandPacer.extendPatchLoad(200);
+		return false;
+	}
 	// Bank select then program change (verified on the emulated firmware via the LCD:
 	// a bare 0xC0 only ever reaches bank A; CC0=0 + CC32=bank + 0xC0 lands "B52:...").
 	const std::uint8_t msg[8] = {
 		0xB0, 0x00, 0x00,                          // bank select MSB
 		0xB0, 0x20, (std::uint8_t) (program / 64), // bank select LSB: 0=A, 1=B
 		0xC0, (std::uint8_t) (program % 64) };     // program within the bank
-	(void) pushImmediateMidi(msg, sizeof(msg));
+	const bool accepted = pushImmediateMidi(msg, sizeof(msg));
+	if (accepted)
+	{
+		holdMidiForPatchLoad(kPatchLoadQuarantineSeconds);
+		m_editorCommandPacer.extendPatchLoad(
+			(int)std::lround(kPatchLoadQuarantineSeconds * 1000.0));
+		m_lastPatchSendMs = now;
+		m_editorPatchSends.fetch_add(1, std::memory_order_relaxed);
+	}
+	return accepted;
+}
+
+void ProphecyAudioProcessor::holdMidiForPatchLoad(double seconds)
+{
+	const std::uint64_t current = m_audioHostFrames.load(std::memory_order_relaxed);
+	const std::uint64_t wanted = current
+		+ (std::uint64_t)std::ceil(std::max(seconds, 0.0) * m_hostSampleRate);
+	std::uint64_t previous = m_patchLoadMidiGateUntilFrame.load(std::memory_order_relaxed);
+	while (previous < wanted && !m_patchLoadMidiGateUntilFrame.compare_exchange_weak(
+		previous, wanted, std::memory_order_release, std::memory_order_relaxed)) {}
+}
+
+bool ProphecyAudioProcessor::suppressDuringPatchLoad(
+	const std::uint8_t *bytes, std::size_t size)
+{
+	if (bytes == nullptr || size == 0) return false;
+	const std::uint8_t status = bytes[0];
+	// Note releases must always pass so a selection cannot create a stuck note.
+	// Other channel voice messages and SysEx create firmware/control-link work and
+	// are held out of the bounded patch-load transaction. System transport other
+	// than MIDI clock remains safe and useful to forward.
+	if ((status & 0xf0) == 0x80) return false;
+	if ((status & 0xf0) == 0x90 && size >= 3 && bytes[2] == 0) return false;
+	if (status < 0xf0 || status == 0xf0 || status == 0xf8) return true;
+	return false;
+}
+
+void ProphecyAudioProcessor::sendMidi(const std::uint8_t *bytes, std::size_t size)
+{
+	if (patchLoadMidiGateActive() && suppressDuringPatchLoad(bytes, size))
+	{
+		if (size == 1 && bytes[0] == 0xf8)
+			m_editorClockTicksSuppressed.fetch_add(1, std::memory_order_relaxed);
+		m_patchLoadMidiEventsSuppressed.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	(void)pushImmediateMidi(bytes, size);
 }
 
 juce::StringArray ProphecyAudioProcessor::patchNames() const
@@ -511,12 +610,41 @@ juce::StringArray ProphecyAudioProcessor::patchNames() const
 	return out;
 }
 
-void ProphecyAudioProcessor::requestProgramDump()
+std::uint64_t ProphecyAudioProcessor::requestProgramDump()
+{
+	m_editorDumpRequests.fetch_add(1, std::memory_order_relaxed);
+	// Program Change and current-program dump assembly share the firmware MIDI task. A dump
+	// sent during the patch-load transaction is silently discarded, so wait out any pending/recent
+	// selection and let ProgramDumpSync retry the one in-flight editor transaction if needed.
+	constexpr double patchSettleMs = kPatchLoadQuarantineSeconds * 1000.0;
+	const double now = juce::Time::getMillisecondCounterHiRes();
+	int delayMs = 0;
+	if (m_patchSelectDelay.pending())
+		delayMs = 800; // debounce checkpoint; the shared pacer remains held through the load
+	else
+		delayMs = std::max(0, (int)std::ceil(patchSettleMs - (now - m_lastPatchSendMs)));
+	return m_programDumpSync.request(delayMs);
+}
+
+std::size_t ProphecyAudioProcessor::getProgramData(std::uint8_t *out, std::size_t cap,
+	std::uint32_t *version, std::uint64_t *completedRequestGeneration) const
+{
+	std::uint32_t observedVersion = 0;
+	const std::size_t bytes = m_engine.latestProgramData(out, cap, &observedVersion);
+	if (version != nullptr) *version = observedVersion;
+	const std::uint64_t completed = m_programDumpSync.observe(observedVersion);
+	if (completedRequestGeneration != nullptr) *completedRequestGeneration = completed;
+	return bytes;
+}
+
+bool ProphecyAudioProcessor::sendProgramDumpNow()
 {
 	// Korg current-program dump request. The 0x40 reply is captured + unpacked by the engine;
 	// the editor polls getProgramData() for it. F0 42 30 41 10 00 F7.
 	const std::uint8_t req[7] = {0xF0, 0x42, 0x30, 0x41, 0x10, 0x00, 0xF7};
-	(void) pushImmediateMidi(req, sizeof(req));
+	const bool accepted = pushImmediateMidi(req, sizeof(req));
+	if (accepted) m_editorDumpSends.fetch_add(1, std::memory_order_relaxed);
+	return accepted;
 }
 
 void ProphecyAudioProcessor::selectArpeggioPattern(int pattern)
@@ -525,7 +653,7 @@ void ProphecyAudioProcessor::selectArpeggioPattern(int pattern)
 	// NRPN MSB=0, LSB=1 (Arpeggio Pattern Select), Data Entry MSB=INT pattern 0..9.
 	const std::uint8_t msg[9] = {0xB0, 0x63, 0x00, 0xB0, 0x62, 0x01,
 		0xB0, 0x06, (std::uint8_t) pattern};
-	(void) pushImmediateMidi(msg, sizeof(msg));
+	m_editorCommandPacer.enqueueMidi(0x20000, msg, sizeof(msg));
 }
 
 void ProphecyAudioProcessor::setArpeggiatorControl(int control, int value)
@@ -535,7 +663,7 @@ void ProphecyAudioProcessor::setArpeggiatorControl(int control, int value)
 	value = std::clamp(value, 0, control == 3 ? 3 : 127);
 	const std::uint8_t msg[9] = {0xB0, 0x63, 0x00, 0xB0, 0x62, (std::uint8_t) control,
 		0xB0, 0x06, (std::uint8_t) value};
-	(void) pushImmediateMidi(msg, sizeof(msg));
+	m_editorCommandPacer.enqueueMidi(0x20010 + control, msg, sizeof(msg));
 }
 
 void ProphecyAudioProcessor::requestArpeggioPatternDump(int pattern)
@@ -543,7 +671,10 @@ void ProphecyAudioProcessor::requestArpeggioPatternDump(int pattern)
 	if (pattern < 0 || pattern > 9) return;
 	const std::uint8_t req[8] = {0xF0, 0x42, 0x30, 0x41, 0x34,
 		(std::uint8_t) pattern, 0x00, 0xF7};
-	(void) pushImmediateMidi(req, sizeof(req));
+	// Only the newest read-back matters to the editor. Coalesce across pattern
+	// numbers as well as duplicate clicks so an older queued request cannot hold
+	// up the pattern currently visible in the UI.
+	m_editorCommandPacer.enqueueMidi(0x20020, req, sizeof(req));
 }
 
 void ProphecyAudioProcessor::sendArpeggioPatternData(int pattern, const std::vector<std::uint8_t> &raw)
@@ -564,7 +695,7 @@ void ProphecyAudioProcessor::sendArpeggioPatternData(int pattern, const std::vec
 			msg.push_back(raw[pos + i] & 0x7f);
 	}
 	msg.push_back(0xF7);
-	(void) pushImmediateMidi(msg.data(), msg.size());
+	m_editorCommandPacer.enqueueMidi(0x20040 + pattern, msg.data(), msg.size());
 }
 
 void ProphecyAudioProcessor::setParam(int paramId, int value)
@@ -583,7 +714,14 @@ void ProphecyAudioProcessor::setParamG(int group, int paramId, int value)
 		(std::uint8_t)(p & 0x7F), (std::uint8_t)((p >> 7) & 0x7F),
 		(std::uint8_t)(v & 0x7F), (std::uint8_t)((v >> 7) & 0x7F),
 		0xF7 };
-	(void) pushImmediateMidi(msg, sizeof(msg));
+	m_editorCommandPacer.enqueueMidi(0x10000 + ((group & 0x7f) << 14) + p,
+		msg, sizeof(msg));
+}
+
+void ProphecyAudioProcessor::panelPulse(int row, int bit)
+{
+	if (row < 0 || bit < 0) return;
+	m_editorCommandPacer.enqueuePanel(row, bit);
 }
 
 void ProphecyAudioProcessor::renamePatch(const juce::String &name)
@@ -693,6 +831,20 @@ void ProphecyAudioProcessor::setWheel2(int value)
 	if (value > 255) value = 255;
 	m_wheel2Pos.store((std::uint8_t) value, std::memory_order_relaxed);
 	(void) pushUiAdin(9, value);
+}
+
+void ProphecyAudioProcessor::setWheel2FromEditor(int value)
+{
+	if (value < 0) value = 0;
+	if (value > 255) value = 255;
+	m_wheel2Pos.store((std::uint8_t)value, std::memory_order_relaxed);
+	m_editorCommandPacer.enqueueAdin(9, value);
+}
+
+void ProphecyAudioProcessor::setAdin(int source, int value)
+{
+	if (source < 0 || source > 15) return;
+	m_editorCommandPacer.enqueueAdin(source, std::clamp(value, 0, 255));
 }
 
 // Translate a mapped control-change to a front-panel ADIN write. Mirrors the editor's own
@@ -996,8 +1148,8 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
 				{
 					juce::ignoreUnused(args);
-					m_proc.requestProgramDump();
-					complete(juce::var{});
+					const auto generation = m_proc.requestProgramDump();
+					complete(juce::var((juce::int64)generation));
 				})
 			.withNativeFunction("getProgramData",
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
@@ -1005,9 +1157,12 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 					juce::ignoreUnused(args);
 					std::uint8_t buf[1024];
 					std::uint32_t ver = 0;
-					const std::size_t n = m_proc.getProgramData(buf, sizeof(buf), &ver);
+					std::uint64_t requestGeneration = 0;
+					const std::size_t n = m_proc.getProgramData(
+						buf, sizeof(buf), &ver, &requestGeneration);
 					auto *obj = new juce::DynamicObject();
 					obj->setProperty("version", (int) ver);
+					obj->setProperty("requestGeneration", (juce::int64)requestGeneration);
 					juce::Array<juce::var> bytes;
 					bytes.ensureStorageAllocated((int) n);
 					for (std::size_t i = 0; i < n; ++i) bytes.add((int) buf[i]);
@@ -1182,7 +1337,7 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 			.withNativeFunction("setWheel2",
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
 				{
-					if (!args.isEmpty()) m_proc.setWheel2((int) args[0]);
+					if (!args.isEmpty()) m_proc.setWheel2FromEditor((int) args[0]);
 					complete(juce::var{});
 				})
 			.withNativeFunction("getWheel2",

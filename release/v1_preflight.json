@@ -17,10 +17,10 @@
   ],
   "dependencies": {
     "extern/JUCE": "2cdfca8feb300fb424002ba2c2751569e5bacb64",
-    "extern/mame": "100fa688cee690aa811d181f87ee83c31e7ae0f9"
+    "extern/mame": "d224f647ae85203a75eccd1c40ab9790c27c6a25"
   },
   "dependency_trees": {
-    "extern/mame": "985d1a45ee8221aed9e5228880719c6cecf870ad"
+    "extern/mame": "dfbfe9caa861b9b23ea5b1f6d1570ca724e61e17"
   },
   "mandatory_ctests": [
     "alpha_release_policy",
@@ -37,6 +37,7 @@
     "run_arp_timing_suite",
     "run_control_abba_repeatability",
     "run_clean_mame_performance_equivalence",
+    "run_headless_midi_stress",
     "run_threaded_pf4_cmem_equivalence"
   ],
   "forbidden_tracked_text": [
