@@ -127,7 +127,15 @@ the Git object IDs of every declared shipping path and separately confirm that
 `notes/` and `HANDOVER.md` are absent.
 
 The release workflow pins both the public MAME commit and its complete root tree.
-Merge the MAME publication PR without squashing away the pinned commit, and
-verify that the pin is an ancestor of the public MAME branch before merging,
-tagging, or packaging the product. Only then may the product PR and release
-artifact workflow proceed.
+After review and required checks, advance the public MAME branch by a true
+fast-forward to the tested candidate. Do not use GitHub's merge-commit, squash,
+or rebase buttons. Verify that the pin is an ancestor of the public MAME branch
+before merging, tagging, or packaging the product. Only then may the product PR
+proceed.
+
+Do not dispatch the artifact workflow from a product PR head or any other
+pre-merge commit. Merge the product PR, freeze that exact resulting commit, and
+dispatch the manual workflow at that ref. Any later tracked change creates a new
+candidate and requires new artifacts. On the MAME PR, the focused Prophecy
+no-ROM jobs and directly affected lint checks are the release gates; unrelated
+full-upstream MAME matrices may be cancelled rather than consuming hours.
