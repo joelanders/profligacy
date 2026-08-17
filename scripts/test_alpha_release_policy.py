@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import subprocess
 import unittest
 
 
@@ -53,6 +54,17 @@ class AlphaReleasePolicyTests(unittest.TestCase):
         self.assertIsNotNone(tree, "release workflow has no pinned 40-hex MAME_TREE")
         self.assertEqual(alpha["dependencies"]["extern/mame"], revision.group(1))
         self.assertEqual(alpha["dependency_trees"]["extern/mame"], tree.group(1))
+
+        gitlink = subprocess.run(
+            ["git", "ls-tree", "HEAD", "extern/mame"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+        self.assertGreaterEqual(len(gitlink), 3, "release commit has no extern/mame gitlink")
+        self.assertEqual("160000", gitlink[0], "extern/mame is not a gitlink")
+        self.assertEqual(alpha["dependencies"]["extern/mame"], gitlink[2])
 
 
 if __name__ == "__main__":

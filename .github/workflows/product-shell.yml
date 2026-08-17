@@ -54,6 +54,7 @@ jobs:
       - name: Run MAME-independent publication checks
         run: >-
           python3 -B -m unittest
+          scripts/test_alpha_release_policy.py
           scripts/test_build_ci_probe_roms.py
           scripts/test_product_identity.py
           scripts/test_release_licensing.py
@@ -156,5 +157,6 @@ jobs:
       - name: Run clean-room ROM and receipt unit tests
         run: >-
           python -B -m unittest
+          scripts/test_alpha_release_policy.py
           scripts/test_build_ci_probe_roms.py
           scripts/test_run_ci_rom_e2e.py

@@ -123,7 +123,7 @@ jobs:
           PROPHECY_FORCE_NO_ROM: "1"
         run: |
           ctest --test-dir build-prototype --output-on-failure \
-            -R '^(mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
+            -R '^(alpha_release_policy|mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
           build-prototype/ProphecyArtifactHost_artefacts/Release/ProphecyArtifactHost \
             --plugin build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 \
             --receipt "$RUNNER_TEMP/real-engine-macos-arm64.json" \
@@ -311,7 +311,7 @@ jobs:
         run: |
           $env:PROPHECY_FORCE_NO_ROM = '1'
           ctest --test-dir build-prototype -C Release --output-on-failure `
-            -R '^(mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
+            -R '^(alpha_release_policy|mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
           if ($LASTEXITCODE -ne 0) { throw "CTest exited $LASTEXITCODE" }
           & build-prototype\ProphecyArtifactHost_artefacts\Release\ProphecyArtifactHost.exe `
             --plugin build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
