@@ -318,6 +318,7 @@ jobs:
             --receipt "$env:RUNNER_TEMP\real-engine-windows-x64.json" `
             --wav "$env:RUNNER_TEMP\real-engine-windows-x64.wav" `
             --require-editor `
+            --editor-timeout 30 `
             --seconds 1
           if ($LASTEXITCODE -ne 0) { throw "artifact host exited $LASTEXITCODE" }
       - name: Open the standalone editor through WebView2

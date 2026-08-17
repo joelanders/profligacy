@@ -66,6 +66,15 @@ class AlphaReleasePolicyTests(unittest.TestCase):
         self.assertEqual("160000", gitlink[0], "extern/mame is not a gitlink")
         self.assertEqual(alpha["dependencies"]["extern/mame"], gitlink[2])
 
+    def test_windows_vst3_editor_gates_allow_cold_webview_startup(self) -> None:
+        release_workflow = (ROOT / ".github/workflows/alpha-prototype.yml").read_text()
+        product_workflow = (ROOT / ".github/workflows/product-shell.yml").read_text()
+
+        # A real-engine release runner can cold-start WebView2 after a large
+        # native build. Keep both packaged-VST3 gates explicit and consistent.
+        self.assertIn("--editor-timeout 30", release_workflow)
+        self.assertIn("--editor-timeout 30", product_workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
