@@ -21,8 +21,8 @@ permissions:
   contents: read
 
 env:
-  MAME_SHA: 9a44de512c19315cece0e8bdc49bbeb2ee31d845
-  MAME_TREE: e00f3cebe5cbb9701c468c78f60b5cfd3ff570b2
+  MAME_SHA: a6e86323c00e006917bffbfc23a0f73d0d5b2fec
+  MAME_TREE: 9fd075fd2eeb88193b635cb4d0c3f09b38ed9793
 
 jobs:
   macos-arm64:
@@ -150,7 +150,7 @@ jobs:
           done
       - name: Package macOS alpha ZIP
         run: |
-          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.5-macOS-arm64"
+          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.6-macOS-arm64"
           mkdir -p "$package"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/AU/Profligacy.component "$package/Profligacy.component"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 "$package/Profligacy.vst3"
@@ -160,10 +160,10 @@ jobs:
           (cd "$RUNNER_TEMP" && shasum -a 256 "$(basename "$package.zip")") > "$package.zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.5-macOS-arm64-${{ github.sha }}
+          name: Profligacy-1.0.0-alpha.6-macOS-arm64-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.5-macOS-arm64.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.5-macOS-arm64.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.6-macOS-arm64.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.6-macOS-arm64.zip.sha256
           retention-days: 7
           if-no-files-found: error
 
@@ -375,7 +375,7 @@ jobs:
       - name: Package Windows alpha ZIP
         shell: pwsh
         run: |
-          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.5-Windows-x64-experimental'
+          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.6-Windows-x64-experimental'
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item -Recurse -LiteralPath `
             build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
@@ -390,9 +390,9 @@ jobs:
           "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -Encoding ascii -NoNewline "$zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.5-Windows-x64-experimental-${{ github.sha }}
+          name: Profligacy-1.0.0-alpha.6-Windows-x64-experimental-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.5-Windows-x64-experimental.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.5-Windows-x64-experimental.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.6-Windows-x64-experimental.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.6-Windows-x64-experimental.zip.sha256
           retention-days: 7
           if-no-files-found: error

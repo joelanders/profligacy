@@ -1,23 +1,28 @@
-# Profligacy 1.0.0 alpha 5
+# Profligacy 1.0.0 alpha 6
 
 Profligacy is an independent AU, VST3, and standalone software instrument
 compatible with user-supplied Korg Prophecy firmware. It is not affiliated with
 or endorsed by Korg.
 
-## Changes in alpha 5
+## Changes in alpha 6
 
-- Fixed a cross-CPU scheduler race that could silently change a byte on the
-  Prophecy's internal V55/H8 serial link without raising a UART error. Both
-  directions now deliver line edges through a scheduler-synchronised boundary.
-- Bounded and paced the editor's shared SysEx command traffic. Rapid patch
-  browsing is latest-wins, obsolete edit-buffer work is cancelled, patch loads
-  are isolated from overlapping editor and DAW Program Changes, and program
-  dumps require generation-matched recovery.
-- Added an exact board-link byte oracle plus deterministic rapid-patch,
-  editor-boundary, pairwise, mixed DAW/editor storm, replay, and negative-control
-  workloads to the existing headless stress runner.
-- Retained the alpha 4 MIDI-stability fixes, alpha 3 native TMS57002 JIT
-  improvements, and alpha 2 WebView2 editor fix.
+- Added a guarded delivery invariant for the Prophecy's internal V55-to-H8
+  serial link. A completed V55 transmit byte remains pending until H8 SCI0
+  accepts it; after a stable idle, error-free delivery deficit, the missing byte
+  is delivered through the normal H8 receive-data and interrupt path. This
+  prevents the observed control freeze in which the final two bytes of a
+  four-byte command disappeared while audio continued.
+- Added a deterministic two-frame fault gate for that failure. With the guard
+  disabled it reproduces the unresponsive control path with two bytes pending
+  and no SCI errors; with the guard enabled exactly two deliveries are repaired
+  and the editor remains responsive. Normal 44.1, 48, and 96 kHz stress runs
+  complete with zero repairs and zero delivery-queue overflows.
+- The lower-level cause of the rare callback/event disappearance is not yet
+  identified. Alpha 6 therefore treats this as a narrowly gated stability
+  safeguard rather than claiming the scheduler mechanism itself is fixed.
+- Retains alpha 5's paced editor SysEx path and board-link stress coverage,
+  alpha 4's MIDI-stability fixes, alpha 3's native TMS57002 JIT improvements,
+  and alpha 2's WebView2 editor fix.
 
 ## Supported systems
 

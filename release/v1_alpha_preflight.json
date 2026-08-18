@@ -20,10 +20,10 @@
   ],
   "dependencies": {
     "extern/JUCE": "2cdfca8feb300fb424002ba2c2751569e5bacb64",
-    "extern/mame": "9a44de512c19315cece0e8bdc49bbeb2ee31d845"
+    "extern/mame": "a6e86323c00e006917bffbfc23a0f73d0d5b2fec"
   },
   "dependency_trees": {
-    "extern/mame": "e00f3cebe5cbb9701c468c78f60b5cfd3ff570b2"
+    "extern/mame": "9fd075fd2eeb88193b635cb4d0c3f09b38ed9793"
   },
   "mandatory_ctests": [
     "alpha_release_policy",
