@@ -69,21 +69,56 @@ extern/
 └── JUCE/
 ```
 
-### 2. Build the MAME foundation
+### 2. Build the pinned static SDL2 prerequisite
+
+The macOS build requires a static SDL2 archive at
+`${SDL_PREFIX}/lib/libSDL2.a`. The release workflow builds real SDL2 2.32.10
+from source; a current Homebrew `sdl2-compat` installation may provide only
+`libSDL2.dylib` and is not a substitute.
+
+Build the same pinned dependency once outside the repository:
+
+```bash
+SDL_VERSION=2.32.10
+SDL_PREFIX="$HOME/.local/SDL2-$SDL_VERSION"
+SDL_SOURCE_ROOT="$HOME/.local/src"
+SDL_BUILD_ROOT="$HOME/.local/build/SDL2-$SDL_VERSION"
+SDL_ARCHIVE="/tmp/SDL2-$SDL_VERSION.tar.gz"
+
+mkdir -p "$SDL_SOURCE_ROOT"
+curl --fail --location --retry 3 --output "$SDL_ARCHIVE" \
+  "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL2-$SDL_VERSION.tar.gz"
+echo '5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165  '"$SDL_ARCHIVE" | shasum -a 256 -c -
+tar -xzf "$SDL_ARCHIVE" -C "$SDL_SOURCE_ROOT"
+cmake -S "$SDL_SOURCE_ROOT/SDL2-$SDL_VERSION" -B "$SDL_BUILD_ROOT" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$SDL_PREFIX" \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DSDL_SHARED=OFF \
+  -DSDL_STATIC=ON \
+  -DSDL_TEST=OFF
+cmake --build "$SDL_BUILD_ROOT" --parallel "$(sysctl -n hw.ncpu)" --target install
+test -f "$SDL_PREFIX/lib/libSDL2.a"
+```
+
+Keep `SDL_PREFIX` set for the following MAME and plug-in build steps.
+
+### 3. Build the MAME foundation
 
 MAME is built separately into static archives and then linked into Profligacy.
 
 This is the slow foundation build and normally only needs to be repeated when the pinned MAME source changes:
 
 ```bash
-scripts/build_mame_core.sh
+SDL_INSTALL_ROOT="$SDL_PREFIX" scripts/build_mame_core.sh
 ```
 
 The script also stamps the resulting MAME archives with the exact MAME revision from which they were built.
 
 Profligacy checks this stamp and refuses to link stale archives from a different `extern/mame` revision.
 
-### 3. Build the console host
+### 4. Build the console host
 
 The console host is a small headless harness for running the emulated Prophecy without JUCE:
 
@@ -99,7 +134,7 @@ This produces:
 
 and also builds the lifecycle test host used for engine teardown/reconstruction testing.
 
-### 4. Run the console host
+### 5. Run the console host
 
 `run_console.sh` boots the v1.7 Prophecy machine headlessly, injects a test note, captures the resulting audio, and exits.
 
@@ -150,12 +185,14 @@ Rung 2: exercises the real-time ring-buffer/backpressure path and writes:
 console_ring_out.wav
 ```
 
-### 5. Build the plug-in
+### 6. Build the plug-in
 
-Configure the JUCE/CMake build:
+Use the same static SDL2 installation when configuring CMake:
 
 ```bash
-cmake -B build-cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake -B build-cmake -G "Unix Makefiles" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSDL_PREFIX="$SDL_PREFIX"
 ```
 
 Then build:
