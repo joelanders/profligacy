@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import random
@@ -19,6 +20,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CASES = ((48000, 32), (48000, 128), (48000, 512), (48000, 1024),
                  (44100, 128), (96000, 128))
+HARDWARE_ROM_SHA1 = {
+    "korgprop/ic12_v17.bin": "2dc101c1fad46366cfec43e450844a9e3b613d8c",
+    "korgprop/ic22_v17.bin": "d394c371279fa7a8c3660bf6c78ea65a0c2a6db0",
+}
 SUMMARY_RE = re.compile(
     r"\[stress-health\] SUMMARY attempts=(\d+) replies=(\d+) misses=(\d+) "
     r"worst_consecutive_misses=(\d+) max_latency=([0-9.]+) verdict=(PASS|FAIL)")
@@ -30,7 +35,7 @@ ARP_RECOVERY_RE = re.compile(
     r"\[arp-recovery\] SUMMARY requested=(?P<requested>[01]) "
     r"replied=(?P<replied>[01]) pending=(?P<pending>[01]) "
     r"max_latency=(?P<latency>[0-9.]+) verdict=(?P<verdict>PASS|FAIL)")
-CLOCK_GATE_RE = re.compile(r"\[editor-clock-gate\] suppressed=(?P<count>\d+)")
+HOST_MIDI_RE = re.compile(r"\[host-midi\] seen=(?P<seen>\d+) forwarded=(?P<forwarded>\d+)")
 EDITOR_PACER_RE = re.compile(
     r"\[editor-command-pacer\] sent=(?P<sent>\d+) coalesced=(?P<coalesced>\d+) "
     r"cancelled=(?P<cancelled>\d+) dropped=(?P<dropped>\d+) "
@@ -83,6 +88,25 @@ FLIGHT_EVENT_RE = re.compile(
     r"SCI=(?P<h8_ssr>[0-9A-F]+)/(?P<h8_rdr>[0-9A-F]+),"
     r"H8E=(?P<h8_error_count>\d+)/(?P<h8_error_status>[0-9A-F]+)/"
     r"(?P<h8_error_pc>[0-9A-F]+)/(?P<h8_error_time>[0-9.]+)", re.IGNORECASE)
+
+
+def verify_hardware_rom_fixture(
+        rompath: Path,
+        expected: dict[str, str] = HARDWARE_ROM_SHA1) -> dict[str, object]:
+    """Require the raw v1.7 hardware ROMs used by the embedded korgprop system."""
+    files = []
+    for relative, expected_sha1 in expected.items():
+        path = rompath / relative
+        if not path.is_file():
+            raise argparse.ArgumentTypeError(f"missing hardware ROM: {path}")
+        digest = hashlib.sha1(path.read_bytes()).hexdigest()
+        if digest != expected_sha1:
+            raise argparse.ArgumentTypeError(
+                f"hardware ROM checksum mismatch: {path} "
+                f"(expected SHA1 {expected_sha1}, found {digest})")
+        files.append({"path": relative, "bytes": path.stat().st_size,
+                      "sha1": digest})
+    return {"schema": "profligacy-hardware-rom-fixture-v1", "files": files}
 
 
 def parse_final_health(log_text: str) -> dict[str, object] | None:
@@ -380,8 +404,8 @@ def editor_pairwise_scenario(seed: int, phase_seconds: float) -> dict[str, objec
         ("config", {"op": "set_cc_map", "args": [1, 1]}),
         ("editor_midi", {"op": "send_midi", "bytes": [0xb0, 1, 32]}),
         # A DAW Program Change is the strongest cross-origin collision: it opens
-        # the audio-thread patch-load gate while the paired editor action enters
-        # through the shared message-thread pacer.
+        # the audio-thread patch-load barrier for editor work while the host MIDI
+        # stream itself remains unfiltered.
         ("daw_midi", {"op": "daw_midi", "bytes": [0xc0, 7]}),
     ]
     boundary_offsets = (0.001, 0.015, 0.079, 0.149, 0.151, 0.399,
@@ -637,7 +661,7 @@ def main() -> int:
     elif args.scenario == "daw-program-clock-collision":
         args.no_programs = True
 
-    # Patch-load atomicity intentionally gates raw DAW dump probes during a dense
+    # Patch-load coordination intentionally delays editor dump probes during a dense
     # storm. Keep retrying until the generator's quiet tail, where mandatory
     # causal editor recovery probes decide the final verdict.
     if args.scenario == "editor-storm" and args.max_health_misses == 2:
@@ -661,6 +685,10 @@ def main() -> int:
                         (args.nvram_seed, "NVRAM seed")):
         if not path.exists():
             parser.error(f"missing {label}: {path}")
+    try:
+        rom_fixture = verify_hardware_rom_fixture(args.rompath)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     cases = args.cases or list(DEFAULT_CASES)
     # The typed timeline is only half of an exact mixed editor/DAW replay: the
@@ -773,7 +801,7 @@ def main() -> int:
                 summary_match = SUMMARY_RE.search(log_text)
                 drops_match = DROPS_RE.search(log_text)
                 arp_recovery_match = ARP_RECOVERY_RE.search(log_text)
-                clock_gate_match = CLOCK_GATE_RE.search(log_text)
+                host_midi_match = HOST_MIDI_RE.search(log_text)
                 editor_pacer_match = EDITOR_PACER_RE.search(log_text)
                 editor_recovery_match = EDITOR_RECOVERY_RE.search(log_text)
                 editor_scheduler_match = EDITOR_SCHEDULER_RE.search(log_text)
@@ -811,15 +839,17 @@ def main() -> int:
                                             drops_match.group("oversized") == "0"),
                     "arp_dump_fresh": (arp_recovery_match is not None and
                                        arp_recovery_match.group("verdict") == "PASS"),
-                    "clock_gate_accounted": clock_gate_match is not None,
+                    "host_midi_accounted": host_midi_match is not None,
                     "editor_command_pacer_bounded": (
                         editor_pacer_match is not None and
                         editor_pacer_match.group("verdict") == "PASS"),
-                    "program_clock_collision_gated": (
+                    "post_program_midi_conserved": (
                         args.scenario not in ("program-clock-collision",
                                               "daw-program-clock-collision") or
-                        (clock_gate_match is not None and
-                         int(clock_gate_match.group("count")) > 0)),
+                        (host_midi_match is not None and
+                         int(host_midi_match.group("seen")) > 0 and
+                         host_midi_match.group("seen") ==
+                         host_midi_match.group("forwarded"))),
                     "editor_recovery": (args.scenario != "rapid-patch-browse" or
                                         (editor_recovery_match is not None and
                                          editor_recovery_match.group(3) == "PASS")),
@@ -913,6 +943,7 @@ def main() -> int:
         "scenario": args.scenario,
         "host": str(args.host.resolve()),
         "rompath": str(args.rompath.resolve()),
+        "rom_fixture": rom_fixture,
         "phase_samples": phases,
         "program_interval": args.program_interval,
         "program_start": args.program_start,

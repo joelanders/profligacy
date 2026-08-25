@@ -111,6 +111,10 @@ The DAW-style stress runner continuously mixes notes, controllers, pitch bend,
 Program Change, and paced parameter SysEx. It requests a current-program dump
 every five seconds and grades the complete host -> firmware -> MIDI-out round
 trip, queue drops, response latency, and recovery after a bounded missed reply.
+Program Change never opens a host-side MIDI quarantine: subsequent host events
+continue to the emulated UART. A bounded patch-load barrier delays only editor
+mutations and dump requests, and the two Program Change collision scenarios
+require every host event seen by the processor to be accepted by the engine.
 Every case writes its seed, MIDI byte trace, host log, and machine-readable result
 under a new temporary output directory. Use repeated `--case RATE:BLOCK` and
 `--seed N` options to select a smaller or broader deterministic matrix.

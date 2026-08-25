@@ -62,9 +62,8 @@ void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 	m_editorPatchSends.store(0, std::memory_order_relaxed);
 	m_editorDumpRequests.store(0, std::memory_order_relaxed);
 	m_editorDumpSends.store(0, std::memory_order_relaxed);
-	m_patchLoadMidiGateUntilFrame.store(0, std::memory_order_relaxed);
-	m_editorClockTicksSuppressed.store(0, std::memory_order_relaxed);
-	m_patchLoadMidiEventsSuppressed.store(0, std::memory_order_relaxed);
+	m_hostMidiEventsForwarded.store(0, std::memory_order_relaxed);
+	m_patchLoadBarrierUntilFrame.store(0, std::memory_order_relaxed);
 	// samplesPerBlock is only a host hint in JUCE. Reserve a generous fixed floor so
 	// ordinary offline/host block-size changes stay allocation-free; a still-larger block
 	// is explicitly silenced and counted in processBlock rather than resizing there.
@@ -191,21 +190,13 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 			| ((std::uint32_t) std::min(numBytes, 255) << 24), std::memory_order_relaxed);
 		const std::uint64_t hostEventFrame = hostBlockStart
 			+ (std::uint64_t)std::max(meta.samplePosition, 0);
-		if (hostEventFrame < m_patchLoadMidiGateUntilFrame.load(std::memory_order_acquire)
-				&& suppressDuringPatchLoad(data, (std::size_t)numBytes))
-		{
-			if (numBytes == 1 && data[0] == 0xf8)
-				m_editorClockTicksSuppressed.fetch_add(1, std::memory_order_relaxed);
-			m_patchLoadMidiEventsSuppressed.fetch_add(1, std::memory_order_relaxed);
-			continue;
-		}
 		if (numBytes == 2 && (data[0] & 0xf0) == 0xc0)
 		{
-			const std::uint64_t gateFrames = (std::uint64_t)std::ceil(
-				m_hostSampleRate * kPatchLoadQuarantineSeconds);
-			const std::uint64_t wanted = hostEventFrame + gateFrames;
-			std::uint64_t previous = m_patchLoadMidiGateUntilFrame.load(std::memory_order_relaxed);
-			while (previous < wanted && !m_patchLoadMidiGateUntilFrame.compare_exchange_weak(
+			const std::uint64_t settleFrames = (std::uint64_t)std::ceil(
+				m_hostSampleRate * kPatchLoadSettleSeconds);
+			const std::uint64_t wanted = hostEventFrame + settleFrames;
+			std::uint64_t previous = m_patchLoadBarrierUntilFrame.load(std::memory_order_relaxed);
+			while (previous < wanted && !m_patchLoadBarrierUntilFrame.compare_exchange_weak(
 				previous, wanted, std::memory_order_release, std::memory_order_relaxed)) {}
 		}
 		if (numBytes >= 2)
@@ -238,7 +229,8 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 		}
 		const auto offset = (std::uint64_t)std::llround(
 			(double)meta.samplePosition * nativePerHost);
-		(void) m_engine.pushMidiAtFrame(data, (std::size_t) numBytes, midiFrameBase + offset);
+		if (m_engine.pushMidiAtFrame(data, (std::size_t) numBytes, midiFrameBase + offset))
+			m_hostMidiEventsForwarded.fetch_add(1, std::memory_order_relaxed);
 	}
 	m_hostMidiFrameCursor = midiFrameBase + (std::uint64_t)std::llround(numSamples * nativePerHost);
 
@@ -334,6 +326,7 @@ ProphecyAudioProcessor::DiagnosticSnapshot ProphecyAudioProcessor::diagnosticSna
 	s.audioEngineFrames = m_audioEngineFrames.load(std::memory_order_relaxed);
 	s.audioUnderrunFrames = m_audioUnderrunFrames.load(std::memory_order_relaxed);
 	s.hostMidiEvents = m_hostMidiEvents.load(std::memory_order_relaxed);
+	s.hostMidiEventsForwarded = m_hostMidiEventsForwarded.load(std::memory_order_relaxed);
 	s.lastHostMidi = m_lastHostMidi.load(std::memory_order_relaxed);
 	s.activeNotesLow = m_activeHostNotes[0].load(std::memory_order_relaxed);
 	s.activeNotesHigh = m_activeHostNotes[1].load(std::memory_order_relaxed);
@@ -346,10 +339,6 @@ ProphecyAudioProcessor::DiagnosticSnapshot ProphecyAudioProcessor::diagnosticSna
 	s.editorPatchSends = m_editorPatchSends.load(std::memory_order_relaxed);
 	s.editorDumpRequests = m_editorDumpRequests.load(std::memory_order_relaxed);
 	s.editorDumpSends = m_editorDumpSends.load(std::memory_order_relaxed);
-	s.editorClockTicksSuppressed =
-		m_editorClockTicksSuppressed.load(std::memory_order_relaxed);
-	s.patchLoadMidiEventsSuppressed =
-		m_patchLoadMidiEventsSuppressed.load(std::memory_order_relaxed);
 	s.editorCommandsSent = m_editorCommandPacer.sent();
 	s.editorCommandsCoalesced = m_editorCommandPacer.coalesced();
 	s.editorCommandsCancelled = m_editorCommandPacer.cancelled();
@@ -494,10 +483,9 @@ void ProphecyAudioProcessor::selectPatch(int program)
 	(void)m_macroBurst.cancel();
 	m_programDumpSync.cancel();
 	m_editorCommandPacer.holdForPatchLoad(2500);
-	// Start gating at intent time so already-debounced clicks cannot schedule more
-	// external clocks ahead of the Program Change. An accepted send refreshes the
-	// window to cover the complete firmware load.
-	holdMidiForPatchLoad(2.5);
+	// Start the editor-command barrier at intent time. An accepted send refreshes
+	// it to cover the complete firmware load; host and editor-play MIDI still pass.
+	holdEditorCommandsForPatchLoad(2.5);
 	m_patchSelectDelay.schedule(program);
 }
 
@@ -512,7 +500,7 @@ bool ProphecyAudioProcessor::sendPatchNow(int program)
 	{
 		// Keep both barriers closed while PatchSelectDelay retains the latest
 		// requested program and waits for the previous transaction to settle.
-		holdMidiForPatchLoad(0.2);
+		holdEditorCommandsForPatchLoad(0.2);
 		m_editorCommandPacer.extendPatchLoad(200);
 		return false;
 	}
@@ -525,49 +513,27 @@ bool ProphecyAudioProcessor::sendPatchNow(int program)
 	const bool accepted = pushImmediateMidi(msg, sizeof(msg));
 	if (accepted)
 	{
-		holdMidiForPatchLoad(kPatchLoadQuarantineSeconds);
+		holdEditorCommandsForPatchLoad(kPatchLoadSettleSeconds);
 		m_editorCommandPacer.extendPatchLoad(
-			(int)std::lround(kPatchLoadQuarantineSeconds * 1000.0));
+			(int)std::lround(kPatchLoadSettleSeconds * 1000.0));
 		m_lastPatchSendMs = now;
 		m_editorPatchSends.fetch_add(1, std::memory_order_relaxed);
 	}
 	return accepted;
 }
 
-void ProphecyAudioProcessor::holdMidiForPatchLoad(double seconds)
+void ProphecyAudioProcessor::holdEditorCommandsForPatchLoad(double seconds)
 {
 	const std::uint64_t current = m_audioHostFrames.load(std::memory_order_relaxed);
 	const std::uint64_t wanted = current
 		+ (std::uint64_t)std::ceil(std::max(seconds, 0.0) * m_hostSampleRate);
-	std::uint64_t previous = m_patchLoadMidiGateUntilFrame.load(std::memory_order_relaxed);
-	while (previous < wanted && !m_patchLoadMidiGateUntilFrame.compare_exchange_weak(
+	std::uint64_t previous = m_patchLoadBarrierUntilFrame.load(std::memory_order_relaxed);
+	while (previous < wanted && !m_patchLoadBarrierUntilFrame.compare_exchange_weak(
 		previous, wanted, std::memory_order_release, std::memory_order_relaxed)) {}
-}
-
-bool ProphecyAudioProcessor::suppressDuringPatchLoad(
-	const std::uint8_t *bytes, std::size_t size)
-{
-	if (bytes == nullptr || size == 0) return false;
-	const std::uint8_t status = bytes[0];
-	// Note releases must always pass so a selection cannot create a stuck note.
-	// Other channel voice messages and SysEx create firmware/control-link work and
-	// are held out of the bounded patch-load transaction. System transport other
-	// than MIDI clock remains safe and useful to forward.
-	if ((status & 0xf0) == 0x80) return false;
-	if ((status & 0xf0) == 0x90 && size >= 3 && bytes[2] == 0) return false;
-	if (status < 0xf0 || status == 0xf0 || status == 0xf8) return true;
-	return false;
 }
 
 void ProphecyAudioProcessor::sendMidi(const std::uint8_t *bytes, std::size_t size)
 {
-	if (patchLoadMidiGateActive() && suppressDuringPatchLoad(bytes, size))
-	{
-		if (size == 1 && bytes[0] == 0xf8)
-			m_editorClockTicksSuppressed.fetch_add(1, std::memory_order_relaxed);
-		m_patchLoadMidiEventsSuppressed.fetch_add(1, std::memory_order_relaxed);
-		return;
-	}
 	(void)pushImmediateMidi(bytes, size);
 }
 
@@ -616,7 +582,7 @@ std::uint64_t ProphecyAudioProcessor::requestProgramDump()
 	// Program Change and current-program dump assembly share the firmware MIDI task. A dump
 	// sent during the patch-load transaction is silently discarded, so wait out any pending/recent
 	// selection and let ProgramDumpSync retry the one in-flight editor transaction if needed.
-	constexpr double patchSettleMs = kPatchLoadQuarantineSeconds * 1000.0;
+	constexpr double patchSettleMs = kPatchLoadSettleSeconds * 1000.0;
 	const double now = juce::Time::getMillisecondCounterHiRes();
 	int delayMs = 0;
 	if (m_patchSelectDelay.pending())

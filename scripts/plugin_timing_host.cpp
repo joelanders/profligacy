@@ -900,9 +900,9 @@ int main(int argc, char **argv)
 		(unsigned long long)processor.droppedUiAdinEvents(),
 		(unsigned long long)processor.droppedAudioAdinEvents(),
 		(unsigned long long)processor.oversizedAudioBlocks());
-	std::fprintf(stderr, "[editor-clock-gate] suppressed=%llu patch_load_midi=%llu\n",
-		(unsigned long long)finalDiagnostic.editorClockTicksSuppressed,
-		(unsigned long long)finalDiagnostic.patchLoadMidiEventsSuppressed);
+	std::fprintf(stderr, "[host-midi] seen=%llu forwarded=%llu\n",
+		(unsigned long long)finalDiagnostic.hostMidiEvents,
+		(unsigned long long)finalDiagnostic.hostMidiEventsForwarded);
 	if (stress)
 	{
 		std::fprintf(stderr,

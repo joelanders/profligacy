@@ -58,6 +58,7 @@ public:
 		std::uint64_t audioEngineFrames = 0;
 		std::uint64_t audioUnderrunFrames = 0;
 		std::uint64_t hostMidiEvents = 0;
+		std::uint64_t hostMidiEventsForwarded = 0;
 		std::uint32_t lastHostMidi = 0;
 		std::uint64_t activeNotesLow = 0;
 		std::uint64_t activeNotesHigh = 0;
@@ -70,8 +71,6 @@ public:
 		std::uint64_t editorPatchSends = 0;
 		std::uint64_t editorDumpRequests = 0;
 		std::uint64_t editorDumpSends = 0;
-		std::uint64_t editorClockTicksSuppressed = 0;
-		std::uint64_t patchLoadMidiEventsSuppressed = 0;
 		std::uint64_t editorCommandsSent = 0;
 		std::uint64_t editorCommandsCoalesced = 0;
 		std::uint64_t editorCommandsCancelled = 0;
@@ -323,7 +322,7 @@ private:
 		{
 			return !m_queue.empty()
 				|| juce::Time::getMillisecondCounterHiRes() < m_holdUntilMs
-				|| m_proc.patchLoadMidiGateActive();
+				|| m_proc.patchLoadBarrierActive();
 		}
 		std::uint64_t sent() const { return m_sent.load(std::memory_order_relaxed); }
 		std::uint64_t coalesced() const { return m_coalesced.load(std::memory_order_relaxed); }
@@ -341,11 +340,12 @@ private:
 		void timerCallback() override
 		{
 			const double now = juce::Time::getMillisecondCounterHiRes();
-			if (m_proc.patchLoadMidiGateActive())
+			if (m_proc.patchLoadBarrierActive())
 			{
-				// DAW Program Changes extend the frame-based gate on the audio
-				// callback. Observe that atomic gate here instead of starting or
-				// touching a JUCE timer from the real-time thread.
+				// DAW Program Changes extend the frame-based editor-command barrier
+				// on the audio callback. Observe it here instead of starting or
+				// touching a JUCE timer from the real-time thread. Host MIDI itself
+				// remains unfiltered.
 				startTimer(25);
 				return;
 			}
@@ -381,18 +381,16 @@ private:
 		std::atomic<std::uint64_t> m_dropped { 0 };
 	};
 	EditorCommandPacer m_editorCommandPacer { *this };
-	// Program loading plus concurrent MIDI can wedge the emulated H8/V55 control
-	// link even when every host-side byte was accepted. Treat loading as an atomic
-	// transaction: releases always pass, while new musical/control work waits for a
-	// bounded host-frame window. This covers editor and DAW Program Changes.
-	void holdMidiForPatchLoad(double seconds);
-	bool patchLoadMidiGateActive() const
+	// Program loading plus concurrent editor mutations can wedge the emulated H8/V55
+	// control link. Hold editor commands and dump requests for a bounded interval after
+	// editor or DAW Program Change, but never discard the host's MIDI stream.
+	void holdEditorCommandsForPatchLoad(double seconds);
+	bool patchLoadBarrierActive() const
 	{
 		return m_audioHostFrames.load(std::memory_order_relaxed)
-			< m_patchLoadMidiGateUntilFrame.load(std::memory_order_acquire);
+			< m_patchLoadBarrierUntilFrame.load(std::memory_order_acquire);
 	}
-	static bool suppressDuringPatchLoad(const std::uint8_t *bytes, std::size_t size);
-	static constexpr double kPatchLoadQuarantineSeconds = 2.0;
+	static constexpr double kPatchLoadSettleSeconds = 2.0;
 	static constexpr double kPatchSelectMinIntervalMs = 2500.0;
 	bool sendPatchNow(int program);
 	class PatchSelectDelay : private juce::Timer
@@ -572,14 +570,13 @@ private:
 	std::atomic<std::uint64_t> m_audioEngineFrames { 0 };
 	std::atomic<std::uint64_t> m_audioUnderrunFrames { 0 };
 	std::atomic<std::uint64_t> m_hostMidiEvents { 0 };
+	std::atomic<std::uint64_t> m_hostMidiEventsForwarded { 0 };
 	std::atomic<std::uint32_t> m_lastHostMidi { 0 };
 	std::atomic<std::uint64_t> m_editorPatchIntents { 0 };
 	std::atomic<std::uint64_t> m_editorPatchSends { 0 };
 	std::atomic<std::uint64_t> m_editorDumpRequests { 0 };
 	std::atomic<std::uint64_t> m_editorDumpSends { 0 };
-	std::atomic<std::uint64_t> m_patchLoadMidiGateUntilFrame { 0 };
-	std::atomic<std::uint64_t> m_editorClockTicksSuppressed { 0 };
-	std::atomic<std::uint64_t> m_patchLoadMidiEventsSuppressed { 0 };
+	std::atomic<std::uint64_t> m_patchLoadBarrierUntilFrame { 0 };
 	std::array<std::atomic<std::uint64_t>, 2> m_activeHostNotes {};
 	bool               m_skipStateRestore = false;
 

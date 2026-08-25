@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,22 @@ import run_headless_midi_stress as stress
 
 
 class HeadlessMidiStressTest(unittest.TestCase):
+    def test_hardware_rom_fixture_rejects_substituted_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relative = "korgprop/test.bin"
+            path = root / relative
+            path.parent.mkdir()
+            body = b"independently constructed test fixture"
+            path.write_bytes(body)
+            expected = {relative: hashlib.sha1(body).hexdigest()}
+            receipt = stress.verify_hardware_rom_fixture(root, expected)
+            self.assertEqual(expected[relative], receipt["files"][0]["sha1"])
+            path.write_bytes(body + b" changed")
+            with self.assertRaisesRegex(argparse.ArgumentTypeError,
+                                       "hardware ROM checksum mismatch"):
+                stress.verify_hardware_rom_fixture(root, expected)
+
     def test_case_parser(self) -> None:
         self.assertEqual((48000, 512), stress.parse_case("48000:512"))
         with self.assertRaises(argparse.ArgumentTypeError):
@@ -142,6 +159,13 @@ class HeadlessMidiStressTest(unittest.TestCase):
         self.assertIsNotNone(arp)
         assert arp is not None
         self.assertEqual("PASS", arp.group("verdict"))
+
+    def test_host_midi_conservation_parser(self) -> None:
+        match = stress.HOST_MIDI_RE.search("[host-midi] seen=73 forwarded=73")
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual("73", match.group("seen"))
+        self.assertEqual(match.group("seen"), match.group("forwarded"))
 
     def test_editor_recovery_parser(self) -> None:
         match = stress.EDITOR_RECOVERY_RE.search(
