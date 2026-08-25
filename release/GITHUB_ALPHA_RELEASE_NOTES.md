@@ -1,28 +1,34 @@
-# Profligacy 1.0.0 alpha 6
+# Profligacy 1.0.0 alpha 7
 
 Profligacy is an independent AU, VST3, and standalone software instrument
 compatible with user-supplied Korg Prophecy firmware. It is not affiliated with
 or endorsed by Korg.
 
-## Changes in alpha 6
+## Changes in alpha 7
 
-- Added a guarded delivery invariant for the Prophecy's internal V55-to-H8
-  serial link. A completed V55 transmit byte remains pending until H8 SCI0
-  accepts it; after a stable idle, error-free delivery deficit, the missing byte
-  is delivered through the normal H8 receive-data and interrupt path. This
-  prevents the observed control freeze in which the final two bytes of a
-  four-byte command disappeared while audio continued.
-- Added a deterministic two-frame fault gate for that failure. With the guard
-  disabled it reproduces the unresponsive control path with two bytes pending
-  and no SCI errors; with the guard enabled exactly two deliveries are repaired
-  and the editor remains responsive. Normal 44.1, 48, and 96 kHz stress runs
-  complete with zero repairs and zero delivery-queue overflows.
-- The lower-level cause of the rare callback/event disappearance is not yet
-  identified. Alpha 6 therefore treats this as a narrowly gated stability
-  safeguard rather than claiming the scheduler mechanism itself is fixed.
-- Retains alpha 5's paced editor SysEx path and board-link stress coverage,
-  alpha 4's MIDI-stability fixes, alpha 3's native TMS57002 JIT improvements,
-  and alpha 2's WebView2 editor fix.
+- Corrected the independent clocks on the Prophecy's internal serial link. The
+  V55 now runs at 31.25 kbit/s and the H8 at 32 kbit/s, matching measured
+  hardware rather than forcing both endpoints to one rate.
+- Added the H8/3003 external-bus costs used by the instrument and routed the
+  V55 P33 signal to the H8 IRQ1 input according to the service-manual wiring and
+  physical traces. This replaces synthetic interrupt timing with the modeled
+  board signal path.
+- Replaced the DSP host-update timing surrogate with the TMS57002's native
+  EMPTY state and complete 16-word update queue.
+- Corrected the H8 watchdog interval-overflow and overflow-clear behavior.
+- Preserved ordinary MIDI arriving after Program Change. Earlier builds could
+  discard two seconds of otherwise valid follow-up traffic.
+- Added deterministic control-path, lifecycle, firmware-version, and
+  cross-platform no-ROM regressions. The retained DSP corpus still passes all
+  554 hardware-oracle cases, and the packaged-product gates exercise all three
+  DSPs without distributing Korg firmware.
+- A narrow phase-dependent firmware scheduling window can defer a parameter
+  update until the following roughly 4 ms host-transfer pass. The transaction
+  and DSP command remain intact; this is recorded as firmware control flow, not
+  hidden as a fixed-latency claim.
+- Retains alpha 6's guarded-delivery stability work, alpha 5's paced editor
+  SysEx path, alpha 4's MIDI-stability fixes, alpha 3's native TMS57002 JIT
+  improvements, and alpha 2's WebView2 editor fix.
 
 ## Supported systems
 
