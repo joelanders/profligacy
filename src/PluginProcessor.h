@@ -138,6 +138,7 @@ public:
 	// each array element is an independent latest-value display sample.
 	void controllerDisplaySnapshot(std::uint8_t out[16]) const;
 	std::uint32_t ledSnapshot(std::uint8_t out[12]) const { return m_engine.ledSnapshot(out); }
+	std::uint32_t ledVisualSnapshot(std::uint8_t out[12]) const { return m_engine.ledVisualSnapshot(out); }
 	std::uint32_t lcdRawSnapshot(std::uint8_t r1[40], std::uint8_t r2[40], std::uint8_t cg[64]) const
 	{ return m_engine.lcdRawSnapshot(r1, r2, cg); }
 	// 128 patch names (A00..B63) read from the sysram NVRAM file; empty when unavailable

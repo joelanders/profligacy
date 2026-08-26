@@ -12,6 +12,12 @@ endif()
 include(CTest)
 
 if(BUILD_TESTING)
+	add_executable(ProphecyLedStoreTest scripts/led_store_test.cpp)
+	target_include_directories(ProphecyLedStoreTest PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/src)
+	target_compile_features(ProphecyLedStoreTest PRIVATE cxx_std_20)
+	add_test(NAME led_store COMMAND $<TARGET_FILE:ProphecyLedStoreTest>)
+
 	find_package(Python3 REQUIRED COMPONENTS Interpreter)
 	foreach(_prophecy_python_test
 		alpha_release_policy

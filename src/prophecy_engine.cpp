@@ -24,6 +24,7 @@
 #include "render.h"
 #include "video/hd44780.h"
 
+#include "led_store.h"
 #include "prophecy_engine.h"
 
 #include <algorithm>
@@ -383,33 +384,9 @@ private:
 MidiTxByteEventRing g_host_midi_tx_byte_ring;
 std::atomic<bool> g_host_midi_tx_byte_capture_enabled { false };
 
-// Front-panel LED state. The MAME thread pushes (bank, data) snapshots via the
-// kprop_set_host_led callback; the message thread polls the accumulated banks
-// (12 banks x 8 bits = leds[96]). Atomics — no locks near either thread.
-struct LedStore
-{
-	void set(std::uint8_t bank, std::uint8_t data)
-	{
-		if (bank >= 12) return;
-		m_banks[bank].store(data, std::memory_order_relaxed);
-		m_version.fetch_add(1, std::memory_order_release);
-	}
-	std::uint32_t snapshot(std::uint8_t out[12]) const
-	{
-		const std::uint32_t v = m_version.load(std::memory_order_acquire);
-		for (int i = 0; i < 12; i++) out[i] = m_banks[i].load(std::memory_order_relaxed);
-		return v;
-	}
-	void reset()
-	{
-		for (auto &bank : m_banks) bank.store(0, std::memory_order_relaxed);
-		m_version.store(0, std::memory_order_release);
-	}
-private:
-	std::atomic<std::uint8_t>  m_banks[12] {};
-	std::atomic<std::uint32_t> m_version { 0 };
-};
-
+// Front-panel LED state. The MAME worker publishes bank changes here; ordinary
+// observers read electrical state, while the editor has a separate pulse-aware
+// snapshot so a diagnostic read cannot steal a short visual event.
 LedStore g_host_led_store;
 
 // Latest HD44780 text. The MAME worker thread writes (via the kprop_set_host_lcd callback); the
@@ -1071,6 +1048,16 @@ std::uint32_t ProphecyEngine::ledSnapshot(std::uint8_t out[12]) const
 		return 0;
 	}
 	return g_host_led_store.snapshot(out);
+}
+
+std::uint32_t ProphecyEngine::ledVisualSnapshot(std::uint8_t out[12]) const
+{
+	if (!ownsMachineSlot())
+	{
+		if (out != nullptr) std::fill_n(out, 12, std::uint8_t(0));
+		return 0;
+	}
+	return g_host_led_store.visualSnapshot(out);
 }
 
 std::uint32_t ProphecyEngine::lcdRawSnapshot(std::uint8_t row1[40], std::uint8_t row2[40], std::uint8_t cgram[64]) const

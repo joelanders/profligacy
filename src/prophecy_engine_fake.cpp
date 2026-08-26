@@ -88,6 +88,10 @@ std::uint32_t ProphecyEngine::ledSnapshot(std::uint8_t out[12]) const
 	if (out) std::memset(out, 0, 12);
 	return 0;
 }
+std::uint32_t ProphecyEngine::ledVisualSnapshot(std::uint8_t out[12]) const
+{
+	return ledSnapshot(out);
+}
 std::uint32_t ProphecyEngine::lcdRawSnapshot(std::uint8_t row1[40], std::uint8_t row2[40], std::uint8_t cgram[64]) const
 {
 	if (row1) std::memset(row1, ' ', 40);

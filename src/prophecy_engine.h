@@ -125,6 +125,10 @@ public:
 	// Returns a version counter that increments on every LED change — poll cheaply and
 	// redraw only when it moves. Atomics only; any thread.
 	std::uint32_t ledSnapshot(std::uint8_t out[12]) const;
+	// Editor-only visual snapshot. Rising edges are latched until this method consumes
+	// them, so a short hardware pulse remains visible for at least one editor poll.
+	// Other ledSnapshot() observers never consume these latches.
+	std::uint32_t ledVisualSnapshot(std::uint8_t out[12]) const;
 
 	// Raw LCD snapshot: the visible 40-column rows as HD44780 char codes (codes 0x00-0x07
 	// are the CGRAM custom glyphs) plus the 64-byte CGRAM (8 glyphs x 8 rows, low 5 bits).

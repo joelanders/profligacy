@@ -1276,7 +1276,7 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 				{
 					juce::ignoreUnused(args);
 					std::uint8_t banks[12];
-					const std::uint32_t ver = m_proc.ledSnapshot(banks);
+					const std::uint32_t ver = m_proc.ledVisualSnapshot(banks);
 					auto *obj = new juce::DynamicObject();
 					obj->setProperty("version", (int) ver);
 					juce::Array<juce::var> arr;

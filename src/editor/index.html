@@ -5287,16 +5287,19 @@
       dirty = true;
   });
 
-  // ---- LED poll: banks -> leds[96], redraw only when the version moves ----
-  let ledVer = -1;
+  // ---- LED poll: banks -> leds[96]. The native visual snapshot latches short
+  // rising pulses for one poll; always apply it so the following same-version
+  // snapshot can clear the visual latch again.
   pollNativeLatest('getLeds',33,r => {
-      if (!r || (r.version|0) === ledVer) return;
-      ledVer = r.version|0;
+      if (!r) return;
       const banks = r.banks || [];
+      let changed = false;
       for (let b = 0; b < 12; b++)
-        for (let bit = 0; bit < 8; bit++)
-          leds[b*8+bit] = ((banks[b]|0) & (1<<bit)) !== 0;
-      dirty = true;
+        for (let bit = 0; bit < 8; bit++) {
+          const next = ((banks[b]|0) & (1<<bit)) !== 0;
+          if (leds[b*8+bit] !== next) { leds[b*8+bit] = next; changed = true; }
+        }
+      if (changed) dirty = true;
   });
 
   // ---- performance-controller poll. This is display state only: ordinary MIDI
