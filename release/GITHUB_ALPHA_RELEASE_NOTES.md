@@ -18,6 +18,16 @@ or endorsed by Korg.
 - Corrected the H8 watchdog interval-overflow and overflow-clear behavior.
 - Preserved ordinary MIDI arriving after Program Change. Earlier builds could
   discard two seconds of otherwise valid follow-up traffic.
+- Sent modeled front-panel analog controls directly to the hardware input path
+  instead of throttling them with serialized editor commands, so fast wheel and
+  ribbon gestures reach the firmware at their natural update rate.
+- Corrected the software X-Y surface's ribbon direction, momentary pressure,
+  and release behavior. The editor now also mirrors incoming pitch-bend and
+  modulation-wheel movement without applying those MIDI messages twice.
+- Latched very short front-panel LED pulses long enough for the editor to show
+  them reliably, without changing the timing seen by the emulated hardware.
+- Simplified the Program signal-flow view and made its module layout, mixer
+  routing, visual hierarchy, and developer-only diagnostics more consistent.
 - Added deterministic control-path, lifecycle, firmware-version, and
   cross-platform no-ROM regressions. The retained DSP corpus still passes all
   554 hardware-oracle cases, and the packaged-product gates exercise all three
