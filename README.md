@@ -1,267 +1,69 @@
 # Profligacy
 
-An independent JUCE audio plug-in (VST3/AU/standalone) compatible with
-user-supplied firmware for the Korg Prophecy synthesizer. Profligacy is not
-affiliated with or endorsed by Korg.
+This is a low-level emulation of the hardware in the Korg Prophecy.
+* I'm not affiliated with or endorsed by Korg or anyone else.
 
-**Your code lives at the top level; MAME and JUCE are dependencies underneath.**
-The plugin does not fork or bury itself inside MAME — it *links the pinned public
-MAME fork as a library* (MAME's frontend `main()` is just one caller of the emu
-library; this repo is another) and drives its emulated devices through a narrow
-host seam.
+You bring your own ROM dumps of the original firmware (2 chips), and this thing runs it.
 
-## Public alpha support boundary
+I spent months probing the NEC V55PI, Hitachi H8/3003, and (3x) TI TMS57002 chips. Got all the inter-chip UART and DSP host interface signals matching in time and content exactly.
 
-The first public GitHub alpha supports native Apple Silicon on macOS 15.0 or
-later. The AU, VST3, and standalone bundles are ad-hoc signed, not Developer ID
-signed or Apple-notarized. Verify the published SHA-256 before using the package;
-macOS may then require removing the downloaded archive's quarantine attribute as
-described in `release/GITHUB_ALPHA_RELEASE_NOTES.md`.
+The digital audio is a more complicated story because of the free-running oscillators. I had to do things piece by piece: render some long sustaining oscillator waveforms through the emulator and hardware, line them up by a phase offset. They still won't be sample exact, but the hardware-hardware error is consistent with the hardware-emulator error.
 
-The alpha has four important limitations:
+DSP2 and DSP3 were easier: I could record the inputs and outputs of the hardware chips (4 channels in and 4 channels out), play back the inputs through my emulated chips, and ensure that the outputs matched. Happily, these can match exactly.
 
-- Korg firmware is not included. On first launch, choose a directory containing
-  `korgprop/ic12_v17.bin` and `korgprop/ic22_v17.bin`, or `korgprop.zip`.
-- One Profligacy synth engine may be active per host process. Additional plug-in
-  objects remain inert rather than sharing or corrupting the active engine.
-- DAW bounce/render must run at real-time 1x. Unrestricted faster-than-real-time
-  rendering can be silent because the emulator is paced asynchronously.
-- Existing bit-exact evidence ends at the DSP3 serial output. Analog line-output
-  coloration has not yet been certified against the physical output stage.
+Later I explain running the original firmware's DSP programs on a standalone DSP board, which also let me control the phase of the oscillators. I don't know if this is an easier to believe claim than the one above. In reality, I was coming at this from a lot of directions.
 
-```
-profligacy/                       <- this repo (your code)
-├── src/
-│   └── console_main.cpp          <- headless host harness (the plugin minus JUCE)
-├── scripts/
-│   ├── build_console.sh          <- compile src/ + link MAME's static archives
-│   └── run_console.sh            <- boot korgprop, capture audio (--ring for RT test)
-└── extern/
-    ├── mame/   (git submodule)   -> joelanders/mame-profligacy
-    └── JUCE/   (git submodule)   -> juce-framework/JUCE
-```
+I also did a bunch of MIDI -> UART -> host interface -> digital audio end-to-end tests to make sure all the intermediate signals matched exactly as well. Practically speaking: the other tests measured steady state equivalence, but I also showed my thing reacts to performance/control changes exactly the same as well.
 
-## Why the driver isn't at the top level
+I'm not modelling the post-DAC analog parts at all because the service manual says the frequency response is supposed to be flat to within 1 dB across the audible band. (Annoyingly, I found my hardware unit *isn't* flat, so I might have to replace some old capacitors or something. I'll let you know if it turns out to be the magic analog warmth.)
 
-The **Prophecy driver** (`korgprophecy.cpp`) and the **TMS57002 arm64 dynarec** are
-MAME device/driver code — they use MAME's framework and are edits to MAME's own
-files — so they live inside the `extern/mame` submodule (the fork), not here.
-That is the correct seam: the *emulation* is a MAME fork (and could be upstreamed
-one day); the *product* is this top-level plugin that consumes it. Everything in
-`src/` here is pure host code with zero MAME-framework coupling — it only links MAME.
 
-## Build
+## Downloads, Firmware, and Installation
 
-One-time: build MAME's static archives inside the submodule (the slow foundation
-build). It needs a real `python` on PATH — the asdf shim on this machine is broken
-(pins an uninstalled version), so prepend a working one:
+First rule of emulation development is that I can't help you get the firmware. This project is for people who own the original hardware and firmware already.
 
-```bash
-git submodule update --init            # if not already checked out
-scripts/build_mame_core.sh --regen     # builds the archives AND writes the rev stamp
-```
+On first launch a folder picker opens. Point it at a directory containing `korgprop/ic12_v17.bin` and `korgprop/ic22_v17.bin` *or* `korgprop.zip` containing those two bin files.
 
-(`build_mame_core.sh` handles the python-on-PATH quirk itself and stamps the build;
-CMake refuses to link archives whose stamp doesn't match the submodule HEAD.)
 
-Then build and run the host harness from this repo:
+## Technical stuff
 
-```bash
-./scripts/build_console.sh             # -> ./console_host  (links extern/mame archives)
-./scripts/run_console.sh               # Rung 1: capture to WAV
-./scripts/run_console.sh --ring        # Rung 2: real-time ring-backpressure self-clocking
-```
+The main chips are an NEC V55PI, a Hitachi H8/3003, and three TI TMS57002s. The H8 was already in MAME. The V55 was not (though the related V20 and V30 were), and even finding a TRM was a bit difficult. I could only find some copies in Japanese at first ([here](https://www.renesas.com/ja/document/mah/v55pitm) and [here](https://www.renesas.com/ja/document/mah/v55pitm-0)), which I couldn't read at all, but which was no problem for my LLM agents. Some months in, a fellow dev told me they had found [an English copy](https://archive.org/details/v55pi_manual) (thanks, Giulio).
 
-### Headless MIDI/control stress
+I paid someone to trace the schematics into KiCad (thanks, Houston).
 
-Two unattended regressions exercise the control path without opening the editor:
+### V55PI
+The V55 handles key/switch presses, the LCD, MIDI, etc. It was fun getting things printed to the emulated LCD for the first time. It talks to the H8 over a bidirectional UART (weirdly 31.25 kbit/s there and 32 kbit/s back).
 
-```bash
-# Replays the captured long-session control workload. Periodic current-program
-# dumps and an internal board-link queue invariant make the script fail on a
-# stalled MIDI path or the H8/V55 control-transport freeze.
-PROFLIGACY_REPLAY_ROMPATH=/path/to/roms \
-  ./scripts/replay_v55_control_freeze.sh
+### H8/3003
+The H8 reads things like program/parameter changes and note events over the UART from the V55PI and turns them into control messages for the DSP host interface.
+* For example, if you switch the oscillator or effects type, it will toggle the PLOAD pin and send a new Program over the host interface to dsp1 or dsp3 (there is only 1 program for the filter section, so dsp2 only gets PLOADed at boot).
+* If you play notes or change parameters, the H8 sends CLOAD messages corresponding to Coefficients that control triggers, pitches, amplitudes, filter settings, EG + LFO timings/shapes, etc.
 
-# Drives the actual JUCE processBlock path across the release rate/block matrix.
-cmake --build build-cmake --config Release --target ProphecyPluginTimingHost
-./scripts/run_headless_midi_stress.py \
-  --rompath /path/to/roms --nvram-seed /path/to/sysram
+### TMS57002
+The meat of the project was the DSP chip: the TI TMS57002. There was a stub implementation in MAME, and the author of that helpfully sent me the User's Guide (thanks, Olivier), which I have uploaded [here](https://archive.org/details/tms57002).
 
-# Exercise the editor's real message-thread patch-selection and dump path. Rapid
-# selection intents must coalesce to the final patch and recover a fresh dump.
-./scripts/run_headless_midi_stress.py \
-  --scenario rapid-patch-browse \
-  --rompath /path/to/roms --nvram-seed /path/to/sysram
+That PDF is an optical scan and sometimes the OCR was not 100% reliable. In order to verify the accuracy of my emulation, I bought a couple samples of the chip off eBay. And I made a few PCB assemblies to peek and poke at it with a Raspberry Pi Pico through some level shifting chips.
 
-# Cover every editor action family at scheduler boundaries, then all 100 ordered
-# pairs in four deterministic shards.  These still use the same Python entry
-# point and the same native timing-host executable.
-./scripts/run_headless_midi_stress.py --scenario editor-boundaries --seed 6
-./scripts/run_headless_midi_stress.py --scenario editor-pairwise \
-  --seed 0 --seed 1 --seed 2 --seed 3
+The first DSP programs I poked into this 30+ year-old chip were simple. Exercising all the instructions. Confirming edge cases (sign extension, overflow, rounding, clamping, etc.) Lots of little details like that in a DSP chip since arithmetic is the main job. A lot of that behavior is dependent on mode/status bits.
 
-# Generate a replayable editor/DAW storm. Passing cases retain compact JSON;
-# failures retain their complete log, MIDI trace, flight recorder, and scenario.
-./scripts/run_headless_midi_stress.py --scenario editor-storm \
-  --seed 202 --action-rate 20 --seconds 40
-```
+Eventually it was accurate enough to run the full programs from the original firmware. A program is up to 256 24-bit instructions long. I observed 12 programs going to DSP1 for all the oscillator sets. Just 1 going to DSP2 for the filters. And 2 going to DSP3 for the effects sets. And 1 other program that runs in between programs that zeroes out DMEM and other state as much as possible (not all the registers, annoyingly). I wish I had found that sooner because I had to cobble something less reliable myself during my standalone DSP testing.
 
-The DAW-style stress runner continuously mixes notes, controllers, pitch bend,
-Program Change, and paced parameter SysEx. It requests a current-program dump
-every five seconds and grades the complete host -> firmware -> MIDI-out round
-trip, queue drops, response latency, and recovery after a bounded missed reply.
-Program Change never opens a host-side MIDI quarantine: subsequent host events
-continue to the emulated UART. A bounded patch-load barrier delays only editor
-mutations and dump requests, and the two Program Change collision scenarios
-require every host event seen by the processor to be accepted by the engine.
-Every case writes its seed, MIDI byte trace, host log, and machine-readable result
-under a new temporary output directory. Use repeated `--case RATE:BLOCK` and
-`--seed N` options to select a smaller or broader deterministic matrix.
+The scariest type of problem I ran into was: the observable outputs are bit-exact for a while, but then diverge. Easy to see how this happens: you might do some 24-bit * 32-bit math with a 52-bit accumulator, but then only output the 24 MSBs. If you have some error only in the LSBs of the accumulator, it might only become visible after millions of frames. (If the chip had a debugging interface, you could read back all the internal state after each step and life would be easy.) I wrote a bunch of adversarial programs designed to probe scary behavior like this. Verified they would be sensitive to small errors only after a million or so frames. And then I ran them for longer than that on hardware and the emulator and made sure they stayed in sync past that point.
 
-`--scenario rapid-patch-browse` uses the same host and artifact format, but routes
-twenty fast patch selections and the post-browse dump through the editor-facing
-processor methods rather than synthesizing them in the DAW MIDI buffer. It fails
-unless audio remains live, the first recovery dump arrives, the final LCD names the
-last requested patch, both MIDI queues remain lossless, and the board-link flight
-recorder stays healthy.
+## Making it fast
 
-The other editor scenarios use a versioned, typed action timeline. They cover
-program/global/pattern parameters, arpeggiator reads and writes, rename/macro,
-front-panel pulses, analog controls, configuration, editor MIDI, and simultaneous
-DAW MIDI. Every failure is exactly replayable with `--replay-scenario
-PATH/scenario.json`; a frozen flight-recorder trigger also emits a proven
-trigger-prefix reduction. `--retain compact` (the default) removes large traces
-only after a passing case, while failures always retain full evidence.
+Once I had an accurate emulation, I had to make it faster. The original interpreter ran at about realtime on my M2 chip. Basically no headroom, so there were audio dropouts depending on your buffer size. The 3 DSP chips were taking the bulk of the time, so I added a dynamic recompilation / JIT mode to the DSP core.
 
-Final grading includes live audio, fresh generation-matched read-back, bounded
-editor work, queue drain, note drain, MIDI/ADIN drop counters, H8 SCI errors, and
-an exact V55-to-H8 wire oracle that compares every launched byte with the byte
-the H8 firmware actually reads. The two `negative-*` scenarios deliberately
-trip the MIDI-overflow and stuck-note graders to verify that a green campaign is
-not merely a permissive harness.
+It uses about half a core on my Apple M2 chip, and 80% on my intel iMac last time I checked. Probably room to improve.
 
-The captured replay defaults to response-relative heartbeat timing because the
-original serial fault was phase-sensitive. It also records the exact workload,
-configuration, logs, and MIDI output in its reported artifact directory. For a
-fully pre-scheduled timing baseline, set `PROFLIGACY_REPLAY_HEALTH_FIXED_SCHEDULE=1`
-and provide comma-separated emulated timestamps in
-`PROFLIGACY_REPLAY_HEALTH_TIMES`.
+## Making it pretty
 
-At runtime, choose a ROM directory containing either
-`korgprop/ic12_v17.bin` plus `korgprop/ic22_v17.bin`, or an equivalent
-`korgprop.zip`. The HD44780 A00 LCD character table is a documented datasheet
-reconstruction compiled into the pinned MAME fork, so no separate LCD ROM file
-is required.
+The original panel is quite button-driven. It's a bit nicer in the real hardware when you can use two hands at once, but pecking around with a mouse isn't fun. I started out with a very auto-generated sysex editor kind of UI with hundreds of sliders for all of the exposed parameters. I got sucked into improving this somewhat.
 
-The native TMS57002 engine is the default on supported 64-bit builds, including
-Windows. For troubleshooting, set `PROPHECY_DSP_ENGINE=interpreter` before
-launching the standalone or DAW to use the slower portable interpreter. The
-existing low-level `KPROP_DSP_PERFRAME` variable remains available to developers
-and takes precedence when it is already set.
+## Supported systems
 
-To build against an already-built sibling MAME tree instead of the submodule
-(skips the 30-min build while iterating):
-
-```bash
-MAME_DIR=../mame-profligacy ./scripts/build_console.sh
-```
-
-## Status
-
-Validated integration status:
-
-- **Rung 1 (done):** link MAME archives into a non-MAME binary, own `main()`, custom
-  OSD, headless boot, audio egress — bit-identical to `propmin -wavwrite`.
-- **Rung 2 (done):** ring buffer + real-time-paced consumer; backpressure self-clocks
-  MAME to 1.0x wall-clock, 0 underruns, still bit-exact through the ring.
-- **Rung 3 (implemented):** `juce::AudioProcessor` (`src/PluginProcessor.cpp`) over
-  the engine; `extern/JUCE` (8.0.14); CMake builds AU/VST3/Standalone.
-  Source-equivalent integration builds have passed `auval -v aumu Pflg Prfl`,
-  including in-host boot, format/render (22k–192k, blocks 64–4096), 1-channel,
-  MIDI, and multi-object/teardown tests.  Final 1.0.0 validator receipts must be
-  regenerated from the exact release tree as required by `release/v1_preflight.json`.
-  A redistributable clean-room CI ROM now provides a bounded packaged-VST3 gate:
-  it boots both host CPUs, uploads programs through the real board ports, requires
-  audio to traverse DSP1 -> DSP2 -> DSP3 -> DAC, checks an LCD sentinel through
-  the public state API, and records per-DSP native-JIT telemetry. See
-  `scripts/CI_ROM_E2E.md`.
-  This does **not** mean two audible instances are supported: v1 permits one active
-  Profligacy instance per host process. A concurrent instance reports unavailable and is kept
-  inert so it cannot control or mirror the active synth. Independent simultaneous
-  instances require the post-v1 out-of-process bridge described below.
-
-  The constraint comes from two ownership layers, not CPU performance: MAME's
-  `mame_machine_manager::s_manager` is process-global, and the Prophecy host ABI
-  currently uses process-global callbacks/rings/stores. Making every instance audible
-  in-process would require de-singletonizing both layers and auditing other MAME/JIT
-  globals. The intended post-v1 route is one service process per plugin instance,
-  which provides crash and state isolation without maintaining a broad MAME-core fork.
-
-### Build & validate the plugin
-
-```bash
-cmake -B build-cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build-cmake -j$(sysctl -n hw.ncpu)     # AU + VST3 + Standalone, installed to ~/Library
-auval -v aumu Pflg Prfl                              # validate the AU
-open "build-cmake/ProphecyPlugin_artefacts/Release/Standalone/Profligacy.app" # hear it
-```
-
-### SysEx editor
-
-The EDIT page combines a clickable signal-flow overview with manifest-driven
-Program, Changes, Arpeggiator, Global, and oscillator-model views. It catalogues
-all 1,425 known SysEx rows and all seven oscillator engine types without making
-unknown/reserved fields writable. Persistent text scaling is available from
-`Aa`. Signal-flow blocks open focused detailed views, while repeated
-parameter-name prefixes become scan-friendly nested headings with concise
-control labels.
-The checked-in catalogue and its provenance are documented in
-`src/editor/DATA_PROVENANCE.md`.
-
-### Next (product work, not de-risking)
-
-Host-automation parameters for the curated controls; decode the remaining unknown
-SysEx fields and packed-byte read-back; add Developer ID signing/notarization; and,
-if multi-instance isolation is ever required, an out-of-process bridge.
-
-## Wheel 2 position
-
-The Prophecy's **Wheel 2** is a free-spinning **friction wheel** — it has no spring
-and no rest detent, so wherever you leave it is where it stays. That means there is
-**no single "correct" position**: the value the synth reads on Wheel 2 depends entirely
-on where the physical wheel happened to be left. Because several factory patches route
-Wheel 2 to level or timbre, its assumed position **materially changes the sound** (a
-different Wheel 2 value has, in the past, looked like a synthesis "defect" when it was
-really just the wheel sitting somewhere else).
-
-The plugin exposes this as a persistent **Wheel 2 position** control (MIDI panel,
-0–255, stored with your session/preset). The default is **128** (mid), which matches
-the emulator's built-in value — leaving it there reproduces the previous behavior
-exactly, byte-for-byte.
-
-To **match a specific hardware unit or capture session**, set the wheel where that
-session had it. Known reference values:
-
-| Session        | Wheel 2 position |
-| -------------- | ---------------- |
-| 07-04          | ≈ mid (128)      |
-| 07-10 / 07-14  | full up (255)    |
-| default        | 128 (mid)        |
-
-You can also drive Wheel 2 live from a MIDI controller: map an incoming CC to **Wheel 2**
-in the same MIDI panel (CC → controller remap). A live CC write and the resting-position
-control both target the same input (ADIN9); the most recent write wins.
+I can test macOS on ARM and Intel processors (currently not building a release for macOS/x64; let me know if you want it). A couple alpha testers have it running on Windows/x64.
 
 ## License
 
-Profligacy's owned source and embedded editor assets are distributed under the
-GNU Affero General Public License, version 3 only. JUCE is used under its AGPLv3
-alternative. Linked MAME components are available under GPL-2.0-or-later or
-their more permissive per-file licenses; GPLv3 and AGPLv3 section 13 permit the
-combined distribution under the AGPL terms. See `THIRD_PARTY_NOTICES.md` and
-the pinned dependency notices for the complete licensing inventory.
-
-Korg firmware ROMs are not distributed. The user supplies their own lawfully
-obtained dump. The built-in LCD character table and its provenance are described
-in `THIRD_PARTY_NOTICES.md` and `src/editor/assets/README.md`.
+Profligacy's own source is distributed under the GNU Affero General Public License, version 3 only. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the full license and dependency notices.
