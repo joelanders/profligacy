@@ -804,13 +804,13 @@ void ProphecyAudioProcessor::setWheel2FromEditor(int value)
 	if (value < 0) value = 0;
 	if (value > 255) value = 255;
 	m_wheel2Pos.store((std::uint8_t)value, std::memory_order_relaxed);
-	m_editorCommandPacer.enqueueAdin(9, value);
+	(void) pushUiAdin(9, value);
 }
 
 void ProphecyAudioProcessor::setAdin(int source, int value)
 {
 	if (source < 0 || source > 15) return;
-	m_editorCommandPacer.enqueueAdin(source, std::clamp(value, 0, 255));
+	(void) pushUiAdin(source, std::clamp(value, 0, 255));
 }
 
 // Translate a mapped control-change to a front-panel ADIN write. Mirrors the editor's own

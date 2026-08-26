@@ -128,7 +128,7 @@ public:
 	// Persisted in the plugin state and applied as an ADIN9 write. Default 0x80 matches the
 	// driver's built-in ADIN9 rest, so an unset/legacy session sounds byte-for-byte identical.
 	void setWheel2(int value);                   // message thread: stores + pushes ADIN9 (0..255)
-	void setWheel2FromEditor(int value);         // editor path: stores + uses the shared pacer
+	void setWheel2FromEditor(int value);         // editor path: stores + pushes physical ADIN directly
 	int  wheel2Pos() const { return m_wheel2Pos.load(std::memory_order_relaxed); } // 0..255
 	std::uint32_t ledSnapshot(std::uint8_t out[12]) const { return m_engine.ledSnapshot(out); }
 	std::uint32_t lcdRawSnapshot(std::uint8_t r1[40], std::uint8_t r2[40], std::uint8_t cg[64]) const
@@ -231,11 +231,12 @@ private:
 	ParamBurst         m_renameBurst { *this };
 	ParamBurst         m_macroBurst  { *this }; // quick-init patch macros (sendMacro)
 
-	// All non-musical editor mutations share one bounded, coalescing path. The
+	// Serialized editor commands share one bounded, coalescing path. The
 	// firmware can wedge its internal H8/V55 link if a patch load overlaps a burst
 	// of independent editor commands even though the host MIDI rings never drop a
-	// byte. Musical note input remains immediate; edit/control work is paced at a
-	// hardware-scale interval and held behind the patch-load barrier.
+	// byte. MIDI edit commands and panel presses are therefore paced and held behind
+	// the patch-load barrier. ADIN writes model physical controls polled by the
+	// firmware, so they bypass this serial-command pacer.
 	class EditorCommandPacer : private juce::Timer
 	{
 	public:
@@ -294,30 +295,6 @@ private:
 			m_queue.push_back(std::move(command));
 			if (!isTimerRunning()) startTimer(1);
 		}
-		void enqueueAdin(int source, int value)
-		{
-			for (auto it = m_queue.rbegin(); it != m_queue.rend(); ++it)
-			{
-				if (it->kind == Command::Kind::Adin && it->key == source)
-				{
-					it->b = value;
-					m_coalesced.fetch_add(1, std::memory_order_relaxed);
-					return;
-				}
-			}
-			if (m_queue.size() >= kCapacity)
-			{
-				m_dropped.fetch_add(1, std::memory_order_relaxed);
-				return;
-			}
-			Command command;
-			command.kind = Command::Kind::Adin;
-			command.key = source;
-			command.a = source;
-			command.b = value;
-			m_queue.push_back(std::move(command));
-			if (!isTimerRunning()) startTimer(1);
-		}
 		bool busy() const
 		{
 			return !m_queue.empty()
@@ -332,7 +309,7 @@ private:
 	private:
 		struct Command
 		{
-			enum class Kind { Midi, Panel, Adin } kind = Kind::Midi;
+			enum class Kind { Midi, Panel } kind = Kind::Midi;
 			int key = -1;
 			int a = 0, b = 0;
 			std::vector<std::uint8_t> bytes;
@@ -359,10 +336,8 @@ private:
 			bool accepted = true;
 			if (command.kind == Command::Kind::Midi)
 				accepted = m_proc.pushImmediateMidi(command.bytes.data(), command.bytes.size());
-			else if (command.kind == Command::Kind::Panel)
-				m_proc.m_engine.pushPanelPulse(command.a, command.b);
 			else
-				accepted = m_proc.pushUiAdin(command.a, command.b);
+				m_proc.m_engine.pushPanelPulse(command.a, command.b);
 			if (accepted)
 			{
 				m_queue.pop_front();
