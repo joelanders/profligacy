@@ -183,6 +183,13 @@ const MOCK = __HARNESS_MOCK__;
          flow.querySelectorAll(".moddestination").length!==6 ||
          flow.querySelectorAll(".modrail").length!==1 || flow.querySelector(".control"))
         issues.push("signal flow is missing the consolidated modulation-bus structure");
+      if(flow?.querySelector(".setupzone,.zonetitle"))
+        issues.push("Common and Global are still wrapped in a Control / Setup group");
+      for(const target of ["eg","lfo","common","global"]){
+        const rect=flow?.querySelector(`[data-target="${target}"]>rect`);
+        if(!rect || +rect.getAttribute("y")!==25 || +rect.getAttribute("height")!==95)
+          issues.push(`${target} is not aligned as a top-level signal-flow peer`);
+      }
       const flowHost=document.getElementById("programflow");
       if(flowHost && flowHost.scrollWidth>flowHost.clientWidth+1)
         issues.push(`signal flow horizontal overflow ${flowHost.scrollWidth}>${flowHost.clientWidth}`);
@@ -196,6 +203,17 @@ const MOCK = __HARNESS_MOCK__;
         issues.push("waveshaper cross-feedback paths are incomplete");
       if(flow?.querySelectorAll(".feedback.return.postamp").length!==1)
         issues.push("mixer feedback return is not explicitly post-amplifier");
+      if(flow?.querySelectorAll('[data-target="mixer"] .mixersource').length!==5 ||
+         flow?.querySelectorAll('[data-target="mixer"] .mixeroutput').length!==2)
+        issues.push("signal-flow mixer does not show five sources and two outputs");
+    }
+    if(auditState==="mixer") {
+      const grid=document.querySelector(".mixersection .mixergrid");
+      const cards=grid ? [...grid.children] : [];
+      const columns=new Set(cards.map(card=>Math.round(card.getBoundingClientRect().left))).size;
+      const rows=new Set(cards.map(card=>Math.round(card.getBoundingClientRect().top))).size;
+      if(!grid || cards.length!==10 || columns!==2 || rows!==5)
+        issues.push(`mixer card grid is not five rows by two columns: ${cards.length} cards, ${rows}x${columns}`);
     }
     if(auditState==="oscillator") {
       const sets=document.querySelectorAll(".oscset");
