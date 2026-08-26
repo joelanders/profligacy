@@ -37,6 +37,16 @@ static int prophecy_setenv(const char *name, const char *value, int overwrite)
 ProphecyAudioProcessor::ProphecyAudioProcessor()
 	: AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
+	// Match the driver's physical ADIN defaults until the host observes a gesture.
+	// Most inputs start at zero; these are the modeled nonzero rests/sensors.
+	for (auto &value : m_controllerDisplayValues)
+		value.store(0x00, std::memory_order_relaxed);
+	m_controllerDisplayValues[0].store(0x01, std::memory_order_relaxed);  // SPEED minimum
+	m_controllerDisplayValues[7].store(0xa6, std::memory_order_relaxed);  // battery sense
+	m_controllerDisplayValues[8].store(0x80, std::memory_order_relaxed);  // Wheel 1
+	m_controllerDisplayValues[9].store(0x80, std::memory_order_relaxed);  // Wheel 2
+	m_controllerDisplayValues[12].store(0x80, std::memory_order_relaxed); // ribbon finger-up
+	m_controllerDisplayValues[13].store(0x74, std::memory_order_relaxed); // Log/Wheel 3 rest
 	// Read diagnostics outside processBlock. Function-local static initialization and
 	// getenv() are both inappropriate on a host's real-time callback.
 	m_skipStateRestore = std::getenv("PROPHECY_EDITOR_SELFTEST") != nullptr;
@@ -215,7 +225,8 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 			}
 		}
 		// CC->ADIN remap: a mapped control-change is translated to a front-panel analog
-		// write (X/Y pad, ribbon Z, wheel1/2) and NOT forwarded raw (double-apply). Every
+		// write (the composite X-Y control, ribbon Z, or wheel 1/2) and NOT forwarded raw
+		// (double-apply). Every
 		// other message — including unmapped CCs — passes through unchanged.
 		if (numBytes == 3 && (data[0] & 0xf0) == 0xb0)
 		{
@@ -226,6 +237,18 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 				handleMappedCc(cc, data[2] & 0x7f, tgt);
 				continue;
 			}
+			// An ordinary MIDI mod-wheel message remains ordinary MIDI. Mirror it onto
+			// the onscreen MOD slider, but do not also write ADIN9 (that would apply it
+			// twice inside the synth). Explicit CC mappings above own their target display.
+			if (cc == 1)
+				publishControllerDisplayValue(9, ((data[2] & 0x7f) * 255 + 63) / 127);
+		}
+		else if (numBytes == 3 && (data[0] & 0xf0) == 0xe0)
+		{
+			// Pitch bend is a 14-bit UART message, not an ADIN8 write. Display the same
+			// normalized position while forwarding the original bytes unchanged below.
+			const int bend = (data[1] & 0x7f) | ((data[2] & 0x7f) << 7);
+			publishControllerDisplayValue(8, (bend * 255 + 8191) / 16383);
 		}
 		const auto offset = (std::uint64_t)std::llround(
 			(double)meta.samplePosition * nativePerHost);
@@ -771,12 +794,22 @@ void ProphecyAudioProcessor::setCcMap(int cc, int target)
 	if (old == CcTarget::PadX && newT != CcTarget::PadX && m_padXHeld.exchange(false))
 	{
 		(void) pushUiAdin(12, 0x80);
-		if (!m_padYHeld) (void) pushUiAdin(14, 0x00);
+		publishControllerDisplayValue(12, 0x80);
+		if (!m_padYHeld)
+		{
+			(void) pushUiAdin(14, 0x00);
+			publishControllerDisplayValue(14, 0x00);
+		}
 	}
 	if (old == CcTarget::PadY && newT != CcTarget::PadY && m_padYHeld.exchange(false))
 	{
 		(void) pushUiAdin(13, 0x74);
-		if (!m_padXHeld) (void) pushUiAdin(14, 0x00);
+		publishControllerDisplayValue(13, 0x74);
+		if (!m_padXHeld)
+		{
+			(void) pushUiAdin(14, 0x00);
+			publishControllerDisplayValue(14, 0x00);
+		}
 	}
 }
 
@@ -796,6 +829,7 @@ void ProphecyAudioProcessor::setWheel2(int value)
 	if (value < 0)   value = 0;
 	if (value > 255) value = 255;
 	m_wheel2Pos.store((std::uint8_t) value, std::memory_order_relaxed);
+	publishControllerDisplayValue(9, value);
 	(void) pushUiAdin(9, value);
 }
 
@@ -804,37 +838,82 @@ void ProphecyAudioProcessor::setWheel2FromEditor(int value)
 	if (value < 0) value = 0;
 	if (value > 255) value = 255;
 	m_wheel2Pos.store((std::uint8_t)value, std::memory_order_relaxed);
+	publishControllerDisplayValue(9, value);
 	(void) pushUiAdin(9, value);
 }
 
 void ProphecyAudioProcessor::setAdin(int source, int value)
 {
 	if (source < 0 || source > 15) return;
-	(void) pushUiAdin(source, std::clamp(value, 0, 255));
+	value = std::clamp(value, 0, 255);
+	publishControllerDisplayValue(source, value);
+	(void) pushUiAdin(source, value);
 }
 
-// Translate a mapped control-change to a front-panel ADIN write. Mirrors the editor's own
-// X-Y handler: pad X = ADIN12 (rest 0x80), pad Y = ADIN13 (rest 0x74), touch gate = ADIN14
-// (0xFF while a pad CC is held, 0x00 once neither axis is held — many patches ignore X/Y
-// without the gate), ribbon Z = ADIN14, wheel1 = ADIN8, wheel2 = ADIN9. CC 0..127 scales to
-// 0..255. Audio-thread only.
+void ProphecyAudioProcessor::publishControllerDisplayValue(int source, int value)
+{
+	if (source < 0 || source >= (int)m_controllerDisplayValues.size()) return;
+	const auto next = (std::uint8_t)std::clamp(value, 0, 255);
+	m_controllerDisplayValues[(std::size_t)source].store(next, std::memory_order_relaxed);
+}
+
+void ProphecyAudioProcessor::controllerDisplaySnapshot(std::uint8_t out[16]) const
+{
+	for (std::size_t i = 0; i < m_controllerDisplayValues.size(); ++i)
+		out[i] = m_controllerDisplayValues[i].load(std::memory_order_relaxed);
+}
+
+// Translate a mapped control-change to a front-panel ADIN write. The editor's software X-Y
+// surface combines physical ribbon X (ADIN12, finger-up 0x80) with the separate sprung
+// Log/Wheel 3 controller (ADIN13, rest 0x74); ADIN14 is the ribbon pressure/touch gate.
+// Ribbon Z = ADIN14, wheel 1 = ADIN8, and wheel 2 = ADIN9. CC 0..127 scales to the physical
+// control direction; ribbon X uses the service-manual range and reversed ADC polarity
+// (left=0x7F, right=0x00). Audio-thread only.
 void ProphecyAudioProcessor::handleMappedCc(int cc, int value, CcTarget target)
 {
 	juce::ignoreUnused(cc);
 	const int s = (value * 255 + 63) / 127; // 0..127 -> 0..255 (rounded), matches editor
+	const auto push = [this](int source, int next)
+	{
+		(void) m_engine.pushAdinFromAudio(source, next);
+		publishControllerDisplayValue(source, next);
+	};
 	switch (target)
 	{
 	case CcTarget::PadX:
-		if (value > 0) { (void) m_engine.pushAdinFromAudio(12, s); m_padXHeld = true; (void) m_engine.pushAdinFromAudio(14, 0xFF); }
-		else           { (void) m_engine.pushAdinFromAudio(12, 0x80); m_padXHeld = false; if (!m_padYHeld) (void) m_engine.pushAdinFromAudio(14, 0x00); }
+		if (value > 0)
+		{
+			// CC zero releases the virtual touch, so map the remaining 1..127
+			// across the ribbon's complete 0x7f..0x00 active range.
+			const int ribbonX = ((127 - value) * 127 + 63) / 126;
+			push(12, ribbonX);
+			m_padXHeld = true;
+			push(14, 0xFF);
+		}
+		else
+		{
+			push(12, 0x80);
+			m_padXHeld = false;
+			if (!m_padYHeld) push(14, 0x00);
+		}
 		break;
 	case CcTarget::PadY:
-		if (value > 0) { (void) m_engine.pushAdinFromAudio(13, s); m_padYHeld = true; (void) m_engine.pushAdinFromAudio(14, 0xFF); }
-		else           { (void) m_engine.pushAdinFromAudio(13, 0x74); m_padYHeld = false; if (!m_padXHeld) (void) m_engine.pushAdinFromAudio(14, 0x00); }
+		if (value > 0)
+		{
+			push(13, s);
+			m_padYHeld = true;
+			push(14, 0xFF);
+		}
+		else
+		{
+			push(13, 0x74);
+			m_padYHeld = false;
+			if (!m_padXHeld) push(14, 0x00);
+		}
 		break;
-	case CcTarget::RibbonZ: (void) m_engine.pushAdinFromAudio(14, s); break; // Z pressure / touch gate directly
-	case CcTarget::Wheel1:  (void) m_engine.pushAdinFromAudio(8,  s); break;
-	case CcTarget::Wheel2:  (void) m_engine.pushAdinFromAudio(9,  s); break;
+	case CcTarget::RibbonZ: push(14, s); break; // Z pressure / touch gate directly
+	case CcTarget::Wheel1:  push(8,  s); break;
+	case CcTarget::Wheel2:  push(9,  s); break;
 	case CcTarget::Off:     break; // unreachable (filtered in processBlock)
 	}
 }
@@ -1203,6 +1282,18 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 					juce::Array<juce::var> arr;
 					for (int i = 0; i < 12; i++) arr.add((int) banks[i]);
 					obj->setProperty("banks", std::move(arr));
+					complete(juce::var(obj));
+				})
+			.withNativeFunction("getControllers",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					juce::ignoreUnused(args);
+					std::uint8_t values[16];
+					m_proc.controllerDisplaySnapshot(values);
+					auto *obj = new juce::DynamicObject();
+					juce::Array<juce::var> arr;
+					for (std::uint8_t value : values) arr.add((int)value);
+					obj->setProperty("values", std::move(arr));
 					complete(juce::var(obj));
 				})
 			.withNativeFunction("sendMidi",

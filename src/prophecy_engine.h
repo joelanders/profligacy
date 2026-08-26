@@ -109,7 +109,7 @@ public:
 	// the host message thread happens to wake.
 	bool pushPanelPulseAtFrame(int row, int bit, int len_ms, std::uint64_t frame);
 
-	// Faceplate analog control (wheels / ribbon X-Y-Z / knobs / sliders): set ADIN source
+	// Faceplate analog control (knobs/sliders, wheels/Log, and ribbon X/Z): set ADIN source
 	// (0..15) to value (0..255). The ordinary method is the message-thread producer;
 	// processBlock uses the separate audio-thread queue. Writes are all-or-nothing and
 	// return false on bounded-queue overflow, with counters available below.

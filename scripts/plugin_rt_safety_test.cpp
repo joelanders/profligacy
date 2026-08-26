@@ -3,6 +3,7 @@
 
 #include <juce_events/juce_events.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -57,6 +58,16 @@ int main()
 	juce::ScopedJuceInitialiser_GUI juceInitialiser;
 	ProphecyAudioProcessor processor;
 	juce::MidiBuffer emptyMidi;
+	std::uint8_t controllerValues[16] = {};
+	processor.controllerDisplaySnapshot(controllerValues);
+	const std::uint8_t expectedControllerDefaults[16] = {
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa6,
+		0x80, 0x80, 0x00, 0x00, 0x80, 0x74, 0x00, 0x00 };
+	if (!std::equal(controllerValues, controllerValues + 16, expectedControllerDefaults))
+	{
+		std::fprintf(stderr, "controller display defaults are wrong\n");
+		return 1;
+	}
 
 	constexpr double rates[] = { 44100.0, 48000.0, 96000.0 };
 	constexpr int legalBlockSizes[] = { 1, 17, 64, 511, 512, 1024, 4096, 16384 };
@@ -75,6 +86,27 @@ int main()
 				return 1;
 			}
 		}
+	}
+
+	// Raw MIDI must remain on the UART path while also driving the corresponding
+	// visual controller. Max bend -> PITCH full right; CC1=32 -> MOD ~= 64.
+	juce::MidiBuffer visualMidi;
+	const std::uint8_t bend[] = { 0xe0, 0x7f, 0x7f };
+	const std::uint8_t mod[] = { 0xb0, 0x01, 0x20 };
+	visualMidi.addEvent(bend, 3, 0);
+	visualMidi.addEvent(mod, 3, 1);
+	juce::AudioBuffer<float> visualAudio(2, 64);
+	if (!processWithoutAllocation(processor, visualAudio, visualMidi))
+	{
+		std::fprintf(stderr, "controller display observation allocated in processBlock\n");
+		return 1;
+	}
+	processor.controllerDisplaySnapshot(controllerValues);
+	if (controllerValues[8] != 0xff || controllerValues[9] != 64)
+	{
+		std::fprintf(stderr, "controller display did not follow bend/CC1: pitch=%u mod=%u\n",
+			(unsigned)controllerValues[8], (unsigned)controllerValues[9]);
+		return 1;
 	}
 
 	// The processor reserves at least 16384 frames in prepareToPlay. A larger surprise
@@ -161,6 +193,16 @@ int main()
 			|| std::chrono::steady_clock::now() - adinStart > std::chrono::milliseconds(250))
 	{
 		std::fprintf(stderr, "audio ADIN bounded-overflow policy failed\n");
+		return 1;
+	}
+	// Display state records the latest host input even though this processor does not own
+	// the deliberately saturated engine above; queue rejection remains visible separately
+	// through droppedAudioAdinEvents(). It is not presented as an engine acknowledgement.
+	processor.controllerDisplaySnapshot(controllerValues);
+	if (controllerValues[8] != 129)
+	{
+		std::fprintf(stderr, "mapped CC did not update its target display: pitch=%u\n",
+			(unsigned)controllerValues[8]);
 		return 1;
 	}
 	queueEngine.stop();

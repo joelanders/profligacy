@@ -117,8 +117,10 @@ public:
 	void panelPulse(int row, int bit);
 	void setAdin(int source, int value);
 	// CC -> analog-controller remap. Host control-change (0xB0) messages whose CC number is
-	// mapped are translated to a front-panel ADIN write (X/Y pad, ribbon Z, wheel1/2) instead
-	// of being forwarded raw. Target enum matches the editor's dropdown order.
+	// mapped are translated to a front-panel ADIN write (the editor's composite X-Y control,
+	// ribbon Z, or wheel 1/2) instead of being forwarded raw. The X-Y control combines the
+	// physical ribbon X input with the separate spring-centered Log/Wheel 3 controller.
+	// Target enum matches the editor's dropdown order.
 	enum class CcTarget : std::uint8_t { Off = 0, PadX, PadY, RibbonZ, Wheel1, Wheel2 };
 	void setCcMap(int cc, int target);           // message thread
 	int  ccMapTarget(int cc) const;              // message thread (UI init / state)
@@ -130,6 +132,11 @@ public:
 	void setWheel2(int value);                   // message thread: stores + pushes ADIN9 (0..255)
 	void setWheel2FromEditor(int value);         // editor path: stores + pushes physical ADIN directly
 	int  wheel2Pos() const { return m_wheel2Pos.load(std::memory_order_relaxed); } // 0..255
+	// Latest host-observed performance-controller input for editor display. This is not an
+	// engine acknowledgement: raw MIDI bend/CC remains on the synth's UART, while mapped CC
+	// and panel gestures request ADIN writes. Atomics keep audio-thread observation lock-free;
+	// each array element is an independent latest-value display sample.
+	void controllerDisplaySnapshot(std::uint8_t out[16]) const;
 	std::uint32_t ledSnapshot(std::uint8_t out[12]) const { return m_engine.ledSnapshot(out); }
 	std::uint32_t lcdRawSnapshot(std::uint8_t r1[40], std::uint8_t r2[40], std::uint8_t cg[64]) const
 	{ return m_engine.lcdRawSnapshot(r1, r2, cg); }
@@ -497,6 +504,8 @@ private:
 	// WHEEL2 (ADIN9) rest position, persisted. 0x80 == the driver's built-in ADIN9 default,
 	// so a fresh session that never touches this is bit-identical to pre-parameter behavior.
 	std::atomic<std::uint8_t> m_wheel2Pos { 0x80 };
+	std::array<std::atomic<std::uint8_t>, 16> m_controllerDisplayValues {};
+	void publishControllerDisplayValue(int source, int value);
 	void handleMappedCc(int cc, int value, CcTarget target); // audio thread
 	// Host state callbacks are not guaranteed to share the JUCE message thread with the
 	// editor. Serialize those non-RT producers with one try only: contention drops the
