@@ -5,17 +5,17 @@ This is a low-level emulation of the hardware in the Korg Prophecy.
 
 You bring your own ROM dumps of the original firmware (2 chips), and this thing runs it.
 
-I spent months probing the NEC V55PI, Hitachi H8/3003, and (3x) TI TMS57002 chips. Got all the inter-chip UART and DSP host interface signals matching in time and content exactly.
+I spent some months probing the NEC V55PI, Hitachi H8/3003, and (3x) TI TMS57002 chips. I got all the inter-chip UART and DSP host interface signals matching in time and content exactly.
 
-The digital audio is a more complicated story because of the free-running oscillators. I had to do things piece by piece: render some long sustaining oscillator waveforms through the emulator and hardware, line them up by a phase offset. They still won't be sample exact, but the hardware-hardware error is consistent with the hardware-emulator error.
+For example, the end-to-end signals are like: MIDI -> UART -> DSP host interface -> digital audio.
 
-DSP2 and DSP3 were easier: I could record the inputs and outputs of the hardware chips (4 channels in and 4 channels out), play back the inputs through my emulated chips, and ensure that the outputs matched. Happily, these can match exactly.
+Demonstrating accuracy of the digital audio is a more complicated story because of the free-running oscillators. I had to do things piece by piece: render some long sustaining oscillator waveforms through the emulator and hardware, line them up by a phase offset. They still won't be sample exact, but the hardware-to-hardware error is consistent with the hardware-to-emulator error.
 
-Later I explain running the original firmware's DSP programs on a standalone DSP board, which also let me control the phase of the oscillators. I don't know if this is an easier to believe claim than the one above. In reality, I was coming at this from a lot of directions.
+DSP2 and DSP3 were easier: I could record the inputs and outputs of the hardware chips (4 channels in and 4 channels out), play back the inputs through my emulated chips, and ensure that the outputs matched.
 
-I also did a bunch of MIDI -> UART -> host interface -> digital audio end-to-end tests to make sure all the intermediate signals matched exactly as well. Practically speaking: the other tests measured steady state equivalence, but I also showed my thing reacts to performance/control changes exactly the same as well.
+Additionally I could run the original firmware's DSP programs on a standalone DSP board, which let me control the phase of the oscillators. I don't know if this is an easier claim to believe than the in situ logic probing. In reality, I was coming at this from a lot of directions, and eventually I fixed all the discrepancies.
 
-I'm not modelling the post-DAC analog parts at all because the service manual says the frequency response is supposed to be flat to within 1 dB across the audible band. (Annoyingly, I found my hardware unit *isn't* flat, so I might have to replace some old capacitors or something. I'll let you know if it turns out to be the magic analog warmth.)
+I'm not modelling the post-DAC analog parts at all because the service manual says the frequency response is supposed to be flat to within 1 dB across the audible band. (Annoyingly, I found my hardware unit *isn't* flat, so I might have to replace some 30-y.o. capacitors or something. I'll let you know if it turns out to be the magic analog warmth.)
 
 
 ## Downloads, Firmware, and Installation
