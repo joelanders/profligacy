@@ -96,9 +96,9 @@ static int activeAudioTest()
 	return 0;
 }
 
-// Native private-fixture regression: initial state on either side of prepare
+// Native private-fixture regression: restoration across host lifecycle orders
 // must be acknowledged and read back before a note at host sample 144 (3ms).
-static int initialStateTest(const char* path, bool beforePrepare)
+static int initialStateTest(const char* path, const std::string& order)
 {
 	juce::ScopedJuceInitialiser_GUI juceInitialiser;
 	juce::MemoryBlock state;
@@ -113,9 +113,20 @@ static int initialStateTest(const char* path, bool beforePrepare)
 	}
 	ProphecyAudioProcessor processor;
 	processor.setNonRealtime(true);
-	if (beforePrepare) processor.setStateInformation(state.getData(), (int) state.getSize());
+	if (order != "before" && order != "after" && order != "zero" && order != "reprepare"
+		&& order != "before-reprepare" && order != "released" && order != "live") return 2;
+	if (order == "before") processor.setStateInformation(state.getData(), (int) state.getSize());
 	processor.prepareToPlay(48000, 128);
-	if (!beforePrepare) processor.setStateInformation(state.getData(), (int) state.getSize());
+	juce::MidiBuffer midi;
+	juce::AudioBuffer<float> audio(2, order == "zero" ? 0 : 128);
+	if (order == "live") midi.addEvent(juce::MidiMessage::noteOn(1, 48, (juce::uint8) 64), 127);
+	if (order != "before" && order != "after") processor.processBlock(audio, midi);
+	midi.clear();
+	if (order == "reprepare" || order == "released")
+		processor.releaseResources();
+	if (order == "reprepare") processor.prepareToPlay(48000, 128);
+	if (order != "before") processor.setStateInformation(state.getData(), (int) state.getSize());
+	if (order == "before-reprepare" || order == "released") processor.prepareToPlay(48000, 128);
 	std::uint8_t actual[1024]{};
 	std::uint32_t version = 0;
 	const auto count = processor.getProgramData(actual, sizeof(actual), &version);
@@ -134,8 +145,7 @@ static int initialStateTest(const char* path, bool beforePrepare)
 		std::fprintf(stderr, "save before the first callback lost the restored program\n");
 		return 1;
 	}
-	juce::MidiBuffer midi;
-	juce::AudioBuffer<float> audio(2, 128);
+	audio.setSize(2, 128);
 	int onset = -1;
 	for (int first = 0; first < 48000; first += 128)
 	{
@@ -157,8 +167,8 @@ static int initialStateTest(const char* path, bool beforePrepare)
 		std::fprintf(stderr, "initial restored note onset invalid: %d\n", onset);
 		return 1;
 	}
-	std::printf("PASS initial state %s prepare: %zu-byte readback, immediate save, first note %.3fms\n",
-		beforePrepare ? "before" : "after", count, (onset - 144) / 48.0);
+	std::printf("PASS state lifecycle %s: %zu-byte readback, immediate save, first note %.3fms\n",
+		order.c_str(), count, (onset - 144) / 48.0);
 	return 0;
 }
 
@@ -178,7 +188,7 @@ int main(int argc, char** argv)
 		return juce::File(argv[2]).replaceWithData(bytes + offset, state.getSize() - offset) ? 0 : 1;
 	}
 	if (argc == 4 && std::string(argv[1]) == "--initial-state")
-		return initialStateTest(argv[2], std::string(argv[3]) == "before");
+		return initialStateTest(argv[2], argv[3]);
 	if (argc == 2 && std::string(argv[1]) == "--active") return activeAudioTest();
 #if defined(_WIN32)
 	_putenv_s("PROPHECY_FORCE_NO_ROM", "1");

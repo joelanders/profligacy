@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "audio_timeline.h"
-#include "pending_program.h"
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -89,34 +88,5 @@ int main()
 	}
 	producer.join();
 
-	// Concurrent state publication must never expose torn bytes or acknowledge
-	// a newer publication merely because an older snapshot was consumed.
-	prophecy::PendingProgram pending;
-	std::atomic<bool> finished{false};
-	std::thread writer([&] {
-		std::array<std::uint8_t, 1024> bytes{};
-		for (int value = 1; value <= 10000; ++value)
-		{
-			bytes.fill((std::uint8_t) value);
-			require(pending.publish(bytes.data(), 535 + value % 489), "state publication rejected");
-		}
-		finished.store(true, std::memory_order_release);
-	});
-	std::uint64_t applied = 0;
-	do
-	{
-		const auto state = pending.read();
-		if (state.coherent && state.size)
-		{
-			require(state.revision >= applied, "state revision went backwards");
-			for (std::size_t i = 0; i < state.size; ++i)
-				require(state.bytes[i] == (std::uint8_t) (state.revision / 2), "torn pending program");
-			applied = state.revision;
-		}
-	} while (!finished.load(std::memory_order_acquire));
-	writer.join();
-	const auto latest = pending.read();
-	require(latest.coherent && latest.revision == 20000, "latest state publication lost");
-	require(pending.publish(nullptr, 0) && pending.read().size == 0, "state clear failed");
 	std::puts("audio timeline: clocks, interpolation, underrun recovery and concurrent PCM transfer passed");
 }

@@ -7,7 +7,6 @@
 #pragma once
 
 #include "audio_timeline.h"
-#include "pending_program.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
@@ -17,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -27,7 +27,7 @@ public:
 	~ProphecyAudioProcessor() override;
 
 	void prepareToPlay(double sampleRate, int samplesPerBlock) override;
-	void releaseResources() override {}
+	void releaseResources() override;
 	bool isBusesLayoutSupported(const BusesLayout &layouts) const override;
 	void processBlock(juce::AudioBuffer<float> &, juce::MidiBuffer &) override;
 
@@ -573,13 +573,16 @@ private:
 	// host!=48k resampling (engine is authoritative at 48 kHz)
 	std::vector<float>         m_rsIn[2];       // absolute native input window, preallocated
 
-	// DAW patch persistence (current-program SysEx dump). setState stashes a dump to inject
-	// before initial playback; later restores are published to processBlock. The standalone
-	// intentionally ignores this dump and boots from explicitly written synth NVRAM instead.
-	prophecy::PendingProgram m_pendingState;
-	std::atomic<std::uint64_t> m_appliedStateRevision{0};
-	std::atomic<unsigned> m_initializations{0};
-	std::atomic<bool> m_startupAccess{false};
+	// Host lifecycle/state operations are serialized off the audio thread.
+	// A retained program becomes confirmed only after firmware readback succeeds.
+	std::mutex m_stateMutex;
+	std::vector<std::uint8_t> m_restoredProgram;
+	bool m_restoredProgramConfirmed = false;
+	bool bootEngine();
+	bool restoreProgram(bool firmwareHandshake = true);
+	std::atomic<bool> m_processingPaused{false};
+	std::atomic<bool> m_callbackAccess{false};
+	std::atomic<bool> m_playbackStarted{false}; // current preparation/restoration epoch
 
 	JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ProphecyAudioProcessor)
 };

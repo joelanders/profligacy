@@ -3,12 +3,31 @@
 // of MAME's executable-oriented OSD implementation.
 
 #include "prophecy_engine.h"
+#include "prophecy_engine_fake.h"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <mutex>
+
+namespace {
+std::mutex initializationMutex;
+std::condition_variable initializationReady;
+bool initializationHeld = false;
+std::atomic<bool> initializationIsWaiting{false};
+}
+
+void prophecy::fake::holdInitialization(bool hold)
+{
+	std::lock_guard lock(initializationMutex);
+	initializationHeld = hold;
+	initializationReady.notify_all();
+}
+
+bool prophecy::fake::initializationWaiting() { return initializationIsWaiting.load(); }
 
 struct ProphecyEngine::Impl
 {
@@ -17,6 +36,23 @@ struct ProphecyEngine::Impl
 	std::atomic<bool> owns{false};
 	std::atomic<std::uint64_t> produced{0};
 	std::atomic<std::uint64_t> requested{0};
+	std::atomic<bool> ready{false};
+	std::atomic<std::uint64_t> origin{0};
+	mutable std::mutex programMutex;
+	std::vector<std::uint8_t> program;
+	std::uint32_t programVersion = 0;
+	void loadProgram(const std::uint8_t* state, std::size_t bytes)
+	{
+		if (bytes < 8 || state[0] != 0xf0 || state[4] != 0x40 || state[bytes - 1] != 0xf7) return;
+		program.clear();
+		for (std::size_t i = 6; i + 1 < bytes; )
+		{
+			const auto high = state[i++];
+			for (int bit = 0; bit < 7 && i + 1 < bytes; ++bit)
+				program.push_back(std::uint8_t(state[i++] | (((high >> bit) & 1) << 7)));
+		}
+		++programVersion;
+	}
 	const bool probe = std::getenv("PROPHECY_FAKE_TIMELINE_PROBE") != nullptr;
 	std::array<std::uint64_t, 128> notes{};
 	std::size_t note_count = 0;
@@ -43,10 +79,38 @@ bool ProphecyEngine::start(const std::vector<std::string> &)
 
 bool ProphecyEngine::enableMidiTxByteCapture(bool) { return !m_impl->started.load(); }
 bool ProphecyEngine::enableHostTimeline() { return !m_impl->started.load(); }
-bool ProphecyEngine::initializePlayback(const std::uint8_t*, std::size_t, bool) { return running(); }
+bool ProphecyEngine::initializePlayback(const std::uint8_t* state, std::size_t bytes, bool)
+{
+	if (!running()) return false;
+	m_impl->ready.store(false);
+	{
+		std::unique_lock lock(initializationMutex);
+		initializationIsWaiting.store(true);
+		initializationReady.wait(lock, [] { return !initializationHeld; });
+		initializationIsWaiting.store(false);
+	}
+	{
+		std::lock_guard lock(m_impl->programMutex);
+		if (state && bytes) m_impl->loadProgram(state, bytes);
+		else if (m_impl->programVersion == 0)
+		{
+			m_impl->program.assign(535, 0);
+			++m_impl->programVersion;
+		}
+	}
+	if (state && bytes)
+	{
+		// Model initialization consuming native time outside the playback epoch.
+		m_impl->requested.fetch_add(256);
+		m_impl->origin.store(m_impl->requested.load());
+		m_impl->note_count = 0;
+	}
+	m_impl->ready.store(true);
+	return true;
+}
 const char* ProphecyEngine::initializationError() const { return ""; }
-bool ProphecyEngine::readyForPlayback() const { return running(); }
-std::uint64_t ProphecyEngine::playbackOrigin() const { return 0; }
+bool ProphecyEngine::readyForPlayback() const { return running() && m_impl->ready.load(); }
+std::uint64_t ProphecyEngine::playbackOrigin() const { return m_impl->origin.load(); }
 bool ProphecyEngine::waitingForOutput() const { return false; }
 bool ProphecyEngine::waitingForInput() const { return false; }
 void ProphecyEngine::setHostBlockFrames(std::uint32_t) {}
@@ -101,7 +165,14 @@ std::size_t ProphecyEngine::pull(float *left, float *right, std::size_t frames)
 	return frames;
 }
 
-bool ProphecyEngine::pushMidi(const std::uint8_t *, std::size_t n) { if (!running()) { m_impl->dropped_immediate.fetch_add(n); return false; } return true; }
+bool ProphecyEngine::pushMidi(const std::uint8_t* bytes, std::size_t n)
+{
+	if (!readyForPlayback()) { m_impl->dropped_immediate.fetch_add(n); return false; }
+	std::lock_guard lock(m_impl->programMutex);
+	m_impl->loadProgram(bytes, n);
+	if (n == 7 && bytes[0] == 0xf0 && bytes[4] == 0x10) ++m_impl->programVersion;
+	return true;
+}
 bool ProphecyEngine::pushMidiAtFrame(const std::uint8_t *bytes, std::size_t n, std::uint64_t frame)
 {
 	if (!running()) { m_impl->dropped_scheduled.fetch_add(n); return false; }
@@ -149,7 +220,14 @@ bool ProphecyEngine::latestLcd(char *line1, char *line2, std::size_t cap) const
 	line1[0] = line2[0] = '\0';
 	return false;
 }
-std::size_t ProphecyEngine::latestProgramData(std::uint8_t *, std::size_t, std::uint32_t *version) const { if (version) *version = 0; return 0; }
+std::size_t ProphecyEngine::latestProgramData(std::uint8_t* out, std::size_t cap, std::uint32_t* version) const
+{
+	std::lock_guard lock(m_impl->programMutex);
+	if (version) *version = m_impl->programVersion;
+	const auto count = std::min(cap, m_impl->program.size());
+	if (out) std::copy_n(m_impl->program.data(), count, out);
+	return count;
+}
 std::size_t ProphecyEngine::latestArpeggioPatternData(std::uint8_t *, std::size_t, std::uint32_t *version, int *pattern) const { if (version) *version = 0; if (pattern) *pattern = -1; return 0; }
 std::size_t ProphecyEngine::available() const { return running() ? ringFrames() : 0; }
 std::size_t ProphecyEngine::ringFrames() const { return 2048; }

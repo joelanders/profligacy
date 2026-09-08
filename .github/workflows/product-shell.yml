@@ -45,10 +45,11 @@ jobs:
           ProphecyPlugin_Standalone
           ProphecyArtifactHost
           ProphecyPluginTimelineTest
+          ProphecyPluginStateTest
           ProphecyAudioTimelineTest
           ProphecyLatencySequenceTest
-      - name: Verify processor sample timeline
-        run: ctest --test-dir build --output-on-failure -R '^(audio_timeline|plugin_timeline|latency_sequence)$'
+      - name: Verify processor timeline and state lifecycle
+        run: ctest --test-dir build --output-on-failure -R '^(audio_timeline|plugin_timeline|plugin_state|latency_sequence)$'
       - name: Verify native arm64 products
         run: |
           for binary in \
@@ -127,10 +128,11 @@ jobs:
           ProphecyPlugin_Standalone
           ProphecyArtifactHost
           ProphecyPluginTimelineTest
+          ProphecyPluginStateTest
           ProphecyAudioTimelineTest
           ProphecyLatencySequenceTest
-      - name: Verify processor sample timeline
-        run: ctest --test-dir build -C Release --output-on-failure -R '^(audio_timeline|plugin_timeline|latency_sequence)$'
+      - name: Verify processor timeline and state lifecycle
+        run: ctest --test-dir build -C Release --output-on-failure -R '^(audio_timeline|plugin_timeline|plugin_state|latency_sequence)$'
       - name: Open the standalone editor through WebView2
         shell: pwsh
         run: |

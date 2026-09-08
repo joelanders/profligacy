@@ -474,18 +474,22 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING AND PROPHECY_USE_FAKE_ENGINE)
-	add_executable(ProphecyPluginTimelineTest scripts/plugin_timeline_test.cpp)
-	target_include_directories(ProphecyPluginTimelineTest PRIVATE
-		${CMAKE_CURRENT_SOURCE_DIR}/src ${JUCE_DIR}/modules)
-	target_compile_definitions(ProphecyPluginTimelineTest PRIVATE
-		JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
-	target_link_libraries(ProphecyPluginTimelineTest PRIVATE ProphecyPlugin)
-	if(WIN32)
-		target_compile_definitions(ProphecyPluginTimelineTest PRIVATE JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
-		target_link_libraries(ProphecyPluginTimelineTest PRIVATE juce::juce_webview2)
-	endif()
-	add_test(NAME plugin_timeline COMMAND $<TARGET_FILE:ProphecyPluginTimelineTest>)
-	set_tests_properties(plugin_timeline PROPERTIES TIMEOUT 30)
+	foreach(_test IN ITEMS Timeline State)
+		string(TOLOWER "${_test}" _test_name)
+		set(_test_target ProphecyPlugin${_test}Test)
+		add_executable(${_test_target} scripts/plugin_${_test_name}_test.cpp)
+		target_include_directories(${_test_target} PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR}/src ${JUCE_DIR}/modules)
+		target_compile_definitions(${_test_target} PRIVATE
+			JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
+		target_link_libraries(${_test_target} PRIVATE ProphecyPlugin)
+		if(WIN32)
+			target_compile_definitions(${_test_target} PRIVATE JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
+			target_link_libraries(${_test_target} PRIVATE juce::juce_webview2)
+		endif()
+		add_test(NAME plugin_${_test_name} COMMAND $<TARGET_FILE:${_test_target}>)
+		set_tests_properties(plugin_${_test_name} PROPERTIES TIMEOUT 30)
+	endforeach()
 endif()
 
 # Artifact-level VST3 smoke host. Unlike the timing and RT harnesses above, this

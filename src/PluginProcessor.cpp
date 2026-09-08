@@ -35,25 +35,40 @@ static int prophecy_setenv(const char *name, const char *value, int overwrite)
 #include "rom_locator.h"
 
 namespace {
-// A host may race its first callback with state restoration. Only the
-// initialization side may wait; the audio callback takes one bounded attempt.
-struct StartupAccess
+// Control-thread operations first prevent new callbacks from entering, then
+// wait for an existing callback to finish. The audio thread only tries once.
+struct CallbackAccess
 {
-	explicit StartupAccess(std::atomic<bool>& flagIn) : flag(flagIn)
+	explicit CallbackAccess(std::atomic<bool>& access) : flag(access)
 	{
 		bool expected = false;
 		acquired = flag.compare_exchange_strong(expected, true, std::memory_order_acquire);
 	}
-	~StartupAccess() { if (acquired) flag.store(false, std::memory_order_release); }
+	~CallbackAccess() { if (acquired) flag.store(false, std::memory_order_release); }
 	std::atomic<bool>& flag;
 	bool acquired = false;
 };
 
-struct InitializationScope
+struct ProcessingPause
 {
-	explicit InitializationScope(std::atomic<unsigned>& countIn) : count(countIn) { count.fetch_add(1); }
-	~InitializationScope() { count.fetch_sub(1, std::memory_order_release); }
-	std::atomic<unsigned>& count;
+	ProcessingPause(std::atomic<bool>& pausedIn, std::atomic<bool>& accessIn)
+		: paused(pausedIn), access(accessIn)
+	{
+		paused.store(true, std::memory_order_release);
+		bool expected = false;
+		while (!access.compare_exchange_weak(expected, true, std::memory_order_acquire))
+		{
+			expected = false;
+			juce::Thread::yield();
+		}
+	}
+	~ProcessingPause()
+	{
+		access.store(false, std::memory_order_release);
+		paused.store(false, std::memory_order_release);
+	}
+	std::atomic<bool>& paused;
+	std::atomic<bool>& access;
 };
 }
 
@@ -89,58 +104,79 @@ bool ProphecyAudioProcessor::isBusesLayoutSupported(const BusesLayout &layouts) 
 
 void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-	m_hostSampleRate = std::isfinite(sampleRate) && sampleRate > 0.0
-		? sampleRate : (double) ProphecyEngine::kSampleRate;
-	const auto quantum = ProphecyEngine::kAudioQuantum;
-	m_timelineHostFrame = 0;
-	m_oversizedAudioBlocks.store(0, std::memory_order_relaxed);
-	m_editorPatchIntents.store(0, std::memory_order_relaxed);
-	m_editorPatchSends.store(0, std::memory_order_relaxed);
-	m_editorDumpRequests.store(0, std::memory_order_relaxed);
-	m_editorDumpSends.store(0, std::memory_order_relaxed);
-	m_hostMidiEventsForwarded.store(0, std::memory_order_relaxed);
-	m_patchLoadBarrierUntilFrame.store(0, std::memory_order_relaxed);
-	// samplesPerBlock is only a host hint in JUCE. Reserve a generous fixed floor so
-	// ordinary offline/host block-size changes stay allocation-free; a still-larger block
-	// is explicitly silenced and counted in processBlock rather than resizing there.
-	m_preparedMaxBlock = std::max(samplesPerBlock, 16384);
+	int latency = 0;
+	{
+		std::lock_guard stateLock(m_stateMutex);
+		ProcessingPause pause(m_processingPaused, m_callbackAccess);
+		m_playbackStarted.store(false, std::memory_order_release);
+		m_hostSampleRate = std::isfinite(sampleRate) && sampleRate > 0.0
+			? sampleRate : (double) ProphecyEngine::kSampleRate;
+		const auto quantum = ProphecyEngine::kAudioQuantum;
+		m_timelineHostFrame = 0;
+		m_oversizedAudioBlocks.store(0, std::memory_order_relaxed);
+		m_editorPatchIntents.store(0, std::memory_order_relaxed);
+		m_editorPatchSends.store(0, std::memory_order_relaxed);
+		m_editorDumpRequests.store(0, std::memory_order_relaxed);
+		m_editorDumpSends.store(0, std::memory_order_relaxed);
+		m_hostMidiEventsForwarded.store(0, std::memory_order_relaxed);
+		m_patchLoadBarrierUntilFrame.store(0, std::memory_order_relaxed);
+		// samplesPerBlock is only a host hint in JUCE. Reserve a generous fixed floor so
+		// ordinary offline/host block-size changes stay allocation-free; a still-larger block
+		// is explicitly silenced and counted in processBlock rather than resizing there.
+		m_preparedMaxBlock = std::max(samplesPerBlock, 16384);
 
-	// Prepare the 48 kHz -> host-rate resampler (bypassed when the host runs at 48 kHz).
-	const double ratio = (double) ProphecyEngine::kSampleRate / m_hostSampleRate;
-	const int    cap   = (int) std::ceil(m_preparedMaxBlock * ratio) + 64;
-	m_rsIn[0].assign((size_t) cap, 0.0f);
-	m_rsIn[1].assign((size_t) cap, 0.0f);
+		// Prepare the 48 kHz -> host-rate resampler (bypassed when the host runs at 48 kHz).
+		const double ratio = (double) ProphecyEngine::kSampleRate / m_hostSampleRate;
+		const int    cap   = (int) std::ceil(m_preparedMaxBlock * ratio) + 64;
+		m_rsIn[0].assign((size_t) cap, 0.0f);
+		m_rsIn[1].assign((size_t) cap, 0.0f);
 
-	// Reserve the requested output block, one quantum for grant alignment,
-	// one quantum for worker execution, and interpolation lookahead. A short
-	// preceding callback must not remove the worker execution allowance. Output is explicitly delayed by this
-	// exact integer number of host samples; storage capacity is unrelated.
-	const auto nativeLead = std::max(std::ceil(std::max(samplesPerBlock, 1) * ratio),
-		(double) quantum) + 2 * quantum + 2;
-	setLatencySamples((int) std::ceil(nativeLead / ratio));
-	m_engine.setHostBlockFrames((std::uint32_t) std::ceil(std::max(samplesPerBlock, 1) * ratio));
+		// Reserve the requested output block, one quantum for grant alignment,
+		// one quantum for worker execution, and interpolation lookahead. A short
+		// preceding callback must not remove the worker execution allowance. Output
+		// is delayed by this exact integer number of host samples; storage capacity
+		// is unrelated.
+		const auto nativeLead = std::max(std::ceil(std::max(samplesPerBlock, 1) * ratio),
+			(double) quantum) + 2 * quantum + 2;
+		latency = (int) std::ceil(nativeLead / ratio);
+		m_engine.setHostBlockFrames((std::uint32_t) std::ceil(std::max(samplesPerBlock, 1) * ratio));
 
-	maybeBootEngine();
-	// Initialization and any initial patch load finish before the host epoch.
-	// Reprepare starts beyond the previous input grant, independent of worker speed.
-	const auto origin = ((m_engine.requestedFrames() + quantum - 1) / quantum) * quantum;
-	m_timeline.reset(m_hostSampleRate, origin);
-	m_timelineAttached = m_engine.readyForPlayback();
+		bootEngine();
+		// Initialization and any initial patch load finish before the host epoch.
+		// Reprepare starts beyond the previous input grant, independent of worker speed.
+		const auto origin = ((m_engine.requestedFrames() + quantum - 1) / quantum) * quantum;
+		m_timeline.reset(m_hostSampleRate, origin);
+		m_timelineAttached = m_engine.readyForPlayback();
+	}
+	// Host listeners may query state synchronously when latency changes.
+	setLatencySamples(latency);
+}
+
+void ProphecyAudioProcessor::releaseResources()
+{
+	std::lock_guard stateLock(m_stateMutex);
+	ProcessingPause pause(m_processingPaused, m_callbackAccess);
+	m_playbackStarted.store(false, std::memory_order_release);
+}
+
+bool ProphecyAudioProcessor::maybeBootEngine()
+{
+	std::lock_guard stateLock(m_stateMutex);
+	ProcessingPause pause(m_processingPaused, m_callbackAccess);
+	return bootEngine();
 }
 
 // Boot the engine once, iff a valid ROM set can be located (env / persisted picker
 // choice / drop dir — see rom_locator.h). Without one the plugin stays silent and the
 // editor shows the first-run ROM picker; the pick then boots via setRomDirFromUser().
-bool ProphecyAudioProcessor::maybeBootEngine()
+bool ProphecyAudioProcessor::bootEngine()
 {
 	if (m_started.load())
-		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active;
+		return m_engine.readyForPlayback();
 	const juce::File romDir = romloc::locateRomDir();
 	if (romDir == juce::File())
 		return false;
-	if (m_started.exchange(true))
-		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active;
-	InitializationScope initializing(m_initializations);
+	m_started.store(true);
 	m_romPath   = romDir.getFullPathName();
 	m_nvramPath = romloc::nvramDirFor(romDir).getFullPathName();
 
@@ -172,30 +208,31 @@ bool ProphecyAudioProcessor::maybeBootEngine()
 	const bool started = m_engine.start(args);
 	if (started)
 	{
-		auto pending = m_pendingState.read();
-		const bool restore = !m_skipStateRestore && pending.coherent && pending.size != 0;
 		// Clean-room CI firmware has its own sentinel protocol, not Korg's boot
 		// screen or SysEx parser. Ordinary firmware must complete the handshake.
 		const bool firmware = std::getenv("PROFLIGACY_CI_EXPOSE_LCD_STATE") == nullptr;
-		if (!m_engine.initializePlayback(restore ? pending.bytes.data() : nullptr,
-			restore ? pending.size : 0, firmware)) return false;
-		if (restore) m_appliedStateRevision.store(pending.revision);
-		// A host may publish its initial state while the machine is booting.
-		// Coalesce and finish those loads before exposing a playable epoch.
-		while (!m_skipStateRestore)
-		{
-			pending = m_pendingState.read();
-			if (!pending.coherent) { juce::Thread::yield(); continue; }
-			if (pending.revision == m_appliedStateRevision.load()) break;
-			if (pending.size && !m_engine.initializePlayback(pending.bytes.data(), pending.size)) return false;
-			m_appliedStateRevision.store(pending.revision);
-		}
+		if (!restoreProgram(firmware)) return false;
 		// Host state can restore Wheel 2 before prepareToPlay. Pre-start engine writes are
 		// intentionally rejected so an unclaimed/second processor cannot touch another
 		// instance's global queue; publish the retained value once this engine owns it.
 		(void) m_engine.pushAdin(9, m_wheel2Pos.load(std::memory_order_relaxed));
 	}
 	return started;
+}
+
+// Called only with m_stateMutex and ProcessingPause held. A host restore is
+// complete when firmware has acknowledged and read back the program, never when
+// its SysEx has merely been queued. Initial and subsequent loads share this path.
+bool ProphecyAudioProcessor::restoreProgram(bool firmwareHandshake)
+{
+	const bool restore = !m_skipStateRestore && !m_restoredProgram.empty()
+		&& !m_restoredProgramConfirmed;
+	if (!m_engine.initializePlayback(restore ? m_restoredProgram.data() : nullptr,
+		restore ? m_restoredProgram.size() : 0, firmwareHandshake)) return false;
+	if (restore) m_restoredProgramConfirmed = true;
+	m_playbackStarted.store(false, std::memory_order_release);
+	m_timelineAttached = false;
+	return true;
 }
 
 bool ProphecyAudioProcessor::setRomDirFromUser(const juce::File &dir)
@@ -211,10 +248,22 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 	juce::ScopedNoDenormals noDenormals;
 	const int numSamples  = buffer.getNumSamples();
 	const int numChannels = buffer.getNumChannels();
-	StartupAccess startupAccess(m_startupAccess);
-	const bool initializing = !startupAccess.acquired
-		|| m_initializations.load(std::memory_order_acquire) != 0;
-	const bool engineActive = !initializing && m_engine.readyForPlayback();
+	m_audioCallbacks.fetch_add(1, std::memory_order_relaxed);
+	m_audioHostFrames.fetch_add((std::uint64_t) std::max(numSamples, 0), std::memory_order_relaxed);
+	if (m_processingPaused.load(std::memory_order_acquire))
+	{
+		buffer.clear();
+		return;
+	}
+	CallbackAccess callbackAccess(m_callbackAccess);
+	if (!callbackAccess.acquired)
+	{
+		buffer.clear();
+		return;
+	}
+	const bool engineActive = m_engine.readyForPlayback();
+	if (engineActive && numSamples > 0)
+		m_playbackStarted.store(true, std::memory_order_release);
 	if (engineActive && (!m_timelineAttached || m_timeline.origin() < m_engine.playbackOrigin()))
 	{
 		// A ROM may be selected long after the DAW started calling processBlock.
@@ -223,8 +272,6 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 		m_timelineHostFrame = 0;
 		m_timelineAttached = true;
 	}
-	m_audioCallbacks.fetch_add(1, std::memory_order_relaxed);
-	m_audioHostFrames.fetch_add((std::uint64_t) std::max(numSamples, 0), std::memory_order_relaxed);
 	if (numSamples > m_preparedMaxBlock)
 	{
 		// A host exceeded even our generous prepare-time reserve. Do bounded work only:
@@ -242,21 +289,10 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 	// UART at its absolute sample position, before granting this input range to
 	// the worker. Hardware serial and scan/voice-allocation latency stays intact.
 	const auto timelineBlockStart = m_timelineHostFrame;
-	const auto midiFrameBase = m_timeline.event(timelineBlockStart);
 	const std::uint64_t hostBlockEnd = m_audioHostFrames.load(std::memory_order_relaxed);
 	const std::uint64_t hostBlockStart = hostBlockEnd - (std::uint64_t)numSamples;
-	// This queue is ordered. A restored patch belongs before this block's notes.
-	if (!m_skipStateRestore && engineActive
-		&& m_pendingState.revision() != m_appliedStateRevision.load(std::memory_order_relaxed))
-	{
-		const auto pending = m_pendingState.read();
-		if (pending.coherent && (pending.size == 0
-			|| m_engine.pushMidiAtFrame(pending.bytes.data(), pending.size, midiFrameBase)))
-			m_appliedStateRevision.store(pending.revision, std::memory_order_release);
-	}
 	for (const auto meta : midi)
 	{
-		if (initializing) continue;
 		const auto eventFrame = m_timeline.event(timelineBlockStart
 			+ (std::uint64_t) std::clamp(meta.samplePosition, 0, std::max(numSamples - 1, 0)));
 		// Work from MidiBuffer's borrowed metadata bytes. Constructing a MidiMessage here
@@ -428,45 +464,40 @@ ProphecyAudioProcessor::DiagnosticSnapshot ProphecyAudioProcessor::diagnosticSna
 // engine has booted (no dump yet). Layout: "PRP1" | u8 N | N*(u8 cc, u8 target) | dump...
 void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	dest.reset();
 
 	// Exact edit-buffer recall is part of a DAW project save. The standalone has the
 	// hardware-like policy instead: only an explicit front-panel WRITE persists a patch.
 	std::vector<std::uint8_t> dump;
-	if (wrapperType != juce::AudioProcessor::wrapperType_Standalone
-			&& m_engine.readyForPlayback())
+	if (wrapperType != juce::AudioProcessor::wrapperType_Standalone)
 	{
-		// Before the first callback, initialization already supplied a confirmed
-		// snapshot. A new UART request would remain queued until the first note.
-		if (m_audioCallbacks.load(std::memory_order_acquire) != 0)
+		// A restore retained before ROM selection (or after an initialization
+		// failure) is newer than any firmware cache. Saving must preserve it.
+		if (!m_restoredProgramConfirmed && !m_restoredProgram.empty())
+			dump = m_restoredProgram;
+		else if (m_engine.readyForPlayback())
 		{
-			std::uint8_t tmp[512];
-			while (m_engine.popMidiTx(tmp, sizeof(tmp)) > 0) {}                    // drop stale TX
-			const std::uint8_t req[7] = {0xF0, 0x42, 0x30, 0x41, 0x10, 0x00, 0xF7}; // current-program dump request
-			(void) pushImmediateMidi(req, sizeof(req));
-
-			std::vector<std::uint8_t> tx;
-			const double deadline = juce::Time::getMillisecondCounterHiRes() + 400.0;
-			bool got = false;
-			while (!got && juce::Time::getMillisecondCounterHiRes() < deadline)
+			// Initialization supplied a confirmed snapshot. A new request before
+			// this epoch's first nonempty callback would queue behind startup.
+			std::uint32_t before = 0;
+			m_engine.latestProgramData(nullptr, 0, &before);
+			if (m_playbackStarted.load(std::memory_order_acquire))
 			{
-				std::size_t g;
-				while ((g = m_engine.popMidiTx(tmp, sizeof(tmp))) > 0) tx.insert(tx.end(), tmp, tmp + g);
-				for (std::size_t i = 0; i + 4 < tx.size(); ++i)
+				const std::uint8_t request[] = {0xf0, 0x42, 0x30, 0x41, 0x10, 0, 0xf7};
+				if (pushImmediateMidi(request, sizeof(request)))
 				{
-					if (tx[i] != 0xF0 || tx[i + 4] != 0x40) continue;             // CURRENT_PROGRAM_DATA_DUMP
-					std::size_t j = i + 1;
-					while (j < tx.size() && tx[j] != 0xF7) ++j;
-					if (j < tx.size()) { dump.assign(tx.data() + i, tx.data() + j + 1); got = true; break; }
+					const auto deadline = juce::Time::getMillisecondCounterHiRes() + 400.0;
+					std::uint32_t version = before;
+					while (version == before && juce::Time::getMillisecondCounterHiRes() < deadline)
+					{
+						juce::Thread::sleep(5);
+						m_engine.latestProgramData(nullptr, 0, &version);
+					}
 				}
-				if (!got) juce::Thread::sleep(5);
 			}
-		}
-		if (dump.empty())
-		{
-			// The host may have suspended callbacks while saving. Preserve the
-			// last confirmed firmware buffer, including a just-restored startup
-			// state, if its new serial request cannot advance in that interval.
+			// Read the shared snapshot, without competing with the editor for TX
+			// bytes. If callbacks stopped, this remains the last confirmed buffer.
 			std::uint8_t raw[1024]{};
 			const auto size = m_engine.latestProgramData(raw, sizeof(raw), nullptr);
 			if (size)
@@ -483,13 +514,7 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 				dump.push_back(0xf7);
 			}
 		}
-	}
-
-	if (dump.empty() && wrapperType != juce::AudioProcessor::wrapperType_Standalone)
-	{
-		const auto pending = m_pendingState.read();
-		if (pending.coherent && pending.size)
-			dump.assign(pending.bytes.data(), pending.bytes.data() + pending.size);
+		if (dump.empty()) dump = m_restoredProgram;
 	}
 
 	// Header + mapping (non-Off CC entries). PRP2 adds a WHEEL2 (ADIN9) rest byte after the
@@ -529,6 +554,7 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 
 void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	if (data == nullptr || size <= 0) return;
 	const auto *p = static_cast<const std::uint8_t *>(data);
 
@@ -558,30 +584,21 @@ void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 	// their trailing program dump is ignored on the first launch after this policy change.
 	if (wrapperType == juce::AudioProcessor::wrapperType_Standalone)
 	{
-		(void) m_pendingState.publish(nullptr, 0);
+		m_restoredProgram.clear();
+		m_restoredProgramConfirmed = false;
 		return;
 	}
 
-	if (dumpLen > 0)
+	if (dumpLen > 0 && dumpLen <= 1024)
 	{
-		if (!m_pendingState.publish(dump, (std::size_t) dumpLen)) return;
-		// Some hosts restore state after prepare but before their first callback.
-		// Finish that initial load off the audio thread too; its UART transfer and
-		// firmware acknowledgement must precede the first scheduled note.
-		if (!m_skipStateRestore && m_engine.readyForPlayback()
-			&& m_audioCallbacks.load(std::memory_order_acquire) == 0)
+		m_restoredProgram.assign(dump, dump + dumpLen);
+		m_restoredProgramConfirmed = false;
+		if (!m_skipStateRestore && m_engine.readyForPlayback())
 		{
-			StartupAccess startupAccess(m_startupAccess);
-			if (!startupAccess.acquired || m_audioCallbacks.load(std::memory_order_acquire) != 0) return;
-			InitializationScope initializing(m_initializations);
-			for (;;)
-			{
-				const auto pending = m_pendingState.read();
-				if (!pending.coherent) { juce::Thread::yield(); continue; }
-				if (pending.revision == m_appliedStateRevision.load()) break;
-				if (pending.size && !m_engine.initializePlayback(pending.bytes.data(), pending.size)) break;
-				m_appliedStateRevision.store(pending.revision, std::memory_order_release);
-			}
+			// Firmware loading is slow control-thread work. Concurrent callbacks
+			// emit silence without waiting; the next note starts a confirmed epoch.
+			ProcessingPause pause(m_processingPaused, m_callbackAccess);
+			(void) restoreProgram();
 		}
 	}
 }

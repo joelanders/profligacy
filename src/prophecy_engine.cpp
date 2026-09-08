@@ -206,6 +206,8 @@ public:
 		return false;
 	}
 	std::uint64_t dropped() const { return m_dropped.load(std::memory_order_acquire); }
+	// Initialization only, after the consumer has observed playback input disabled.
+	void discard() { m_head.store(m_tail.load(std::memory_order_acquire), std::memory_order_release); }
 	void reset()
 	{
 		m_head.store(0, std::memory_order_relaxed);
@@ -264,6 +266,8 @@ public:
 		return n;
 	}
 	std::uint64_t dropped() const { return m_dropped.load(std::memory_order_acquire); }
+	// Initialization only, after the consumer has observed playback input disabled.
+	void discard() { m_head.store(m_tail.load(std::memory_order_acquire), std::memory_order_release); }
 	void reset()
 	{
 		m_head.store(0, std::memory_order_relaxed);
@@ -1112,6 +1116,15 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 		stop();
 		return false;
 	};
+	if (wasReady && state && bytes)
+	{
+		// The processor has paused its callback before a subsequent restore.
+		// Let the worker observe disabled playback input before discarding queued
+		// events from the old epoch; they must not play after the new program loads.
+		if (!advance()) return fail();
+		g_host_midi_ring.discard();
+		g_host_timed_midi_ring.discard();
+	}
 	if (firmwareHandshake && !wasReady)
 	{
 		// The program page is firmware evidence that startup has reached the
