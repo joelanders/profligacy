@@ -3755,6 +3755,10 @@
     nativeAsync("getRomStatus").then(r => {
       if (r && r.ok) romgate.classList.remove('show');
       else           romgate.classList.add('show');
+      if (r && r.error) {
+        romerr.textContent = r.error;
+        romgate.querySelector('h2').textContent = 'Unable to start Profligacy';
+      }
       if (r && r.selftest && !selfTestStarted){
         selfTestStarted = true;
         // No-ROM mode boots no engine, so run the first-run-overlay checks instead of the

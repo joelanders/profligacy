@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
+#include <cstdlib>
 #include <cstring>
 
 struct ProphecyEngine::Impl
@@ -14,6 +16,10 @@ struct ProphecyEngine::Impl
 	std::atomic<bool> finished{false};
 	std::atomic<bool> owns{false};
 	std::atomic<std::uint64_t> produced{0};
+	std::atomic<std::uint64_t> requested{0};
+	const bool probe = std::getenv("PROPHECY_FAKE_TIMELINE_PROBE") != nullptr;
+	std::array<std::uint64_t, 128> notes{};
+	std::size_t note_count = 0;
 	std::atomic<std::uint64_t> dropped_immediate{0};
 	std::atomic<std::uint64_t> dropped_scheduled{0};
 	std::atomic<std::uint64_t> dropped_ui_adin{0};
@@ -36,6 +42,36 @@ bool ProphecyEngine::start(const std::vector<std::string> &)
 }
 
 bool ProphecyEngine::enableMidiTxByteCapture(bool) { return !m_impl->started.load(); }
+bool ProphecyEngine::enableHostTimeline() { return !m_impl->started.load(); }
+bool ProphecyEngine::initializePlayback(const std::uint8_t*, std::size_t, bool) { return running(); }
+const char* ProphecyEngine::initializationError() const { return ""; }
+bool ProphecyEngine::readyForPlayback() const { return running(); }
+std::uint64_t ProphecyEngine::playbackOrigin() const { return 0; }
+bool ProphecyEngine::waitingForOutput() const { return false; }
+bool ProphecyEngine::waitingForInput() const { return false; }
+void ProphecyEngine::setHostBlockFrames(std::uint32_t) {}
+void ProphecyEngine::requestThroughFrame(std::uint64_t frame) { m_impl->requested.store(frame); }
+std::uint64_t ProphecyEngine::requestedFrames() const { return m_impl->requested.load(); }
+std::size_t ProphecyEngine::readAtFrame(std::uint64_t first, float* left, float* right,
+	std::size_t frames, bool)
+{
+	std::fill(left, left + frames, 0.0f);
+	std::fill(right, right + frames, 0.0f);
+	if (!running()) return 0;
+	const auto horizon = requestedFrames() / kAudioQuantum * kAudioQuantum;
+	const auto count = horizon > first
+		? (std::size_t) std::min<std::uint64_t>(horizon - first, frames) : 0;
+	if (m_impl->probe)
+		for (std::size_t i = 0; i < count; ++i)
+			for (std::size_t note = 0; note < m_impl->note_count; ++note)
+				if (first + i >= m_impl->notes[note] && first + i < m_impl->notes[note] + 32)
+				{
+					left[i] = 0.5f;
+					right[i] = -0.25f;
+				}
+	m_impl->produced.store(horizon);
+	return count;
+}
 
 void ProphecyEngine::stop()
 {
@@ -66,7 +102,14 @@ std::size_t ProphecyEngine::pull(float *left, float *right, std::size_t frames)
 }
 
 bool ProphecyEngine::pushMidi(const std::uint8_t *, std::size_t n) { if (!running()) { m_impl->dropped_immediate.fetch_add(n); return false; } return true; }
-bool ProphecyEngine::pushMidiAtFrame(const std::uint8_t *, std::size_t n, std::uint64_t) { if (!running()) { m_impl->dropped_scheduled.fetch_add(n); return false; } return true; }
+bool ProphecyEngine::pushMidiAtFrame(const std::uint8_t *bytes, std::size_t n, std::uint64_t frame)
+{
+	if (!running()) { m_impl->dropped_scheduled.fetch_add(n); return false; }
+	if (m_impl->probe && n == 3 && (bytes[0] & 0xf0) == 0x90 && bytes[2] > 0
+			&& m_impl->note_count < m_impl->notes.size())
+		m_impl->notes[m_impl->note_count++] = frame;
+	return true;
+}
 std::uint64_t ProphecyEngine::droppedImmediateMidiBytes() const { return m_impl->dropped_immediate.load(); }
 std::uint64_t ProphecyEngine::droppedScheduledMidiBytes() const { return m_impl->dropped_scheduled.load(); }
 std::size_t ProphecyEngine::popMidiTx(std::uint8_t *, std::size_t) { return 0; }

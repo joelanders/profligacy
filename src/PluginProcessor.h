@@ -6,6 +6,9 @@
 //
 #pragma once
 
+#include "audio_timeline.h"
+#include "pending_program.h"
+
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "prophecy_engine.h"
@@ -45,7 +48,7 @@ public:
 	{ return m_engine.droppedUiAdinEvents()
 		+ m_contendedUiAdinEvents.load(std::memory_order_relaxed); }
 	std::uint64_t droppedAudioAdinEvents() const
-	{ return m_engine.droppedAudioAdinEvents(); }
+	{ return m_engine.droppedAudioAdinEvents() + m_engine.droppedScheduledAdinEvents(); }
 	std::uint64_t oversizedAudioBlocks() const
 	{ return m_oversizedAudioBlocks.load(std::memory_order_relaxed); }
 	struct DiagnosticSnapshot
@@ -101,7 +104,8 @@ public:
 	double hostSampleRate() const { return m_hostSampleRate; }
 	// ROM picker: where the engine's firmware comes from. If no valid ROM set is found
 	// the engine stays unbooted and the editor shows the first-run picker.
-	bool romOk() const { return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active; }
+	bool romOk() const { return m_engine.readyForPlayback(); }
+	const char* initializationError() const { return m_engine.initializationError(); }
 	bool instanceUnavailable() const
 	{
 		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Unavailable;
@@ -507,7 +511,7 @@ private:
 	std::atomic<std::uint8_t> m_wheel2Pos { 0x80 };
 	std::array<std::atomic<std::uint8_t>, 16> m_controllerDisplayValues {};
 	void publishControllerDisplayValue(int source, int value);
-	void handleMappedCc(int cc, int value, CcTarget target); // audio thread
+	void handleMappedCc(int cc, int value, CcTarget target, std::uint64_t frame); // audio thread
 	// Host state callbacks are not guaranteed to share the JUCE message thread with the
 	// editor. Serialize those non-RT producers with one try only: contention drops the
 	// complete message/event and increments a metric. processBlock uses separate rings and
@@ -544,9 +548,10 @@ private:
 	juce::String       m_romPath;             // resolved ROM dir once booted
 	juce::String       m_nvramPath;           // resolved NVRAM dir once booted
 	double             m_hostSampleRate = 48000.0;
-	std::uint64_t      m_hostMidiFrameCursor = 0;
+	prophecy::SampleTimeline m_timeline;
+	std::uint64_t      m_timelineHostFrame = 0;
+	bool               m_timelineAttached = false;
 	int                m_preparedMaxBlock = 0;
-	std::vector<float> m_scratchL, m_scratchR; // mono/resampler output; allocated in prepare
 	std::atomic<std::uint64_t> m_oversizedAudioBlocks { 0 };
 	// Lock-free counters sampled by the optional GUI diagnostic logger. The audio callback
 	// only updates atomics; all formatting and file I/O stays on the message thread.
@@ -566,16 +571,15 @@ private:
 	bool               m_skipStateRestore = false;
 
 	// host!=48k resampling (engine is authoritative at 48 kHz)
-	juce::LagrangeInterpolator m_resampler[2];
-	std::vector<float>         m_rsIn[2];       // leftover 48k input, preallocated
-	int                        m_rsInCount = 0;
+	std::vector<float>         m_rsIn[2];       // absolute native input window, preallocated
 
 	// DAW patch persistence (current-program SysEx dump). setState stashes a dump to inject
-	// once the machine has booted; processBlock does the one-shot injection. The standalone
+	// before initial playback; later restores are published to processBlock. The standalone
 	// intentionally ignores this dump and boots from explicitly written synth NVRAM instead.
-	std::vector<std::uint8_t> m_pendingState;
-	std::atomic<bool>         m_pendingReady { false };
-	std::atomic<bool>         m_pendingInjected { false };
+	prophecy::PendingProgram m_pendingState;
+	std::atomic<std::uint64_t> m_appliedStateRevision{0};
+	std::atomic<unsigned> m_initializations{0};
+	std::atomic<bool> m_startupAccess{false};
 
 	JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ProphecyAudioProcessor)
 };
