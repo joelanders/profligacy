@@ -122,7 +122,7 @@ int main(int argc, char** argv)
 	constexpr int legalBlockSizes[] = { 1, 17, 64, 511, 512, 1024, 4096, 16384 };
 	for (double rate : rates)
 	{
-		processor.prepareToPlay(rate, 64);
+		processor.prepareToPlay(rate, 16384);
 		for (int frames : legalBlockSizes)
 		{
 			juce::AudioBuffer<float> stereo(2, frames);

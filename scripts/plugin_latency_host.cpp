@@ -59,53 +59,58 @@ struct LocalAU
     ~LocalAU() { if (bundle) CFRelease(bundle); }
     bool open(const juce::String& path)
     {
+        auto fail = [](const char* step) {
+            std::fprintf(stderr, "Local AU registration failed at %s\n", step);
+            return false;
+        };
         const auto* utf8 = path.toRawUTF8();
         auto url = CFURLCreateFromFileSystemRepresentation(nullptr,
             reinterpret_cast<const UInt8*>(utf8), (CFIndex) std::strlen(utf8), true);
-        if (!url) return false;
+        if (!url) return fail("bundle URL");
         bundle = CFBundleCreate(nullptr, url);
         CFRelease(url);
-        if (!bundle) return false;
+        if (!bundle) return fail("bundle create");
         auto components = CFBundleGetValueForInfoDictionaryKey(bundle, CFSTR("AudioComponents"));
         if (!components || CFGetTypeID(components) != CFArrayGetTypeID()
-            || CFArrayGetCount((CFArrayRef) components) != 1) return false;
+            || CFArrayGetCount((CFArrayRef) components) != 1) return fail("AudioComponents metadata");
         auto info = (CFDictionaryRef) CFArrayGetValueAtIndex((CFArrayRef) components, 0);
-        if (CFGetTypeID(info) != CFDictionaryGetTypeID()) return false;
+        if (CFGetTypeID(info) != CFDictionaryGetTypeID()) return fail("component dictionary");
         auto string = [&](CFStringRef key) -> CFStringRef {
             auto value = CFDictionaryGetValue(info, key);
             return value && CFGetTypeID(value) == CFStringGetTypeID() ? (CFStringRef) value : nullptr;
         };
         auto type = string(CFSTR("type")), manufacturer = string(CFSTR("manufacturer"));
         auto factoryName = string(CFSTR("factoryFunction"));
-        if (!type || !manufacturer || !factoryName) return false;
+        if (!type || !manufacturer || !factoryName) return fail("component fields");
         const auto typeString = juce::String::fromCFString(type);
         const auto manufacturerString = juce::String::fromCFString(manufacturer);
         auto fourcc = [](const juce::String& s) {
             return (UInt32(s[0]) << 24) | (UInt32(s[1]) << 16) | (UInt32(s[2]) << 8) | UInt32(s[3]);
         };
-        if (typeString.length() != 4 || manufacturerString.length() != 4) return false;
+        if (typeString.length() != 4 || manufacturerString.length() != 4) return fail("fourcc fields");
         AudioComponentDescription description{};
         description.componentType = fourcc(typeString);
         description.componentManufacturer = fourcc(manufacturerString);
         description.componentSubType = fourcc("Ptl1");
-        if (AudioComponentFindNext(nullptr, &description)) return false;
+        if (AudioComponentFindNext(nullptr, &description)) return fail("test subtype collision");
+        if (!CFBundleLoadExecutable(bundle)) return fail("bundle executable load");
         auto factory = reinterpret_cast<AudioComponentFactoryFunction>(
             CFBundleGetFunctionPointerForName(bundle, factoryName));
-        if (!factory) return false;
+        if (!factory) return fail("factory lookup");
         Dl_info loaded{};
-        if (!dladdr(reinterpret_cast<void*>(factory), &loaded) || !loaded.dli_fname) return false;
+        if (!dladdr(reinterpret_cast<void*>(factory), &loaded) || !loaded.dli_fname) return fail("loaded factory path");
         binaryPath = juce::File(loaded.dli_fname).getFullPathName();
         auto executableURL = CFBundleCopyExecutableURL(bundle);
-        if (!executableURL) return false;
+        if (!executableURL) return fail("bundle executable URL");
         auto executablePath = CFURLCopyFileSystemPath(executableURL, kCFURLPOSIXPathStyle);
         CFRelease(executableURL);
-        if (!executablePath) return false;
+        if (!executablePath) return fail("bundle executable path");
         const bool exact = juce::File(binaryPath) == juce::File(juce::String::fromCFString(executablePath));
         CFRelease(executablePath);
-        if (!exact) return false;
+        if (!exact) return fail("exact bundle identity");
         component = AudioComponentRegister(&description, CFSTR("Profligacy: Latency capture"), 65536, factory);
         identifier = "AudioUnit:" + typeString + ",Ptl1," + manufacturerString;
-        return component != nullptr;
+        return component != nullptr ? true : fail("AudioComponentRegister");
     }
     CFBundleRef bundle = nullptr;
     AudioComponent component = nullptr;

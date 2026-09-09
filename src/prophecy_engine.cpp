@@ -46,6 +46,7 @@
 #define NOMINMAX
 #endif
 #include <objbase.h>
+#include <windows.h>
 
 static int prophecy_setenv(const char *name, const char *value, int overwrite)
 {
@@ -53,6 +54,10 @@ static int prophecy_setenv(const char *name, const char *value, int overwrite)
 	return _putenv_s(name, value);
 }
 #define setenv prophecy_setenv
+#endif
+
+#if !defined(_WIN32)
+#include <dlfcn.h>
 #endif
 
 #if defined(__APPLE__)
@@ -69,6 +74,36 @@ int sdl_entered_debugger = 0;
 #endif
 
 namespace {
+
+// Retain the image containing the engine before its worker starts. A worker that
+// misses the cooperative shutdown deadline keeps this reference for the rest of
+// the process, so a host cannot unload code that it may still execute. Normal
+// shutdown releases it after joining the worker.
+void* retain_current_module()
+{
+#if defined(_WIN32)
+	HMODULE module = nullptr;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+			reinterpret_cast<LPCWSTR>(&retain_current_module), &module))
+		return nullptr;
+	return module;
+#else
+	Dl_info info{};
+	if (!dladdr(reinterpret_cast<const void*>(&retain_current_module), &info)
+			|| info.dli_fname == nullptr)
+		return nullptr;
+	return dlopen(info.dli_fname, RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+
+void release_current_module(void* module)
+{
+#if defined(_WIN32)
+	FreeLibrary(static_cast<HMODULE>(module));
+#else
+	dlclose(module);
+#endif
+}
 
 #if defined(__APPLE__)
 void configure_audio_producer_scheduling(std::uint32_t nativeFrames = 960)
@@ -688,6 +723,7 @@ struct ProphecyEngine::Impl
 	std::uint64_t                    completed_horizon = 0; // protected by output_mutex
 	std::uint64_t                    output_wait_horizon = 0; // protected by output_mutex
 	std::thread                      thread;
+	void*                            retained_module = nullptr;
 	std::atomic<bool>                started{false};
 	std::atomic<bool>                finished{false};
 	std::atomic<uint64_t>            produced{0};
@@ -871,7 +907,7 @@ private:
 //============================================================
 //  ProphecyEngine
 //============================================================
-ProphecyEngine::ProphecyEngine() : m_impl(std::make_unique<Impl>()) { }
+ProphecyEngine::ProphecyEngine() : m_impl(std::make_shared<Impl>()) { }
 
 ProphecyEngine::~ProphecyEngine() { stop(); }
 
@@ -925,6 +961,15 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 		m_impl->status.store(InstanceStatus::Unavailable, std::memory_order_release);
 		return false;
 	}
+	m_impl->retained_module = retain_current_module();
+	if (m_impl->retained_module == nullptr)
+	{
+		std::fprintf(stderr, "Profligacy startup: could not retain engine module for bounded shutdown\n");
+		m_impl->finished.store(true, std::memory_order_release);
+		m_impl->status.store(InstanceStatus::Stopped, std::memory_order_release);
+		g_engine_active.store(false, std::memory_order_release);
+		return false;
+	}
 	m_impl->owns_singleton = true;
 	apply_audio_config();
 	kprop_set_host_midi_pop(host_midi_pop_impl);   // host MIDI -> emulated UART
@@ -963,7 +1008,7 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 	// consume input. A ROM-picker boot may race the DAW's audio callback.
 	m_impl->status.store(InstanceStatus::Active, std::memory_order_release);
 	m_impl->playback_ready.store(!m_impl->host_timeline, std::memory_order_release);
-	Impl *impl = m_impl.get();
+	auto impl = m_impl;
 	m_impl->thread = std::thread([impl, args]() {
 #if defined(__APPLE__)
 		impl->applied_period = impl->host_timeline ? impl->worker_period.load() : 960;
@@ -975,12 +1020,17 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 		#else
 		sdl_options options;
 		#endif
-		prophecy_osd osd(options, impl);
+		prophecy_osd osd(options, impl.get());
 		osd.register_options();
 		impl->exitCode = emulator_info::start_frontend(options, osd, a);
+		if (const char* delay = std::getenv("PROFLIGACY_TEST_SHUTDOWN_STALL_MS"))
+			std::this_thread::sleep_for(std::chrono::milliseconds(std::max(std::atoi(delay), 0)));
 		{
 			std::lock_guard lock(impl->output_mutex);
 			impl->finished.store(true);
+			impl->owns_singleton.store(false, std::memory_order_release);
+			impl->status.store(InstanceStatus::Stopped, std::memory_order_release);
+			g_engine_active.store(false, std::memory_order_release);
 		}
 		impl->output_ready.notify_all();
 		impl->ring.set_done();
@@ -998,7 +1048,7 @@ bool ProphecyEngine::enableMidiTxByteCapture(bool enabled)
 	return true;
 }
 
-void ProphecyEngine::stop()
+void ProphecyEngine::requestStop()
 {
 	if (!m_impl->started.load()) return;
 	if (!m_impl->owns_singleton.load(std::memory_order_acquire)) return;
@@ -1008,12 +1058,36 @@ void ProphecyEngine::stop()
 	}
 	m_impl->output_ready.notify_all();
 	m_impl->ring.set_abort(); // release legacy FIFO backpressure too
-	// A plugin cannot unload code or storage still used by a detached worker.
-	// All engine waits observe abort; let the worker request its own MAME exit.
-	if (m_impl->thread.joinable()) m_impl->thread.join();
-	m_impl->owns_singleton.store(false, std::memory_order_release);
-	m_impl->status.store(InstanceStatus::Stopped, std::memory_order_release);
-	g_engine_active.store(false, std::memory_order_release);
+}
+
+void ProphecyEngine::stop()
+{
+	requestStop();
+	if (!m_impl->started.load()) return;
+	if (!m_impl->thread.joinable()) return;
+	bool finished = false;
+	{
+		std::unique_lock lock(m_impl->output_mutex);
+		finished = m_impl->output_ready.wait_for(lock, std::chrono::seconds(3), [this] {
+			return m_impl->finished.load(std::memory_order_acquire);
+		});
+	}
+	if (finished)
+	{
+		m_impl->thread.join();
+		release_current_module(m_impl->retained_module);
+		m_impl->retained_module = nullptr;
+		return;
+	}
+	// Do not repeat the old unsafe detach: retain the worker's Impl through its
+	// shared capture and keep this module loaded for the rest of the host process.
+	// The worker releases the singleton itself if it eventually exits.
+	std::fprintf(stderr, "Profligacy shutdown: worker exceeded 3 second deadline; retaining module until process exit\n");
+	// Deliberately leak the startup-time module reference. The shared worker capture
+	// retains Impl; clearing this field prevents any later owner from releasing the
+	// image while the detached worker might still be running.
+	m_impl->retained_module = nullptr;
+	m_impl->thread.detach();
 }
 
 bool ProphecyEngine::running() const  { return ownsMachineSlot() && m_impl->started.load() && !m_impl->finished.load(); }
@@ -1088,7 +1162,7 @@ bool ProphecyEngine::initializePlayback(bool firmwareHandshake)
 	const char* failure = "Firmware startup did not complete. Reload the plugin to try again.";
 	auto fail = [&] {
 		std::fprintf(stderr, "Profligacy initialization failed: %s\n", failure);
-		stop();
+		requestStop();
 		return false;
 	};
 	if (firmwareHandshake && !wasReady)

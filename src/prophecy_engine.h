@@ -51,8 +51,9 @@ public:
 
 	// Boot the machine on a background thread. `args` is a MAME command line, e.g.
 	// {"prophecy","korgprop","-rompath",romdir,"-video","none","-sound","none","-nothrottle"}.
-	// Non-blocking; returns false if already started or another engine owns MAME's
-	// process-global machine slot. instanceStatus() distinguishes those cases.
+	// Non-blocking; returns false if already started, another engine owns MAME's
+	// process-global machine slot, or the current module cannot be retained for safe
+	// bounded teardown. instanceStatus() distinguishes an unavailable singleton.
 	bool start(const std::vector<std::string> &args);
 
 	// Enable the raw MIDI OUT observer. Call before start(); it is disabled by default so
@@ -60,7 +61,11 @@ public:
 	// observer ring and dropped-event count. Returns false once the engine has started.
 	bool enableMidiTxByteCapture(bool enabled = true);
 
-	// Ask the machine to exit and join the thread. Safe to call from a destructor.
+	// Ask the machine to exit and finish ownership cleanup. Safe to call from a
+	// destructor and bounded even if MAME fails to reach a cancellation point.
+	// requestStop() is non-blocking and may be used to cancel initialization before
+	// joining an owner-managed initialization thread.
+	void requestStop();
 	void stop();
 
 	bool running() const;   // thread launched and machine not yet finished
@@ -81,8 +86,8 @@ public:
 	// Plugin timeline mode is selected before start; console clients retain pull's
 	// free-running contract. Publish all scheduled input before granting its range.
 	bool enableHostTimeline();
-	// Non-realtime initialization, before playback. Finish firmware boot outside
-	// the host epoch, then publish its native origin.
+	// Potentially blocking initialization for caller-managed background lifecycle
+	// work. Finish firmware boot outside the host epoch, then publish its native origin.
 	bool initializePlayback(bool firmwareHandshake = true);
 	bool readyForPlayback() const;
 	std::uint64_t playbackOrigin() const;
@@ -184,5 +189,5 @@ public:
 	std::uint64_t producedFrames() const; // total frames MAME has emitted
 
 private:
-	std::unique_ptr<Impl> m_impl;
+	std::shared_ptr<Impl> m_impl;
 };

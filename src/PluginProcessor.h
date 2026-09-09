@@ -14,8 +14,11 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -103,7 +106,8 @@ public:
 	double hostSampleRate() const { return m_hostSampleRate; }
 	// ROM picker: where the engine's firmware comes from. If no valid ROM set is found
 	// the engine stays unbooted and the editor shows the first-run picker.
-	bool romOk() const { return m_engine.readyForPlayback(); }
+	bool romOk() const { return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active; }
+	bool playbackReady() const { return m_engine.readyForPlayback(); }
 	bool instanceUnavailable() const
 	{
 		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Unavailable;
@@ -549,7 +553,14 @@ private:
 	prophecy::SampleTimeline m_timeline;
 	std::uint64_t      m_timelineHostFrame = 0;
 	bool               m_timelineAttached = false;
+	std::atomic<bool>  m_resetTimelineOnAttach { false };
 	int                m_preparedMaxBlock = 0;
+	int                m_maxExpectedBlock = 1;
+	enum class InitializationState : std::uint8_t { Idle, Running, Ready, Failed };
+	std::atomic<InitializationState> m_initializationState { InitializationState::Idle };
+	std::mutex         m_initializationMutex;
+	std::condition_variable m_initializationChanged;
+	std::thread        m_initializationThread;
 	std::atomic<std::uint64_t> m_oversizedAudioBlocks { 0 };
 	// Lock-free counters sampled by the optional GUI diagnostic logger. The audio callback
 	// only updates atomics; all formatting and file I/O stays on the message thread.

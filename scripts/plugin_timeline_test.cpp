@@ -4,6 +4,7 @@
 #include "PluginProcessor.h"
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 
 static void require(bool condition, const char* message)
 {
@@ -32,6 +33,9 @@ static Render render(double rate, bool variable, bool offline, bool mono, bool r
 	ProphecyAudioProcessor processor;
 	processor.setNonRealtime(offline);
 	processor.prepareToPlay(reprepare ? 48000 : rate, 512);
+	for (int i = 0; !processor.playbackReady() && i < 1000; ++i)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	require(processor.playbackReady() || lateBoot, "asynchronous initialization did not finish");
 	juce::MidiBuffer midi;
 	midi.ensureSize(4096);
 	juce::AudioBuffer<float> block(mono ? 1 : 2, 512);
@@ -44,6 +48,9 @@ static Render render(double rate, bool variable, bool offline, bool mono, bool r
 		unsetenv("PROPHECY_FORCE_NO_ROM");
 #endif
 		require(processor.maybeBootEngine(), "late ROM selection did not boot");
+		for (int i = 0; !processor.playbackReady() && i < 1000; ++i)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		require(processor.playbackReady(), "late asynchronous initialization did not finish");
 	}
 	if (reprepare)
 	{
@@ -119,6 +126,63 @@ int main()
 #else
 	unsetenv("PROPHECY_FORCE_NO_ROM");
 #endif
+	// Firmware readiness belongs to a background lifecycle task. prepareToPlay must
+	// return promptly, while an offline render may wait for deterministic readiness.
+	environment("PROPHECY_FAKE_INITIALIZATION_MS", "500");
+	{
+		ProphecyAudioProcessor processor;
+		const auto prepareStart = std::chrono::steady_clock::now();
+		processor.prepareToPlay(48000, 64);
+		require(std::chrono::steady_clock::now() - prepareStart < std::chrono::milliseconds(250),
+			"prepareToPlay blocked on firmware initialization");
+		require(!processor.playbackReady(), "delayed initialization completed synchronously");
+		juce::AudioBuffer<float> audio(2, 64);
+		juce::MidiBuffer midi;
+		const auto realtimeStart = std::chrono::steady_clock::now();
+		processor.processBlock(audio, midi);
+		require(std::chrono::steady_clock::now() - realtimeStart < std::chrono::milliseconds(100),
+			"realtime callback blocked on firmware initialization");
+		require(audio.getMagnitude(0, audio.getNumSamples()) == 0.0f,
+			"realtime callback emitted audio before initialization");
+		processor.setNonRealtime(true);
+		processor.processBlock(audio, midi);
+		require(processor.playbackReady(), "offline render did not wait for initialization");
+	}
+	environment("PROPHECY_FAKE_INITIALIZATION_MS", "5000");
+	{
+		const auto destructionStart = std::chrono::steady_clock::now();
+		{
+			ProphecyAudioProcessor processor;
+			processor.prepareToPlay(48000, 64);
+		}
+		require(std::chrono::steady_clock::now() - destructionStart < std::chrono::milliseconds(250),
+			"processor destruction did not cancel background initialization");
+	}
+	environment("PROPHECY_FAKE_INITIALIZATION_MS", "0");
+
+	// A realtime callback larger than the host's declared maximum has no matching
+	// latency allowance. Reject it deterministically instead of emitting a partial,
+	// scheduler-dependent block, and do not deliver MIDI whose audio cannot align.
+	{
+		ProphecyAudioProcessor processor;
+		processor.prepareToPlay(48000, 64);
+		for (int i = 0; !processor.playbackReady() && i < 1000; ++i)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		require(processor.playbackReady(), "oversize-policy initialization did not finish");
+		juce::AudioBuffer<float> audio(2, 65);
+		for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+			for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+				audio.setSample(channel, sample, 1.0f);
+		juce::MidiBuffer midi;
+		midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8) 64), 0);
+		const auto forwarded = processor.diagnosticSnapshot().hostMidiEventsForwarded;
+		processor.processBlock(audio, midi);
+		require(processor.oversizedAudioBlocks() == 1, "larger-than-hint realtime block was not counted");
+		require(audio.getMagnitude(0, audio.getNumSamples()) == 0.0f,
+			"larger-than-hint realtime block was not silent");
+		require(processor.diagnosticSnapshot().hostMidiEventsForwarded == forwarded,
+			"MIDI from a rejected realtime block was delivered");
+	}
 	for (double rate : { 44100.0, 48000.0, 88200.0, 96000.0, 192000.0 })
 	{
 		const auto reference = render(rate, false, false, false, false);
@@ -152,5 +216,5 @@ int main()
 		}
 	}
 	require(fixture.deleteRecursively(), "fixture cleanup");
-	std::puts("processor timeline: MIDI offsets, reported delay, variable/zero blocks, offline PCM, reprepare and mono passed");
+	std::puts("processor timeline: asynchronous boot, oversize policy, MIDI offsets, reported delay, variable/zero blocks, offline PCM, reprepare and mono passed");
 }

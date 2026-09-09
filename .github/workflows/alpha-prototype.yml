@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 env:
-  MAME_SHA: 72e702f92fd6d45849f036e01b5004847859abc6
+  MAME_SHA: eb19791d0286f5de5492ac0303b776af475e2e29
   MAME_TREE: cd0c0d5b7bf7f14decec74dc45caaf1b517fc6b9
 
 jobs:

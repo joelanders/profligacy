@@ -6,10 +6,10 @@
 // the engine's worker thread and streams its 48 kHz stereo output through processBlock.
 // It links the MAME static archives via the prophecy_engine static library.
 //
-// Host MIDI (notes/CC/bend/sysex) is injected into the emulated serial UART at block
-// start (see processBlock), and a Lagrange resampler adapts the engine's native
-// 48 kHz to the host rate. Known limitation: only ONE instance produces audio per
-// process (the MAME machine is a singleton); a second instance is explicitly unavailable.
+// Host MIDI (notes/CC/bend/sysex) and audio share absolute sample positions (see
+// processBlock); timeline interpolation adapts the engine's native 48 kHz to the host
+// rate. Known limitation: only ONE instance produces audio per process (the MAME
+// machine is a singleton); a second instance is explicitly unavailable.
 //
 #include "PluginProcessor.h"
 
@@ -55,6 +55,8 @@ ProphecyAudioProcessor::ProphecyAudioProcessor()
 
 ProphecyAudioProcessor::~ProphecyAudioProcessor()
 {
+	m_engine.requestStop();
+	if (m_initializationThread.joinable()) m_initializationThread.join();
 	m_engine.stop();
 }
 
@@ -81,6 +83,7 @@ void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 	// ordinary offline/host block-size changes stay allocation-free; a still-larger block
 	// is explicitly silenced and counted in processBlock rather than resizing there.
 	m_preparedMaxBlock = std::max(samplesPerBlock, 16384);
+	m_maxExpectedBlock = std::max(samplesPerBlock, 1);
 
 	// Prepare the 48 kHz -> host-rate resampler (bypassed when the host runs at 48 kHz).
 	const double ratio = (double) ProphecyEngine::kSampleRate / m_hostSampleRate;
@@ -90,16 +93,18 @@ void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 
 	// Reserve the requested output block, one quantum for grant alignment,
 	// one quantum for worker execution, and interpolation lookahead. A short
-	// preceding callback must not remove the worker execution allowance. Output is explicitly delayed by this
-	// exact integer number of host samples; storage capacity is unrelated.
+	// preceding callback must not remove the worker execution allowance. Output is
+	// explicitly delayed by this exact integer number of host samples; storage
+	// capacity is unrelated.
 	const auto nativeLead = std::max(std::ceil(std::max(samplesPerBlock, 1) * ratio),
 		(double) quantum) + 2 * quantum + 2;
 	setLatencySamples((int) std::ceil(nativeLead / ratio));
 	m_engine.setHostBlockFrames((std::uint32_t) std::ceil(std::max(samplesPerBlock, 1) * ratio));
 
 	maybeBootEngine();
-	// Firmware initialization finishes before the host epoch.
-	// Reprepare starts beyond the previous input grant, independent of worker speed.
+	// Install a provisional origin immediately. Asynchronous first boot replaces it
+	// with the completed firmware origin; reprepare after readiness starts beyond the
+	// previous input grant, independent of worker speed.
 	const auto origin = ((m_engine.requestedFrames() + quantum - 1) / quantum) * quantum;
 	m_timeline.reset(m_hostSampleRate, origin);
 	m_timelineAttached = m_engine.readyForPlayback();
@@ -117,6 +122,11 @@ bool ProphecyAudioProcessor::maybeBootEngine()
 		return false;
 	if (m_started.exchange(true))
 		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active;
+	// A ROM chosen after callbacks have already begun starts a fresh audible epoch;
+	// ordinary asynchronous startup retains the host frames elapsed during boot so
+	// later MIDI still shares the same absolute project timeline.
+	m_resetTimelineOnAttach.store(m_audioCallbacks.load(std::memory_order_acquire) != 0,
+		std::memory_order_release);
 	m_romPath   = romDir.getFullPathName();
 	m_nvramPath = romloc::nvramDirFor(romDir).getFullPathName();
 
@@ -151,11 +161,24 @@ bool ProphecyAudioProcessor::maybeBootEngine()
 		// Clean-room CI firmware has its own sentinel protocol, not Korg's boot
 		// screen or SysEx parser. Ordinary firmware must complete the handshake.
 		const bool firmware = std::getenv("PROFLIGACY_CI_EXPOSE_LCD_STATE") == nullptr;
-		if (!m_engine.initializePlayback(firmware)) return false;
-		// Host state can restore Wheel 2 before prepareToPlay. Pre-start engine writes are
-		// intentionally rejected so an unclaimed/second processor cannot touch another
-		// instance's global queue; publish the retained value once this engine owns it.
-		(void) m_engine.pushAdin(9, m_wheel2Pos.load(std::memory_order_relaxed));
+		m_initializationState.store(InitializationState::Running, std::memory_order_release);
+		m_initializationThread = std::thread([this, firmware] {
+			const bool ready = m_engine.initializePlayback(firmware);
+			if (ready)
+			{
+				// Host state can restore Wheel 2 before prepareToPlay. Pre-start engine writes are
+				// rejected; publish the retained value once this engine accepts playback input.
+				(void) m_engine.pushAdin(9, m_wheel2Pos.load(std::memory_order_relaxed));
+			}
+			{
+				// Pair the state transition with the wait mutex so an offline callback
+				// cannot miss the notification between checking and sleeping.
+				std::lock_guard lock(m_initializationMutex);
+				m_initializationState.store(ready ? InitializationState::Ready
+					: InitializationState::Failed, std::memory_order_release);
+			}
+			m_initializationChanged.notify_all();
+		});
 	}
 	return started;
 }
@@ -173,22 +196,36 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 	juce::ScopedNoDenormals noDenormals;
 	const int numSamples  = buffer.getNumSamples();
 	const int numChannels = buffer.getNumChannels();
-	const bool engineActive = m_engine.readyForPlayback();
+	bool engineActive = m_engine.readyForPlayback();
+	if (!engineActive && isNonRealtime()
+			&& m_initializationState.load(std::memory_order_acquire) == InitializationState::Running)
+	{
+		// Offline and VST3-prefetch callbacks may wait for deterministic output;
+		// realtime callbacks must never wait for firmware or the emulator.
+		std::unique_lock lock(m_initializationMutex);
+		m_initializationChanged.wait_for(lock, std::chrono::seconds(30), [this] {
+			return m_initializationState.load(std::memory_order_acquire)
+				!= InitializationState::Running;
+		});
+		engineActive = m_engine.readyForPlayback();
+	}
 	if (engineActive && (!m_timelineAttached || m_timeline.origin() < m_engine.playbackOrigin()))
 	{
 		// A ROM may be selected long after the DAW started calling processBlock.
 		// Adopt its completed initialization epoch, with the same fixed delay.
 		m_timeline.reset(m_hostSampleRate, m_engine.playbackOrigin());
-		m_timelineHostFrame = 0;
+		if (m_resetTimelineOnAttach.exchange(false, std::memory_order_acq_rel))
+			m_timelineHostFrame = 0;
 		m_timelineAttached = true;
 	}
 	m_audioCallbacks.fetch_add(1, std::memory_order_relaxed);
 	m_audioHostFrames.fetch_add((std::uint64_t) std::max(numSamples, 0), std::memory_order_relaxed);
-	if (numSamples > m_preparedMaxBlock)
+	if (numSamples > m_preparedMaxBlock
+			|| (!isNonRealtime() && numSamples > m_maxExpectedBlock))
 	{
-		// A host exceeded even our generous prepare-time reserve. Do bounded work only:
-		// output silence, count the contract violation, and ignore this block's MIDI rather
-		// than allocate or touch undersized resampler storage on the audio thread.
+		// The host exceeded its realtime prepare hint, or even the larger offline
+		// reserve. Do bounded work only: output silence, count the contract violation,
+		// and ignore MIDI rather than touch undersized realtime storage.
 		buffer.clear();
 		m_oversizedAudioBlocks.fetch_add(1, std::memory_order_relaxed);
 		m_audioUnderrunFrames.fetch_add((std::uint64_t) numSamples, std::memory_order_relaxed);

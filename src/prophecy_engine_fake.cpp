@@ -7,14 +7,17 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 struct ProphecyEngine::Impl
 {
 	std::atomic<bool> started{false};
 	std::atomic<bool> finished{false};
 	std::atomic<bool> owns{false};
+	std::atomic<bool> playback_ready{false};
 	std::atomic<std::uint64_t> produced{0};
 	std::atomic<std::uint64_t> requested{0};
 	const bool probe = std::getenv("PROPHECY_FAKE_TIMELINE_PROBE") != nullptr;
@@ -29,7 +32,7 @@ struct ProphecyEngine::Impl
 	std::atomic<std::uint32_t> lcd_version{0};
 };
 
-ProphecyEngine::ProphecyEngine() : m_impl(std::make_unique<Impl>()) { }
+ProphecyEngine::ProphecyEngine() : m_impl(std::make_shared<Impl>()) { }
 ProphecyEngine::~ProphecyEngine() { stop(); }
 
 bool ProphecyEngine::start(const std::vector<std::string> &)
@@ -38,13 +41,22 @@ bool ProphecyEngine::start(const std::vector<std::string> &)
 	if (!m_impl->started.compare_exchange_strong(expected, true)) return false;
 	m_impl->owns.store(true);
 	m_impl->finished.store(false);
+	m_impl->playback_ready.store(false);
 	return true;
 }
 
 bool ProphecyEngine::enableMidiTxByteCapture(bool) { return !m_impl->started.load(); }
 bool ProphecyEngine::enableHostTimeline() { return !m_impl->started.load(); }
-bool ProphecyEngine::initializePlayback(bool) { return running(); }
-bool ProphecyEngine::readyForPlayback() const { return running(); }
+bool ProphecyEngine::initializePlayback(bool)
+{
+	if (const auto* delay = std::getenv("PROPHECY_FAKE_INITIALIZATION_MS"))
+		for (int remaining = std::max(std::atoi(delay), 0); running() && remaining > 0; --remaining)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	const bool ready = running();
+	m_impl->playback_ready.store(ready);
+	return ready;
+}
+bool ProphecyEngine::readyForPlayback() const { return running() && m_impl->playback_ready.load(); }
 std::uint64_t ProphecyEngine::playbackOrigin() const { return 0; }
 bool ProphecyEngine::waitingForOutput() const { return false; }
 bool ProphecyEngine::waitingForInput() const { return false; }
@@ -72,14 +84,17 @@ std::size_t ProphecyEngine::readAtFrame(std::uint64_t first, float* left, float*
 	return count;
 }
 
-void ProphecyEngine::stop()
+void ProphecyEngine::requestStop()
 {
 	if (m_impl->started.exchange(false))
 	{
 		m_impl->owns.store(false);
+		m_impl->playback_ready.store(false);
 		m_impl->finished.store(true);
 	}
 }
+
+void ProphecyEngine::stop() { requestStop(); }
 
 bool ProphecyEngine::running() const { return m_impl->started.load() && !m_impl->finished.load(); }
 bool ProphecyEngine::finished() const { return m_impl->finished.load(); }
