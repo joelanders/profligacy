@@ -96,6 +96,10 @@ static void restoreAndSave(Order order)
 	// A confirmed restore must not mask subsequent firmware/editor changes.
 	const auto edited = program(73);
 	processor.sendMidi(edited.data(), edited.size());
+	// Explicit import owns the replacement immediately, without a host callback.
+	requireSavedProgram(processor, edited);
+	audio.setSize(2, 128);
+	processor.processBlock(audio, midi);
 	requireSavedProgram(processor, edited);
 	processor.releaseResources();
 	processor.prepareToPlay(48000, 128);
@@ -176,6 +180,160 @@ static void concurrentRestore()
 	requireFirstNote(processor);
 }
 
+static void destroyDuringControlDelivery()
+{
+	auto processor = std::make_unique<ProphecyAudioProcessor>();
+	processor->prepareToPlay(48000, 128);
+	prophecy::fake::holdImmediateInput(true);
+	processor->setParam(1, 'Q');
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!prophecy::fake::immediateInputWaiting() && std::chrono::steady_clock::now() < deadline)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	require(prophecy::fake::immediateInputWaiting(), "control delivery required a message-loop callback");
+	std::atomic<bool> entered{false}, destroyed{false};
+	std::thread destruction([&] {
+		entered.store(true);
+		processor.reset();
+		destroyed.store(true);
+	});
+	while (!entered.load()) std::this_thread::yield();
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	require(!destroyed.load(), "destructor returned while a control callback still owned the processor");
+	prophecy::fake::holdImmediateInput(false);
+	destruction.join();
+	require(destroyed.load(), "control shutdown did not complete");
+	std::puts("PASS control delivery without a message loop and joined callback destruction");
+}
+
+static void stoppedCommandPacing()
+{
+	ProphecyAudioProcessor processor;
+	processor.setNonRealtime(true);
+	processor.prepareToPlay(48000, 128);
+	processor.releaseResources();
+	processor.renamePatch("Queued rename");
+	std::this_thread::sleep_for(std::chrono::milliseconds(350));
+	const auto stopped = processor.diagnosticSnapshot();
+	require(stopped.editorCommandsSent == 1 && stopped.editorCommandsPending == 15,
+		"wall-clock pacing filled the UART while firmware was stopped");
+	juce::MemoryBlock beforeOverflow;
+	processor.getStateInformation(beforeOverflow);
+	// Admission of an oversized batch must preserve the previous whole request.
+	for (int i = 0; i < 15; ++i) processor.renamePatch("Accepted name");
+	juce::MemoryBlock full;
+	processor.getStateInformation(full);
+	processor.renamePatch("Rejected name");
+	juce::MemoryBlock rejected;
+	processor.getStateInformation(rejected);
+	require(full == rejected && *processor.programStateError() != 0,
+		"queue exhaustion accepted a partial rename");
+	processor.setStateInformation(beforeOverflow.getData(), int(beforeOverflow.getSize()));
+	require(*processor.programStateError() == 0, "restoring the accepted request did not clear the error");
+	std::puts("PASS stopped firmware pacing and atomic batch overflow");
+}
+
+static void explicitProgramImport()
+{
+	ProphecyAudioProcessor processor;
+	const auto first = program(31), second = program(79);
+	processor.sendMidi(first.data(), first.size());
+	requireSavedProgram(processor, first);
+	processor.prepareToPlay(48000, 128);
+	requireSavedProgram(processor, first);
+	processor.setParam(1, 'X');
+	processor.sendMidi(second.data(), second.size());
+	requireSavedProgram(processor, second);
+	auto invalid = first;
+	invalid.pop_back();
+	processor.sendMidi(invalid.data(), invalid.size());
+	requireSavedProgram(processor, second);
+	require(*processor.programStateError() != 0, "malformed explicit import had no error");
+	std::puts("PASS explicit program import before boot, immediate save, supersession and malformed input");
+
+	juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Standalone);
+	auto standalone = std::make_unique<ProphecyAudioProcessor>();
+	juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Undefined);
+	require(standalone->wrapperType == juce::AudioProcessor::wrapperType_Standalone, "standalone fixture type");
+	standalone->prepareToPlay(48000, 128);
+	standalone->setStateInformation(first.data(), int(first.size()));
+	std::vector<std::uint8_t> raw(535);
+	require(standalone->getProgramData(raw.data(), raw.size(), nullptr) == raw.size()
+		&& std::all_of(raw.begin(), raw.end(), [](auto byte) { return byte == 0; }),
+		"standalone automatically recalled the edit buffer");
+	standalone->sendMidi(second.data(), second.size());
+	const auto imported = prophecy::ProgramDocument::fromMidi(second.data(), second.size());
+	require(standalone->getProgramData(raw.data(), raw.size(), nullptr) == raw.size()
+		&& std::equal(raw.begin(), raw.end(), imported->base.begin()), "standalone explicit import was ignored");
+	juce::MemoryBlock preferences;
+	standalone->getStateInformation(preferences);
+	require(preferences.getSize() == 6, "standalone automatic state included the edit buffer");
+	std::puts("PASS standalone imports explicitly while automatic state remains preferences only");
+}
+
+static void delayedLiveConfirmation()
+{
+	ProphecyAudioProcessor processor;
+	processor.setNonRealtime(true);
+	processor.prepareToPlay(48000, 128);
+	const auto initial = program(31);
+	processor.setStateInformation(initial.data(), int(initial.size()));
+	juce::MidiBuffer midi;
+	juce::AudioBuffer<float> audio(2, 128);
+	auto step = [&] { processor.processBlock(audio, midi); std::this_thread::sleep_for(std::chrono::milliseconds(1)); };
+	auto waitFor = [&](auto predicate, const char* failure) {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		while (!predicate() && std::chrono::steady_clock::now() < deadline) step();
+		require(predicate(), failure);
+	};
+	auto saved = [&] { juce::MemoryBlock state; processor.getStateInformation(state); return state; };
+	auto pending = [&]() -> std::optional<prophecy::ProgramDocument> {
+		const auto state = saved();
+		const auto* bytes = static_cast<const std::uint8_t*>(state.getData());
+		if (state.getSize() < 6 || std::memcmp(bytes, "PRP3", 4)) return {};
+		const auto offset = 6 + 2 * std::size_t(bytes[4]);
+		return prophecy::ProgramDocument::decode(bytes + offset, state.getSize() - offset);
+	};
+	prophecy::fake::holdReadbackCompletion(true);
+	processor.setParam(1, 'Z');
+	waitFor([&] {
+		std::uint8_t first = 0;
+		return processor.getProgramData(&first, 1, nullptr) == 1 && first == 'Z';
+	}, "live edit dump not published");
+	require(pending() && pending()->edits.size() == 1, "dump version prematurely confirmed an edit");
+	processor.setParam(2, 'Y');
+	for (int i = 0; i < 250; ++i) step();
+	require(processor.diagnosticSnapshot().editorCommandsSent == 1,
+		"new edit was delivered during the older readback");
+	require(pending() && pending()->edits.size() == 2, "newer accepted intent was not saved");
+	prophecy::fake::holdReadbackCompletion(false);
+	waitFor([&] {
+		const auto document = pending();
+		return document && document->edits.size() == 1 && document->base[0] == 'Z'
+			&& document->edits[0].parameter == 2 && document->edits[0].value == 'Y';
+	}, "older confirmation did not retain the newer edit");
+	auto expected = prophecy::ProgramDocument::fromMidi(initial.data(), initial.size());
+	expected->base[0] = 'Z'; expected->base[1] = 'Y';
+	waitFor([&] { return savedProgramMatches(saved(), expected->programMidi()); },
+		"completed live edits were not retired into the saved base");
+	std::puts("PASS delayed live readback, retained newer intent, exact prefix retirement and plain final state");
+
+	const auto requests = processor.diagnosticSnapshot().editorDumpSends;
+	prophecy::fake::rejectReadbacks(true);
+	processor.setParam(3, 'X');
+	waitFor([&] { return *processor.programStateError() != 0; }, "missing firmware readback never failed");
+	require(processor.diagnosticSnapshot().editorDumpSends == requests + 3, "readback retries were not bounded");
+	const auto retained = pending();
+	require(retained && retained->edits.size() == 1 && retained->edits[0].parameter == 3,
+		"failed readback discarded accepted intent");
+	const auto recover = saved();
+	prophecy::fake::rejectReadbacks(false);
+	processor.setStateInformation(recover.getData(), int(recover.getSize()));
+	expected->base[2] = 'X';
+	requireSavedProgram(processor, expected->programMidi());
+	require(*processor.programStateError() == 0, "explicit recovery did not clear the failure");
+	std::puts("PASS bounded readback failure preserves accepted intent for explicit recovery");
+}
+
 int main()
 {
 	juce::ScopedJuceInitialiser_GUI juceInitialiser;
@@ -193,6 +351,10 @@ int main()
 	restoreWithoutRom();
 	concurrentRestore();
 	latencyNotification();
+	destroyDuringControlDelivery();
+	stoppedCommandPacing();
+	explicitProgramImport();
+	delayedLiveConfirmation();
 	require(fixture.deleteRecursively(), "fixture cleanup");
 	std::puts("state lifecycle: save/restore, zero callbacks, reprepare, edits and concurrent loading passed");
 }

@@ -10,6 +10,8 @@
 //
 #pragma once
 
+#include "program_document.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -84,7 +86,13 @@ public:
 	// Non-realtime initialization, before playback. Run firmware boot and any
 	// initial patch load outside the host epoch, then publish its native origin.
 	bool initializePlayback(const std::uint8_t *state = nullptr, std::size_t bytes = 0,
-		bool firmwareHandshake = true);
+		bool firmwareHandshake = true, const std::vector<prophecy::ProgramEdit>& edits = {});
+	// Explicit persistent WRITE to A00..B63. Non-realtime, with the host callback
+	// paused: apply the accepted document outside the playback epoch, acknowledge
+	// and verify the destination, then restore the original memory protection.
+	// Once started, this operation must finish before the caller stops the engine.
+	// A failed write may leave playback ready if protection cleanup succeeded.
+	bool storeProgram(int destination, const prophecy::ProgramDocument& document);
 	bool readyForPlayback() const;
 	const char* initializationError() const; // stable message, empty on success
 	std::uint64_t playbackOrigin() const;
@@ -104,7 +112,15 @@ public:
 	// The write is all-or-nothing; false means the bounded queue was full and the complete
 	// message was dropped (never torn). Timeline hosts reject input until
 	// initializePlayback succeeds; console hosts must wait for firmware boot.
-	bool pushMidi(const std::uint8_t *bytes, std::size_t n);
+	bool pushMidi(const std::uint8_t *bytes, std::size_t n, std::uint64_t revision = 0);
+	// Publish a newer program revision. Queued editor commands from older
+	// revisions are discarded by the consumer before starting a MIDI message.
+	void setProgramRevision(std::uint64_t revision);
+	// Host program messages stay on the timed UART queue. Hold new editor
+	// packets until the program owner has recorded their accepted intent. An
+	// already started packet always finishes; scheduled performance MIDI flows.
+	void setProgramInputPending(std::uint64_t sequence);
+	void acknowledgeProgramInput(std::uint64_t sequence);
 
 	// Schedule one host MIDI message at a native 48 kHz engine-output frame. This is
 	// used by processBlock to preserve host MidiBuffer sample offsets despite MAME
@@ -126,7 +142,7 @@ public:
 
 	// Faceplate front-panel button press: pulse scan-matrix (row, bit) for len_ms (default
 	// 75 ms, the hardware GUI's pulse length). Lock-free; drained on the MAME thread.
-	void pushPanelPulse(int row, int bit, int len_ms = 75);
+	void pushPanelPulse(int row, int bit, int len_ms = 75, std::uint64_t revision = 0);
 	// Deterministic harness/automation form: make the pulse visible to the emulated
 	// scan matrix at an exact native 48 kHz engine frame instead of depending on when
 	// the host message thread happens to wake.
@@ -174,6 +190,23 @@ public:
 	// editor reads knob values out of it by manifest offset). Returns bytes copied (0 if none yet);
 	// *version is a monotonic counter so a poller can detect a fresh dump. Message thread only.
 	std::size_t latestProgramData(std::uint8_t *out, std::size_t cap, std::uint32_t *version) const;
+	// One owned, asynchronous program query. Its following identity reply fences
+	// the firmware output, so a newer dump alone cannot complete the transaction.
+	// Cancellation abandons the result but keeps the exchange alive until drained.
+	// All methods are non-realtime; zero from begin means the transport is busy.
+	enum class ReadbackStatus { Pending, Complete, NoReply, Failed, Invalid };
+	std::uint64_t beginProgramReadback();
+	ReadbackStatus pollProgramReadback(std::uint64_t ticket, std::vector<std::uint8_t>& raw);
+	void cancelProgramReadback(std::uint64_t ticket);
+	bool programReadbackPending();
+	std::uint64_t firmwareControlErrors() const; // data-load / WRITE errors observed on the private MIDI transport
+
+	// Copy the firmware edit buffer at a worker boundary, without MIDI traffic or
+	// advancing emulated time. Non-realtime; unlike latestProgramData this is a
+	// current snapshot, independent of editor polling and host audio callbacks.
+	std::vector<std::uint8_t> snapshotProgram();
+	std::vector<std::uint8_t> snapshotStoredProgram(int program); // A00..B63 = 0..127
+	std::vector<std::uint8_t> snapshotGlobals(); // live 574-byte global record, no emulated-time advance
 
 	// Copy the most recently captured single arpeggio-pattern dump, unpacked into its
 	// documented 128-byte record. `pattern` receives 0..9 (UP..PAT5), or -1 when the
@@ -186,5 +219,8 @@ public:
 	std::uint64_t producedFrames() const; // total frames MAME has emitted
 
 private:
+	bool runProgramOperation(const std::uint8_t* state, std::size_t bytes,
+		bool firmwareHandshake, const std::vector<prophecy::ProgramEdit>& edits, int destination);
+	std::vector<std::uint8_t> readProgramSnapshot(std::uint32_t address = 0x4930, std::size_t bytes = 535);
 	std::unique_ptr<Impl> m_impl;
 };

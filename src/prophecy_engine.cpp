@@ -26,9 +26,11 @@
 
 #include "led_store.h"
 #include "audio_timeline.h"
+#include "midi_queue.h"
 #include "prophecy_engine.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -221,69 +223,17 @@ private:
 	std::atomic<std::uint64_t> m_dropped{0};
 };
 
-MidiRing g_host_midi_ring;     // host -> emulated UART (RX)
 MidiRing g_initialization_midi_ring; // non-realtime initialization -> UART
 std::atomic<bool> g_playback_input_enabled{true};
+std::atomic<std::uint64_t> g_program_revision{1};
+std::atomic<std::uint64_t> g_program_input_pending{0}, g_program_input_complete{0};
 MidiRing g_host_midi_tx_ring;  // emulated UART -> host (TX: patch dumps, param echoes)
-MidiRing g_host_panel_ring;    // host -> panel scan matrix: (row, bit, len_ms lo, len_ms hi) records
 MidiRing g_host_adin_ui_ring;  // message thread -> ADIN mux: (source, value) records
 MidiRing g_host_adin_rt_ring;  // audio thread -> ADIN mux: (source, value) records
 
-// Audio-thread host MIDI retains its JUCE sample offset as an engine-frame due time.
-// It is separate from the immediate editor/UI queue so a future audio event can never
-// head-of-line-block an immediate parameter SysEx message.
-class TimedMidiRing
-{
-public:
-	bool push(const std::uint8_t *bytes, std::size_t n, std::uint64_t frame)
-	{
-		if (bytes == nullptr || n == 0) return true;
-		const std::size_t t = m_tail.load(std::memory_order_relaxed);
-		const std::size_t h = m_head.load(std::memory_order_acquire);
-		if (CAP - (t - h) < n)
-		{
-			m_dropped.fetch_add(n, std::memory_order_relaxed);
-			return false;
-		}
-		for (std::size_t i = 0; i < n; ++i)
-			m_buf[(t + i) & (CAP - 1)] = Item{frame, bytes[i]};
-		m_tail.store(t + n, std::memory_order_release);
-		return true;
-	}
 
-	std::size_t popDue(std::uint8_t *out, std::size_t cap, std::uint64_t frame)
-	{
-		const std::size_t h = m_head.load(std::memory_order_relaxed);
-		const std::size_t t = m_tail.load(std::memory_order_acquire);
-		std::size_t n = 0;
-		while (h + n < t && n < cap)
-		{
-			const Item &item = m_buf[(h + n) & (CAP - 1)];
-			if (item.frame > frame) break;
-			out[n++] = item.byte;
-		}
-		if (n > 0) m_head.store(h + n, std::memory_order_release);
-		return n;
-	}
-	std::uint64_t dropped() const { return m_dropped.load(std::memory_order_acquire); }
-	// Initialization only, after the consumer has observed playback input disabled.
-	void discard() { m_head.store(m_tail.load(std::memory_order_acquire), std::memory_order_release); }
-	void reset()
-	{
-		m_head.store(0, std::memory_order_relaxed);
-		m_tail.store(0, std::memory_order_relaxed);
-		m_dropped.store(0, std::memory_order_relaxed);
-	}
-
-private:
-	struct Item { std::uint64_t frame; std::uint8_t byte; };
-	static constexpr std::size_t CAP = 8192;
-	Item m_buf[CAP] {};
-	std::atomic<std::size_t> m_head {0}, m_tail {0};
-	std::atomic<std::uint64_t> m_dropped {0};
-};
-
-TimedMidiRing g_host_timed_midi_ring;
+prophecy::MidiQueue<8192> g_host_timed_midi_ring;
+prophecy::MidiQueue<4096> g_host_midi_ring;
 
 // Exact-emulated-time control records for acceptance tests and host automation.
 // Keep these separate from the immediate UI queues: a future scheduled record must
@@ -292,7 +242,7 @@ template <std::size_t RecordSize, std::size_t Capacity = 256>
 class TimedControlRing
 {
 public:
-	bool push(const std::uint8_t *bytes, std::uint64_t frame)
+	bool push(const std::uint8_t *bytes, std::uint64_t frame, std::uint64_t revision = 0)
 	{
 		const std::size_t t = m_tail.load(std::memory_order_relaxed);
 		const std::size_t h = m_head.load(std::memory_order_acquire);
@@ -303,6 +253,7 @@ public:
 		}
 		Item &item = m_buf[t & (Capacity - 1)];
 		item.frame = frame;
+		item.revision = revision;
 		std::copy_n(bytes, RecordSize, item.bytes);
 		m_tail.store(t + 1, std::memory_order_release);
 		return true;
@@ -310,17 +261,23 @@ public:
 
 	bool popDue(std::uint8_t *out, std::uint64_t frame)
 	{
-		const std::size_t h = m_head.load(std::memory_order_relaxed);
-		const std::size_t t = m_tail.load(std::memory_order_acquire);
-		if (h == t) return false;
-		const Item &item = m_buf[h & (Capacity - 1)];
-		if (item.frame > frame) return false;
-		std::copy_n(item.bytes, RecordSize, out);
-		m_head.store(h + 1, std::memory_order_release);
-		return true;
+		auto h = m_head.load(std::memory_order_relaxed);
+		const auto t = m_tail.load(std::memory_order_acquire);
+		while (h != t)
+		{
+			const Item &item = m_buf[h & (Capacity - 1)];
+			if (item.frame > frame) return false;
+			const bool accept = item.revision == 0
+				|| item.revision == g_program_revision.load(std::memory_order_acquire);
+			if (accept) std::copy_n(item.bytes, RecordSize, out);
+			m_head.store(++h, std::memory_order_release);
+			if (accept) return true;
+		}
+		return false;
 	}
 
 	std::uint64_t dropped() const { return m_dropped.load(std::memory_order_acquire); }
+	void discard() { m_head.store(m_tail.load(std::memory_order_acquire), std::memory_order_release); }
 	void reset()
 	{
 		m_head.store(0, std::memory_order_relaxed);
@@ -330,13 +287,14 @@ public:
 
 private:
 	static_assert((Capacity & (Capacity - 1)) == 0, "capacity must be a power of two");
-	struct Item { std::uint64_t frame = 0; std::uint8_t bytes[RecordSize] {}; };
+	struct Item { std::uint64_t frame = 0; std::uint64_t revision = 0; std::uint8_t bytes[RecordSize] {}; };
 	Item m_buf[Capacity] {};
 	std::atomic<std::size_t> m_head {0}, m_tail {0};
 	std::atomic<std::uint64_t> m_dropped {0};
 };
 
 TimedControlRing<4> g_host_timed_panel_ring;
+TimedControlRing<4> g_host_panel_ring;
 TimedControlRing<2> g_host_timed_adin_ring;
 bool g_host_adin_prefer_rt = false; // MAME-thread-only arbitration state
 
@@ -499,6 +457,9 @@ private:
 };
 
 ProgramDumpStore g_program_dump_store;
+ProgramDumpStore g_global_dump_store;
+std::atomic<std::uint64_t> g_program_write_completed{0};
+std::atomic<std::uint64_t> g_program_write_failed{0};
 std::atomic<std::uint64_t> g_data_load_completed{0};
 std::atomic<std::uint64_t> g_identity_replies{0};
 std::atomic<std::uint64_t> g_data_load_failed{0};
@@ -578,7 +539,8 @@ static bool host_panel_pop_impl(uint8_t *row, uint8_t *bit, uint16_t *len_ms,
 	double emu_seconds)
 {
 	uint8_t rec[4];
-	if (g_host_panel_ring.pop(rec, 4) < 4)
+	if (!g_playback_input_enabled.load(std::memory_order_acquire)) return false;
+	if (!g_host_panel_ring.popDue(rec, 0))
 	{
 		const auto frame = (std::uint64_t)std::llround(
 			emu_seconds * (double)ProphecyEngine::kSampleRate);
@@ -592,6 +554,7 @@ static bool host_panel_pop_impl(uint8_t *row, uint8_t *bit, uint16_t *len_ms,
 static bool host_adin_pop_impl(uint8_t *source, uint8_t *value, double emu_seconds)
 {
 	uint8_t rec[2];
+	if (!g_playback_input_enabled.load(std::memory_order_acquire)) return false;
 	// Each queue remains genuinely SPSC: editor/timer writes never contend with the
 	// audio callback. Alternate the first choice so sustained traffic on either producer
 	// cannot starve the other; cross-thread writes have no meaningful total ordering.
@@ -618,13 +581,12 @@ static bool host_midi_pop_impl(uint8_t *out, size_t cap, size_t *n, double emu_s
 	*n = g_initialization_midi_ring.pop(out, cap);
 	if (*n != 0) return true;
 	if (!g_playback_input_enabled.load(std::memory_order_acquire)) return false;
-	*n = g_host_midi_ring.pop(out, cap);
-	if (*n == 0)
-	{
-		const auto frame = (std::uint64_t)std::llround(
-			emu_seconds * (double)ProphecyEngine::kSampleRate);
-		*n = g_host_timed_midi_ring.popDue(out, cap, frame);
-	}
+	const auto frame = (std::uint64_t)std::llround(
+		emu_seconds * (double)ProphecyEngine::kSampleRate);
+	*n = prophecy::popMidiInput(g_host_midi_ring, g_host_timed_midi_ring,
+		out, cap, frame, g_program_revision.load(std::memory_order_acquire),
+		g_program_input_pending.load(std::memory_order_acquire)
+			== g_program_input_complete.load(std::memory_order_acquire));
 	return *n > 0;
 }
 
@@ -641,10 +603,22 @@ static void host_midi_tx_impl(const uint8_t *bytes, size_t n)
 	// Also capture the current-program dump (F0 42 3n 41 40 01 <packed 7-bit> F7) for the editor's
 	// param read-back: unpack the payload (message[6..n-1)) into raw program bytes + bump version.
 	// Called per complete sysex on the MAME thread (not the audio thread), so allocation is fine.
-	if (n >= 8 && bytes[0] == 0xF0 && bytes[4] == 0x40 && bytes[n - 1] == 0xF7)
+	if (const auto program = prophecy::ProgramDocument::fromMidi(bytes, n))
 	{
 		g_firmware_channel.store(bytes[2] & 0x0f, std::memory_order_relaxed);
-		g_program_dump_store.store(korg_unpack(bytes + 6, n - 7));
+		g_program_dump_store.store({program->base.begin(), program->base.end()});
+	}
+	// The global record is 574 bytes packed seven-in-eight. Reject malformed
+	// replies before they can acknowledge a memory-protection transition.
+	if (n == 663 && bytes[0] == 0xf0 && bytes[1] == 0x42 && (bytes[2] & 0xf0) == 0x30
+		&& bytes[3] == 0x41 && bytes[4] == 0x51 && bytes[5] == 0 && bytes[n - 1] == 0xf7
+		&& std::all_of(bytes + 6, bytes + n - 1, [](auto byte) { return byte < 128; }))
+		g_global_dump_store.store(korg_unpack(bytes + 6, n - 7));
+	if ((n == 6 || n == 7) && bytes[0] == 0xf0 && bytes[1] == 0x42 && (bytes[2] & 0xf0) == 0x30
+		&& bytes[3] == 0x41 && bytes[n - 1] == 0xf7)
+	{
+		if (n == 6 && bytes[4] == 0x21) g_program_write_completed.fetch_add(1, std::memory_order_release);
+		if (bytes[4] == 0x22) g_program_write_failed.fetch_add(1, std::memory_order_release);
 	}
 	if (n == 6 && bytes[0] == 0xF0 && bytes[1] == 0x42 && bytes[3] == 0x41
 		&& bytes[4] == 0x23 && bytes[5] == 0xF7)
@@ -693,6 +667,14 @@ struct ProphecyEngine::Impl
 	std::atomic<const char*>         initialization_error{""};
 	std::atomic<std::uint64_t>       playback_origin{0};
 	std::mutex                       initialization_mutex; // non-realtime callers only
+	struct Readback
+	{
+		std::uint64_t ticket, identity, frame;
+		std::uint32_t version;
+		bool abandoned = false;
+	};
+	std::optional<Readback> readback; // initialization_mutex
+	std::uint64_t next_readback = 0;
 	std::atomic<std::uint64_t>       requested{0};
 	std::atomic<std::uint64_t>       next_request{0};
 	std::atomic<bool>                abort{false};
@@ -716,15 +698,45 @@ struct ProphecyEngine::Impl
 	std::atomic<std::uint64_t>       rejected_ui_adin{0};
 	std::atomic<std::uint64_t>       rejected_audio_adin{0};
 	std::atomic<std::uint64_t>       rejected_scheduled_adin{0};
+	std::uint16_t*                  program_ram = nullptr; // worker only
+	std::mutex                     snapshot_mutex;
+	std::atomic<bool>              snapshot_requested{false};
+	std::array<std::uint8_t, 574>    program_snapshot{};
+	std::size_t                    program_snapshot_size = 0;
+	std::size_t                    program_snapshot_requested_size = 535;
+	std::uint32_t                  program_snapshot_address = 0x4930;
+	bool                           firmware_snapshot = false; // control operations serialized
+
+	void serviceSnapshot()
+	{
+		if (!snapshot_requested.load(std::memory_order_acquire)) return;
+		program_snapshot_size = 0;
+		if (program_ram)
+		{
+			// V1.7 current-program edit buffer in the V55's little-endian SRAM.
+			// Read on the worker, between CPU execution slices, never on a host thread.
+			for (std::size_t i = 0; i < program_snapshot_requested_size; ++i)
+			{
+				const auto address = program_snapshot_address + i;
+				program_snapshot[i] = std::uint8_t(program_ram[address / 2] >> ((address & 1) * 8));
+			}
+			program_snapshot_size = program_snapshot_requested_size;
+		}
+		snapshot_requested.store(false, std::memory_order_release);
+	}
 
 	void waitForRequest(std::uint64_t frame)
 	{
 		next_request.store(frame, std::memory_order_release);
+		serviceSnapshot();
 		// Only the MAME worker sleeps. The realtime host publishes one atomic and
 		// never waits on a mutex, condition variable, or the emulator.
 		while (host_timeline && requested.load(std::memory_order_acquire) < frame
 				&& !abort.load(std::memory_order_acquire))
+		{
+			serviceSnapshot();
 			std::this_thread::sleep_for(std::chrono::microseconds(50));
+		}
 #if defined(__APPLE__)
 		const auto period = worker_period.load(std::memory_order_acquire);
 		if (host_timeline && period != applied_period)
@@ -819,6 +831,9 @@ public:
 
 	virtual void add_audio_to_recording(const int16_t *buffer, int samples_this_frame) override
 	{
+		if (!m_impl->program_ram)
+			if (auto* ram = machine().root_device().memshare("sysram"); ram && ram->bytes() >= 0x40000)
+				m_impl->program_ram = static_cast<std::uint16_t*>(ram->ptr());
 		if (buffer != nullptr && samples_this_frame > 0)
 		{
 			const auto first = m_impl->produced.load(std::memory_order_relaxed);
@@ -955,6 +970,9 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 	// A previous machine in this process must not leak queued UI traffic or observer
 	// bytes into a reconstructed engine. Reset only after acquiring the singleton.
 	g_host_midi_ring.reset();
+	g_program_revision.store(1, std::memory_order_release);
+	g_program_input_pending.store(0, std::memory_order_release);
+	g_program_input_complete.store(0, std::memory_order_release);
 	g_initialization_midi_ring.reset();
 	g_playback_input_enabled.store(!m_impl->host_timeline, std::memory_order_release);
 	g_host_midi_tx_ring.reset();
@@ -966,6 +984,9 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 	g_host_lcd_store.reset();
 	g_host_lcd_raw_store.reset();
 	g_program_dump_store.reset();
+	g_global_dump_store.reset();
+	g_program_write_completed.store(0);
+	g_program_write_failed.store(0);
 	g_data_load_completed.store(0);
 	g_identity_replies.store(0);
 	g_data_load_failed.store(0);
@@ -1087,13 +1108,33 @@ bool ProphecyEngine::waitingForInput() const
 }
 
 bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t bytes,
-	bool firmwareHandshake)
+	bool firmwareHandshake, const std::vector<prophecy::ProgramEdit>& edits)
+{
+	return runProgramOperation(state, bytes, firmwareHandshake, edits, -1);
+}
+
+bool ProphecyEngine::storeProgram(int destination, const prophecy::ProgramDocument& document)
+{
+	if (destination < 0 || destination >= 128 || !readyForPlayback()) return false;
+	const auto message = document.programMidi();
+	return runProgramOperation(message.data(), message.size(), true, document.edits, destination);
+}
+
+bool ProphecyEngine::runProgramOperation(const std::uint8_t *state, std::size_t bytes,
+	bool firmwareHandshake, const std::vector<prophecy::ProgramEdit>& edits, int destination)
 {
 	std::lock_guard initializationLock(m_impl->initialization_mutex);
 	if (!running() || !m_impl->host_timeline) return false;
+	if (!edits.empty() && (!state || !bytes || !firmwareHandshake
+		|| edits.size() > prophecy::ProgramDocument::maxEdits
+		|| std::any_of(edits.begin(), edits.end(), [](const auto& edit) { return !edit.supported(); })))
+		return false;
 	const bool wasReady = m_impl->playback_ready.exchange(false, std::memory_order_acq_rel);
-	g_playback_input_enabled.store(false, std::memory_order_release);
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	// Bound a stalled firmware operation, not the total length of an accepted
+	// edit sequence. A valid long sequence must not fail merely because earlier
+	// edits used the time allotted to a later one.
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	auto beginOperation = [&] { deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30); };
 	auto advance = [&] {
 		if (std::chrono::steady_clock::now() >= deadline) return false;
 		const auto end = (requestedFrames() / kAudioQuantum + 4) * kAudioQuantum;
@@ -1116,6 +1157,41 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 		stop();
 		return false;
 	};
+	auto identityFence = [&] {
+		const auto before = g_identity_replies.load(std::memory_order_acquire);
+		const std::uint8_t request[]{0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
+		if (!g_initialization_midi_ring.pushAll(request, sizeof(request))) return false;
+		while (g_identity_replies.load(std::memory_order_acquire) == before)
+			if (!advance()) return false;
+		return true;
+	};
+	auto queryProgram = [&](bool required) {
+		std::uint32_t before = 0, version = 0;
+		g_program_dump_store.load(nullptr, 0, &before);
+		const std::uint8_t request[]{0xf0, 0x42,
+			std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)), 0x41, 0x10, 0, 0xf7};
+		do
+		{
+			// The firmware serializes this dump before the following identity
+			// reply. Wait for both before retrying or sending another edit. A
+			// timeout-based retry can leave a second dump in flight and falsely
+			// attribute that old program to the next edit.
+			if (!g_initialization_midi_ring.pushAll(request, sizeof(request)) || !identityFence()) return false;
+			g_program_dump_store.load(nullptr, 0, &version);
+		} while (version == before && required);
+		return true;
+	};
+	if (m_impl->readback)
+	{
+		// A revision change abandons the old result, not the UART exchange.
+		// Drain it while its input is still enabled, before discarding old input
+		// and starting any new identity/query transaction for the replacement.
+		failure = "An earlier firmware readback did not finish before program restoration.";
+		while (g_identity_replies.load(std::memory_order_acquire) == m_impl->readback->identity)
+			if (!advance()) return fail();
+		m_impl->readback.reset();
+	}
+	g_playback_input_enabled.store(false, std::memory_order_release);
 	if (wasReady && state && bytes)
 	{
 		// The processor has paused its callback before a subsequent restore.
@@ -1124,6 +1200,11 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 		if (!advance()) return fail();
 		g_host_midi_ring.discard();
 		g_host_timed_midi_ring.discard();
+		g_host_panel_ring.discard();
+		g_host_timed_panel_ring.discard();
+		g_host_adin_ui_ring.discard();
+		g_host_adin_rt_ring.discard();
+		g_host_timed_adin_ring.discard();
 	}
 	if (firmwareHandshake && !wasReady)
 	{
@@ -1135,17 +1216,18 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 			|| line1[1] < '0' || line1[1] > '9' || line1[2] < '0' || line1[2] > '9'
 			|| line1[3] != ':')
 			if (!advance()) return fail();
+	}
+	if (firmwareHandshake)
+	{
 		// Universal inquiry is independent of the Korg SysEx receive filter and
 		// broadcasts across device channels. Its reply also identifies the channel.
+		// Re-discover it after a global-channel edit before any restore/WRITE.
 		failure = "Firmware did not answer its MIDI identity request. Reload the plugin to try again.";
-		const auto identity = g_identity_replies.load(std::memory_order_acquire);
-		const std::uint8_t request[] = {0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
-		if (!g_initialization_midi_ring.pushAll(request, sizeof(request))) return fail();
-		while (g_identity_replies.load(std::memory_order_acquire) == identity)
-			if (!advance()) return fail();
+		if (!identityFence()) return fail();
 	}
 	if (state && bytes)
 	{
+		beginOperation();
 		failure = "The saved program is invalid and could not be restored.";
 		if (bytes < 8 || state[0] != 0xf0 || state[1] != 0x42 || state[3] != 0x41
 			|| state[4] != 0x40 || state[bytes - 1] != 0xf7) return fail();
@@ -1163,56 +1245,137 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 		// Cache the actual edit buffer, and verify an initial restore rather than
 		// relying on an acknowledgement alone. A dump is optional for ordinary
 		// boot: disabling Korg SysEx reception must not prevent MIDI playback.
-		std::uint32_t before = 0, version = 0;
-		g_program_dump_store.load(nullptr, 0, &before);
-		const std::uint8_t request[] = {0xf0, 0x42,
-			std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)), 0x41, 0x10, 0, 0xf7};
-		// A load acknowledgement can precede completion of the firmware's
-		// patch transition. Requests received while that task is busy are
-		// discarded. Retry one complete query after a bounded response window.
-		do
-		{
-			if (std::getenv("PROPHOST_INIT_STATS")) std::fprintf(stderr, "init query at %llu\n", (unsigned long long) requestedFrames());
-			if (!g_initialization_midi_ring.pushAll(request, sizeof(request))) return fail();
-			const auto end = requestedFrames() + kSampleRate / 2;
-			do
-			{
-				if (!advance()) return fail();
-				g_program_dump_store.load(nullptr, 0, &version);
-			} while (version == before && requestedFrames() < end);
-		} while (version == before && state && bytes);
+		if (!queryProgram(state && bytes)) return fail();
 		if (state && bytes)
 		{
 			failure = "The firmware program readback did not match the saved state. Reload the plugin to try again.";
 			std::uint8_t actual[1024]{};
 			const auto size = g_program_dump_store.load(actual, sizeof(actual), nullptr);
 			const auto expected = korg_unpack(state + 6, bytes - 7);
-			if (version == before || size != expected.size()
+			if (size != expected.size()
 				|| !std::equal(expected.begin(), expected.end(), actual))
 			{
 				std::size_t first = 0;
 				while (first < std::min(size, expected.size()) && actual[first] == expected[first]) ++first;
-				std::fprintf(stderr, "program readback: version %u -> %u, bytes %zu/%zu, first difference %zu\n",
-					before, version, size, expected.size(), first);
+				std::fprintf(stderr, "program readback: bytes %zu/%zu, first difference %zu\n",
+					size, expected.size(), first);
 				return fail();
 			}
 		}
 	}
-	if (firmwareHandshake && state && bytes)
+	for (const auto& edit : edits)
 	{
-		// Drain any outstanding query through the firmware parser before notes.
-		const auto identity = g_identity_replies.load(std::memory_order_acquire);
-		const std::uint8_t request[] = {0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
-		if (!g_initialization_midi_ring.pushAll(request, sizeof(request))) return fail();
-		while (g_identity_replies.load(std::memory_order_acquire) == identity)
+		beginOperation();
+		// Restore operations against their original base. Applying a byte overlay
+		// (or replaying against a partially edited base) loses firmware side effects.
+		failure = "The firmware did not finish restoring the saved program edits.";
+		const auto message = edit.midi(g_firmware_channel.load(std::memory_order_acquire));
+		if (!g_initialization_midi_ring.pushAll(message.data(), message.size())) return fail();
+		const auto settle = requestedFrames() + kSampleRate / 10;
+		while (requestedFrames() < settle)
 			if (!advance()) return fail();
+
+		// One outstanding readback at a time, including after structural edits.
+		// This supplies the entire resulting program, including secondary fields.
+		if (!queryProgram(true)) return fail();
+	}
+	if (firmwareHandshake)
+	{
+		// Guard the supported firmware layout against its independent MIDI dump.
+		// Snapshotting must never silently serialize a different working buffer.
+		std::uint8_t dump[1024]{};
+		const auto size = g_program_dump_store.load(dump, sizeof(dump), nullptr);
+		const auto current = readProgramSnapshot();
+		failure = "The firmware program snapshot did not match its MIDI readback. Reload the plugin to try again.";
+		if (current.size() != 535 || (size != 0 && (size != current.size()
+			|| !std::equal(current.begin(), current.end(), dump)))) return fail();
+	}
+	bool stored = true;
+	if (destination >= 0)
+	{
+		// No host/editor input is enabled during this transaction. The caller
+		// joins it before restore or shutdown, so cancellation cannot strand the
+		// firmware between unprotect and cleanup. Every query has an identity
+		// boundary; an unrelated dump version cannot advance the transaction.
+		std::array<std::uint8_t, 574> original{}, observed{};
+		auto queryGlobal = [&] {
+			std::uint32_t before = 0, version = 0;
+			g_global_dump_store.load(nullptr, 0, &before);
+			const std::uint8_t query[]{0xf0, 0x42,
+				std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)), 0x41, 0x0e, 0, 0xf7};
+			if (!g_initialization_midi_ring.pushAll(query, sizeof(query)) || !identityFence()) return false;
+			return g_global_dump_store.load(observed.data(), observed.size(), &version) == observed.size()
+				&& version != before;
+		};
+		auto protect = [&](bool enabled) {
+			const std::uint8_t message[]{0xf0, 0x42,
+				std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)),
+				0x41, 0x41, 0, 42, 1, std::uint8_t(enabled), 0, 0xf7}; // global p170
+			if (!g_initialization_midi_ring.pushAll(message, sizeof(message)) || !identityFence()) return false;
+			return queryGlobal() && bool(observed[163] & 1) == enabled;
+		};
+		beginOperation();
+		stored = queryGlobal();
+		const bool haveGlobals = stored;
+		original = observed;
+		bool protectionMayHaveChanged = false;
+		try
+		{
+			if (stored && (original[163] & 1))
+			{
+				// Arm cleanup before sending: a missing reply does not prove that
+				// the firmware ignored the command.
+				protectionMayHaveChanged = true;
+				stored = protect(false);
+			}
+			if (stored)
+			{
+				beginOperation();
+				const auto acknowledged = g_program_write_completed.load(std::memory_order_acquire);
+				const auto rejected = g_program_write_failed.load(std::memory_order_acquire);
+				const std::uint8_t message[]{0xf0, 0x42,
+					std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)),
+					0x41, 0x11, std::uint8_t(destination / 64), std::uint8_t(destination % 64), 0xf7};
+				stored = g_initialization_midi_ring.pushAll(message, sizeof(message)) && identityFence()
+					&& g_program_write_completed.load(std::memory_order_acquire) != acknowledged
+					&& g_program_write_failed.load(std::memory_order_acquire) == rejected;
+			}
+		}
+		catch (...) { stored = false; }
+		// There is deliberately no return between arming cleanup and this point.
+		// Restore the original value, including an originally unprotected bank.
+		bool cleaned = true;
+		if (protectionMayHaveChanged)
+		{
+			beginOperation();
+			try { cleaned = protect(true) && observed == original; }
+			catch (...) { cleaned = false; }
+		}
+		else if (haveGlobals)
+		{
+			beginOperation();
+			try { cleaned = queryGlobal() && observed == original; }
+			catch (...) { cleaned = false; }
+		}
+		if (!cleaned)
+		{
+			failure = "WRITE failed to restore memory protection. Reload the plugin and check the protection setting.";
+			return fail();
+		}
+		if (stored)
+		{
+			const auto current = readProgramSnapshot();
+			stored = current.size() == 535
+				&& readProgramSnapshot(0x20a10 + std::uint32_t(destination) * 535) == current;
+		}
 	}
 	if (std::getenv("PROPHOST_INIT_STATS")) std::fprintf(stderr, "init ready at %llu\n", (unsigned long long) requestedFrames());
-	m_impl->initialization_error.store("", std::memory_order_release);
+	m_impl->firmware_snapshot = firmwareHandshake;
+	m_impl->initialization_error.store(stored ? "" : "The firmware did not confirm the program WRITE.", std::memory_order_release);
 	m_impl->playback_origin.store(requestedFrames(), std::memory_order_release);
 	g_playback_input_enabled.store(true, std::memory_order_release);
 	m_impl->playback_ready.store(true, std::memory_order_release);
-	return true;
+	return stored;
 }
 
 void ProphecyEngine::setHostBlockFrames(std::uint32_t frames)
@@ -1260,7 +1423,7 @@ std::size_t ProphecyEngine::readAtFrame(std::uint64_t first, float *left,
 	return m_impl->timeline.read(first, left, right, frames);
 }
 
-bool ProphecyEngine::pushMidi(const std::uint8_t *bytes, std::size_t n)
+bool ProphecyEngine::pushMidi(const std::uint8_t *bytes, std::size_t n, std::uint64_t revision)
 {
 	if (bytes == nullptr || n == 0) return true;
 	if (!ownsMachineSlot() || (m_impl->host_timeline && !m_impl->playback_ready.load(std::memory_order_acquire)))
@@ -1268,7 +1431,7 @@ bool ProphecyEngine::pushMidi(const std::uint8_t *bytes, std::size_t n)
 		m_impl->rejected_immediate_midi.fetch_add(n, std::memory_order_relaxed);
 		return false;
 	}
-	return g_host_midi_ring.pushAllCounted(bytes, n);
+	return g_host_midi_ring.push(bytes, n, 0, revision);
 }
 
 bool ProphecyEngine::pushMidiAtFrame(const std::uint8_t *bytes, std::size_t n, std::uint64_t frame)
@@ -1294,7 +1457,7 @@ std::uint64_t ProphecyEngine::droppedScheduledMidiBytes() const
 	return rejected + (ownsMachineSlot() ? g_host_timed_midi_ring.dropped() : 0);
 }
 
-void ProphecyEngine::pushPanelPulse(int row, int bit, int len_ms)
+void ProphecyEngine::pushPanelPulse(int row, int bit, int len_ms, std::uint64_t revision)
 {
 	if (!ownsMachineSlot() || (m_impl->host_timeline && !m_impl->playback_ready.load(std::memory_order_acquire))) return;
 	if (row < 0 || row > 7 || bit < 0 || bit > 7) return;
@@ -1303,7 +1466,7 @@ void ProphecyEngine::pushPanelPulse(int row, int bit, int len_ms)
 	const std::uint8_t rec[4] = {
 		(std::uint8_t) row, (std::uint8_t) bit,
 		(std::uint8_t) (len_ms & 0xff), (std::uint8_t) ((len_ms >> 8) & 0xff) };
-	g_host_panel_ring.pushAll(rec, 4);
+	g_host_panel_ring.push(rec, 0, revision);
 }
 
 bool ProphecyEngine::pushPanelPulseAtFrame(int row, int bit, int len_ms, std::uint64_t frame)
@@ -1456,6 +1619,114 @@ std::size_t ProphecyEngine::latestProgramData(std::uint8_t *out, std::size_t cap
 	return g_program_dump_store.load(out, cap, version);
 }
 
+bool ProphecyEngine::programReadbackPending()
+{
+	std::lock_guard lock(m_impl->initialization_mutex);
+	if (m_impl->readback && m_impl->readback->abandoned
+		&& g_identity_replies.load(std::memory_order_acquire) != m_impl->readback->identity)
+		m_impl->readback.reset();
+	return m_impl->readback.has_value();
+}
+
+std::uint64_t ProphecyEngine::beginProgramReadback()
+{
+	std::lock_guard lock(m_impl->initialization_mutex);
+	if (!readyForPlayback()) return 0;
+	if (m_impl->readback && m_impl->readback->abandoned
+		&& g_identity_replies.load(std::memory_order_acquire) != m_impl->readback->identity)
+		m_impl->readback.reset();
+	if (m_impl->readback) return 0;
+	std::uint32_t version = 0;
+	g_program_dump_store.load(nullptr, 0, &version);
+	const auto identity = g_identity_replies.load(std::memory_order_acquire);
+	const std::uint8_t request[]{0xf0, 0x42,
+		std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)), 0x41, 0x10, 0, 0xf7,
+		0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
+	// This read-only exchange survives program revisions so cancellation can
+	// drain it. The program owner separately rejects the obsolete result.
+	if (!pushMidi(request, sizeof(request))) return 0;
+	const auto ticket = ++m_impl->next_readback;
+	m_impl->readback = Impl::Readback{ticket, identity, producedFrames(), version};
+	return ticket;
+}
+
+std::uint64_t ProphecyEngine::firmwareControlErrors() const
+{
+	return ownsMachineSlot() ? g_data_load_failed.load(std::memory_order_acquire)
+		+ g_program_write_failed.load(std::memory_order_acquire) : 0;
+}
+
+ProphecyEngine::ReadbackStatus ProphecyEngine::pollProgramReadback(std::uint64_t ticket,
+	std::vector<std::uint8_t>& raw)
+{
+	std::lock_guard lock(m_impl->initialization_mutex);
+	raw.clear();
+	if (!m_impl->readback || m_impl->readback->ticket != ticket || m_impl->readback->abandoned)
+		return ReadbackStatus::Invalid;
+	if (!running()) return ReadbackStatus::Failed;
+	if (g_identity_replies.load(std::memory_order_acquire) == m_impl->readback->identity)
+		return producedFrames() - m_impl->readback->frame > 5 * kSampleRate
+			? ReadbackStatus::Failed : ReadbackStatus::Pending;
+	std::uint32_t version = 0;
+	std::uint8_t bytes[535]{};
+	const auto size = g_program_dump_store.load(bytes, sizeof(bytes), &version);
+	const bool complete = version != m_impl->readback->version && size == sizeof(bytes);
+	m_impl->readback.reset();
+	if (!complete) return ReadbackStatus::NoReply;
+	raw.assign(bytes, bytes + size);
+	return ReadbackStatus::Complete;
+}
+
+void ProphecyEngine::cancelProgramReadback(std::uint64_t ticket)
+{
+	std::lock_guard lock(m_impl->initialization_mutex);
+	if (m_impl->readback && m_impl->readback->ticket == ticket) m_impl->readback->abandoned = true;
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotProgram()
+{
+	if (!readyForPlayback() || !m_impl->firmware_snapshot) return {};
+	return readProgramSnapshot();
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotStoredProgram(int program)
+{
+	if (program < 0 || program >= 128 || !readyForPlayback() || !m_impl->firmware_snapshot) return {};
+	return readProgramSnapshot(0x20a10 + std::uint32_t(program) * 535);
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotGlobals()
+{
+	if (!readyForPlayback() || !m_impl->firmware_snapshot) return {};
+	return readProgramSnapshot(0x3e4, 574);
+}
+
+std::vector<std::uint8_t> ProphecyEngine::readProgramSnapshot(std::uint32_t address, std::size_t bytes)
+{
+	if (bytes > m_impl->program_snapshot.size() || address > 0x40000 || bytes > 0x40000 - address) return {};
+	// Only callers serialize. The audio worker copies into fixed storage and
+	// publishes completion; it never waits for a host mutex or allocates here.
+	std::lock_guard lock(m_impl->snapshot_mutex);
+	if (!running()) return {};
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	auto wait = [&] {
+		while (m_impl->snapshot_requested.load(std::memory_order_acquire))
+		{
+			if (!running() || std::chrono::steady_clock::now() >= deadline) return false;
+			std::this_thread::sleep_for(std::chrono::microseconds(50));
+		}
+		return true;
+	};
+	// Finish a timed-out prior request before reusing its transfer storage.
+	if (!wait()) return {};
+	m_impl->program_snapshot_address = address;
+	m_impl->program_snapshot_requested_size = bytes;
+	m_impl->snapshot_requested.store(true, std::memory_order_release);
+	if (!wait()) return {};
+	return {m_impl->program_snapshot.begin(),
+		m_impl->program_snapshot.begin() + (std::ptrdiff_t)m_impl->program_snapshot_size};
+}
+
 std::size_t ProphecyEngine::latestArpeggioPatternData(std::uint8_t *out, std::size_t cap,
 	std::uint32_t *version, int *pattern) const
 {
@@ -1471,3 +1742,21 @@ std::size_t ProphecyEngine::latestArpeggioPatternData(std::uint8_t *out, std::si
 std::size_t   ProphecyEngine::available() const     { return m_impl->host_timeline ? m_impl->timeline.available() : m_impl->ring.count() / kChannels; }
 std::size_t   ProphecyEngine::ringFrames() const    { return m_impl->ring.capacity_frames(); }
 std::uint64_t ProphecyEngine::producedFrames() const { return m_impl->produced.load(); }
+
+void ProphecyEngine::setProgramRevision(std::uint64_t revision)
+{
+	if (!ownsMachineSlot()) return;
+	auto previous = g_program_revision.load(std::memory_order_relaxed);
+	while (previous < revision && !g_program_revision.compare_exchange_weak(
+		previous, revision, std::memory_order_release, std::memory_order_relaxed)) {}
+}
+
+void ProphecyEngine::setProgramInputPending(std::uint64_t sequence)
+{
+	if (ownsMachineSlot()) g_program_input_pending.store(sequence, std::memory_order_release);
+}
+
+void ProphecyEngine::acknowledgeProgramInput(std::uint64_t sequence)
+{
+	if (ownsMachineSlot()) g_program_input_complete.store(sequence, std::memory_order_release);
+}

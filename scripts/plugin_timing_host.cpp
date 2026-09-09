@@ -167,7 +167,12 @@ bool loadScenarioFile(const char *path, double rate, std::vector<Event> &dawEven
 		else if (op == "send_arp_pattern_data") action.kind = EditorActionKind::SendArpPatternData;
 		else if (op == "rename_patch") action.kind = EditorActionKind::RenamePatch;
 		else if (op == "send_macro") action.kind = EditorActionKind::SendMacro;
-		else if (op == "write_patch") action.kind = EditorActionKind::WritePatch;
+		else if (op == "write_patch")
+		{
+			if (action.args.size() != 1 || action.args[0] < 0 || action.args[0] >= 128)
+			{ error = "write_patch needs an explicit destination (0..127)"; return false; }
+			action.kind = EditorActionKind::WritePatch;
+		}
 		else if (op == "panel_pulse") action.kind = EditorActionKind::PanelPulse;
 		else if (op == "set_adin") action.kind = EditorActionKind::SetAdin;
 		else if (op == "set_wheel2") action.kind = EditorActionKind::SetWheel2;
@@ -602,7 +607,7 @@ int main(int argc, char **argv)
 			else if (event.kind == EditorActionKind::SendMacro)
 				processor.sendMacro(juce::String(event.text));
 			else if (event.kind == EditorActionKind::WritePatch)
-				processor.writePatch();
+				processor.writePatch(event.args[0]);
 			else if (event.kind == EditorActionKind::PanelPulse && needArgs(2))
 				processor.panelPulse(event.args[0], event.args[1]);
 			else if (event.kind == EditorActionKind::SetAdin && needArgs(2))

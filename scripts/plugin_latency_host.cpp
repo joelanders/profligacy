@@ -114,8 +114,8 @@ struct LocalAU
 
 int main(int argc, char** argv)
 {
-    if (argc < 12 || argc > 13) {
-        std::fprintf(stderr, "usage: latency_host PLUGIN OUTPUT_PREFIX RATE BLOCK SECONDS REPREPARE_SECONDS fixed|variable OFFLINE_AFTER_SECONDS fast|paced|prefetch REALTIME_AFTER_SECONDS MIDI_FILE [INITIAL_STATE_FILE]\n");
+    if (argc < 12 || argc > 14) {
+        std::fprintf(stderr, "usage: latency_host PLUGIN OUTPUT_PREFIX RATE BLOCK SECONDS REPREPARE_SECONDS fixed|variable OFFLINE_AFTER_SECONDS fast|paced|prefetch REALTIME_AFTER_SECONDS MIDI_FILE [INITIAL_STATE_FILE|- [SAVE_INTERVAL_BLOCKS]]\n");
         return 2;
     }
     const juce::String pluginPath(argv[1]), prefix(argv[2]);
@@ -131,6 +131,11 @@ int main(int argc, char** argv)
     if (realtimeAfter >= 0 && (!prefetch || realtimeAfter <= offlineAfter || realtimeAfter >= seconds)) return 2;
     if (!std::isfinite(rate) || !std::isfinite(seconds) || rate < 8000 || block < 16
         || seconds <= 0 || seconds * rate > std::numeric_limits<int>::max()) return 2;
+    const bool initialStateRequested = argc > 12 && std::string(argv[12]) != "-";
+    const int saveInterval = argc > 13 ? std::atoi(argv[13]) : 0;
+    // Stop between offline blocks and save on the message thread, as a host may
+    // do. These captures test PCM preservation, not realtime deadline timing.
+    if (saveInterval < 0 || (saveInterval > 0 && (offlineAfter != 0 || paceOffline || prefetch || realtimeAfter >= 0))) return 2;
     const bool isAU = pluginPath.endsWith(".component");
     if (prefetch && (isAU || offlineAfter < 0 || offlineAfter >= seconds)) return 2;
     std::vector<LatencyEvent> events;
@@ -187,7 +192,7 @@ int main(int argc, char** argv)
     instance->setNonRealtime(false);
     instance->prepareToPlay(rate, block);
     bool initialStateVerified = false;
-    if (argc > 12) {
+    if (initialStateRequested) {
         juce::MemoryBlock state, confirmed;
         if (!juce::File(argv[12]).loadFileAsData(state) || state.isEmpty()) return 2;
         // Hosting wrappers serialize their own containers. Passing raw processor
@@ -260,6 +265,8 @@ int main(int argc, char** argv)
     blocks.reserve((size_t)(total / std::max(1, block/2) + 100));
     std::atomic<bool> done{false};
     std::atomic<bool> processFailed{false};
+    std::atomic<bool> saveRequested{false};
+    int stateSaves = 0;
     std::thread render([&] {
         Steinberg::Vst::IAudioProcessor* nativeProcessor = nullptr;
         using Clock = std::chrono::steady_clock;
@@ -373,11 +380,25 @@ int main(int argc, char** argv)
                 std::chrono::duration<double, std::milli>(after-before).count(),
                 instance->getLatencySamples(), !offline || paceOffline});
             start += count;
+            if (saveInterval > 0 && blocks.size() % (std::size_t)saveInterval == 0) {
+                saveRequested.store(true, std::memory_order_release);
+                while (saveRequested.load(std::memory_order_acquire))
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
         }
         if (nativeProcessor) nativeProcessor->release();
         done.store(true);
     });
-    while (!done.load()) juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+    while (!done.load()) {
+        if (saveRequested.load(std::memory_order_acquire)) {
+            juce::MemoryBlock state;
+            instance->getStateInformation(state);
+            if (state.isEmpty()) processFailed.store(true);
+            ++stateSaves;
+            saveRequested.store(false, std::memory_order_release);
+        }
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+    }
     render.join();
     const int finalLatency = instance->getLatencySamples();
     instance->releaseResources();
@@ -414,7 +435,9 @@ int main(int argc, char** argv)
     receipt->setProperty("pace_offline", paceOffline);
     receipt->setProperty("prefetch", prefetch);
     receipt->setProperty("realtime_after_seconds", realtimeAfter);
-    receipt->setProperty("initial_state_requested", argc > 12);
+    receipt->setProperty("initial_state_requested", initialStateRequested);
+    receipt->setProperty("state_save_interval_blocks", saveInterval);
+    receipt->setProperty("state_saves", stateSaves);
     receipt->setProperty("initial_state_verified", initialStateVerified);
     receipt->setProperty("process_failed", processFailed.load());
     receipt->setProperty("initial_latency_samples", initialLatency);

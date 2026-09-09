@@ -5,4 +5,13 @@
 namespace prophecy::fake {
 void holdInitialization(bool hold);
 bool initializationWaiting();
+void holdImmediateInput(bool hold);
+bool immediateInputWaiting();
+void holdReadbackCompletion(bool hold);
+void rejectReadbacks(bool reject);
+void rejectSnapshots(bool reject);
+void holdWriteCleanup(bool hold);
+bool writeCleanupWaiting();
+void rejectWrites(bool reject);
+bool memoryProtected();
 }

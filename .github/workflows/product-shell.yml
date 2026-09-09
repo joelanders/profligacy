@@ -46,10 +46,13 @@ jobs:
           ProphecyArtifactHost
           ProphecyPluginTimelineTest
           ProphecyPluginStateTest
+          ProphecyProgramControlTest
+          ProphecyProgramIntentTest
+          ProphecyMidiQueueTest
           ProphecyAudioTimelineTest
           ProphecyLatencySequenceTest
       - name: Verify processor timeline and state lifecycle
-        run: ctest --test-dir build --output-on-failure -R '^(audio_timeline|plugin_timeline|plugin_state|latency_sequence)$'
+        run: ctest --test-dir build --output-on-failure -R '^(audio_timeline|editor_manifest|midi_queue|program_intent|program_pending_state|program_live_state|program_selection_state|program_midi_state|program_midi_edits|program_midi_channel|program_edit_validation|program_write_state|program_control|plugin_timeline|plugin_state|latency_sequence)$'
       - name: Verify native arm64 products
         run: |
           for binary in \
@@ -129,10 +132,13 @@ jobs:
           ProphecyArtifactHost
           ProphecyPluginTimelineTest
           ProphecyPluginStateTest
+          ProphecyProgramControlTest
+          ProphecyProgramIntentTest
+          ProphecyMidiQueueTest
           ProphecyAudioTimelineTest
           ProphecyLatencySequenceTest
       - name: Verify processor timeline and state lifecycle
-        run: ctest --test-dir build -C Release --output-on-failure -R '^(audio_timeline|plugin_timeline|plugin_state|latency_sequence)$'
+        run: ctest --test-dir build -C Release --output-on-failure -R '^(audio_timeline|editor_manifest|midi_queue|program_intent|program_pending_state|program_live_state|program_selection_state|program_midi_state|program_midi_edits|program_midi_channel|program_edit_validation|program_write_state|program_control|plugin_timeline|plugin_state|latency_sequence)$'
       - name: Open the standalone editor through WebView2
         shell: pwsh
         run: |

@@ -58,10 +58,16 @@ static int activeAudioTest()
 	midi.ensureSize(4096);
 	const std::uint8_t note[] = {0x90, 60, 64};
 	const std::uint8_t cc[] = {0xb0, 1, 64};
+	const std::uint8_t ignoredProgram[] = {0xc1, 9};
+	const std::uint8_t ignoredBank[] = {0xb1, 32, 1};
+	const auto parameter = prophecy::ProgramEdit{1, 'R'}.midi();
 	std::array<std::uint8_t, 600> sysex{};
 	sysex[0] = 0xf0; sysex[1] = 0x7d; sysex.back() = 0xf7;
 	midi.addEvent(note, sizeof(note), 0);
 	midi.addEvent(cc, sizeof(cc), 0);
+	midi.addEvent(ignoredBank, sizeof(ignoredBank), 0);
+	midi.addEvent(ignoredProgram, sizeof(ignoredProgram), 0);
+	midi.addEvent(parameter.data(), (int)parameter.size(), 0);
 	midi.addEvent(sysex.data(), (int) sysex.size(), 0);
 	juce::AudioBuffer<float> block(2, 512);
 	for (double rate : {48000.0, 44100.0, 96000.0, 192000.0})
@@ -92,7 +98,7 @@ static int activeAudioTest()
 			}
 		}
 	}
-	std::puts("PASS active realtime allocation guard: PCM reads, resampling, MIDI SysEx and timed ADIN");
+	std::puts("PASS active realtime allocation guard: PCM, resampling, program-edit inbox, MIDI SysEx and timed ADIN");
 	return 0;
 }
 
