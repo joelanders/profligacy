@@ -74,6 +74,8 @@ class HeadlessMidiStressTest(unittest.TestCase):
         arp_load = next(action for action in scenario["actions"]
                         if action["op"] == "send_arp_pattern_data")
         self.assertEqual(128, len(arp_load["bytes"]))
+        write = next(action for action in scenario["actions"] if action["op"] == "write_patch")
+        self.assertEqual([3], write["args"])
 
     def test_four_pairwise_shards_cover_all_ordered_family_pairs(self) -> None:
         observed: set[tuple[str, str]] = set()

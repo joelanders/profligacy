@@ -6,14 +6,22 @@
 //
 #pragma once
 
+#include "audio_timeline.h"
+#include "program_state.h"
+#include "program_midi.h"
+
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "prophecy_engine.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -24,7 +32,7 @@ public:
 	~ProphecyAudioProcessor() override;
 
 	void prepareToPlay(double sampleRate, int samplesPerBlock) override;
-	void releaseResources() override {}
+	void releaseResources() override;
 	bool isBusesLayoutSupported(const BusesLayout &layouts) const override;
 	void processBlock(juce::AudioBuffer<float> &, juce::MidiBuffer &) override;
 
@@ -39,13 +47,11 @@ public:
 	std::uint64_t droppedScheduledMidiBytes() const
 	{ return m_engine.droppedScheduledMidiBytes(); }
 	std::uint64_t droppedImmediateMidiBytes() const
-	{ return m_engine.droppedImmediateMidiBytes()
-		+ m_contendedImmediateMidiBytes.load(std::memory_order_relaxed); }
+	{ return m_engine.droppedImmediateMidiBytes(); }
 	std::uint64_t droppedUiAdinEvents() const
-	{ return m_engine.droppedUiAdinEvents()
-		+ m_contendedUiAdinEvents.load(std::memory_order_relaxed); }
+	{ return m_engine.droppedUiAdinEvents(); }
 	std::uint64_t droppedAudioAdinEvents() const
-	{ return m_engine.droppedAudioAdinEvents(); }
+	{ return m_engine.droppedAudioAdinEvents() + m_engine.droppedScheduledAdinEvents(); }
 	std::uint64_t oversizedAudioBlocks() const
 	{ return m_oversizedAudioBlocks.load(std::memory_order_relaxed); }
 	struct DiagnosticSnapshot
@@ -101,7 +107,10 @@ public:
 	double hostSampleRate() const { return m_hostSampleRate; }
 	// ROM picker: where the engine's firmware comes from. If no valid ROM set is found
 	// the engine stays unbooted and the editor shows the first-run picker.
-	bool romOk() const { return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active; }
+	bool romOk() const { return m_engine.readyForPlayback(); }
+	const char* initializationError() const { return m_engine.initializationError(); }
+	const char* programStateError() const { return m_programState.error(); }
+	prophecy::ProgramState::Status programStateStatus() const { return m_programState.status(); }
 	bool instanceUnavailable() const
 	{
 		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Unavailable;
@@ -110,7 +119,8 @@ public:
 	bool setRomDirFromUser(const juce::File &dir); // validate + persist + boot; false if invalid
 	bool maybeBootEngine();                        // boot once iff a valid ROM set is locatable
 	void selectPatch(int program);       // bank-select + program change (0..127 = A00..B63)
-	// Raw MIDI from the editor (faceplate keybed note on/off etc.) into the emulated UART.
+	// Non-realtime editor input. Full-program imports and dump inquiries use the
+	// program owner; performance MIDI (for example the keybed) enters the UART.
 	void sendMidi(const std::uint8_t *bytes, std::size_t n);
 	// Faceplate front-panel controls, through the engine's host seams (drained on the
 	// MAME thread at 1 kHz; SCANQ reports pulses to the firmware as real scan codes).
@@ -151,20 +161,20 @@ public:
 	void renamePatch(const juce::String &name);
 	// Quick-init patch-shaping macros (Init / Saw / Filter THRU / Bypass FX), ported from
 	// the MAME-tree GUI (src/tools/korgprophecy_gui + scripts/korgprophecy_macros.py). Each
-	// is a batch of Parameter Change writes delivered through a paced ParamBurst (the
+	// is a batch of Parameter Change writes delivered through the shared command queue (the
 	// firmware drops back-to-back sysex). OSC1-specific params are ExID-packed (paramId =
 	// (1<<12)|param); a p154 (OSC Set) write, if present, is re-asserted LAST so the live
 	// DSP1 engine reloads cleanly (a std-osc write right after a reconfig gets clobbered).
 	void sendMacro(const juce::String &name);
-	// Commit the edit buffer to its program slot, exactly as the hardware does it:
-	// unprotect (global p170=0) -> WRITE (panel row 0 bit 0) -> ENTER to select the
-	// target -> ENTER to confirm -> re-protect. The firmware refuses the write while
-	// protected ("*WRITE ERROR<Program Memory is protected>"), so the unprotect is
-	// mandatory, not optional. Scheduled on
-	// a timer because the panel pulses must land in order, ~0.4 s apart, on the MAME
-	// thread's scan cadence. Verified end-to-end (name reaches sysram).
-	void writePatch();
-	bool writeInProgress() const { return m_writeInProgress.load(std::memory_order_acquire); }
+	// Accept an explicit persistent WRITE of the current document to A00..B63.
+	// Returns a request ID, or zero if rejected. A queued request can be cancelled;
+	// a started transaction is joined, including protection cleanup, before restore
+	// or destruction. It briefly pauses playback while firmware performs the WRITE.
+	enum class WriteStatus { Idle, Pending, Succeeded, Failed, Cancelled };
+	std::uint64_t writePatch(int destination);
+	bool writeInProgress() const { return writeStatus() == WriteStatus::Pending; }
+	WriteStatus writeStatus() const { return m_writeStatus.load(std::memory_order_acquire); }
+	std::uint64_t writeRequestId() const { return m_writeRequestId.load(std::memory_order_acquire); }
 	// Copy the emulator's live HD44780 text (two NUL-terminated lines, >= 41 bytes each) for the
 	// editor. Message-thread only. Returns false if the firmware has not drawn anything yet.
 	bool getLcd(char *line1, char *line2, std::size_t cap) const { return m_engine.latestLcd(line1, line2, cap); }
@@ -185,59 +195,97 @@ public:
 	{ return m_engine.latestArpeggioPatternData(out, cap, version, pattern); }
 
 private:
-	// Drives writePatch()'s unprotect -> WRITE -> ENTER -> ENTER -> re-protect sequence off the
-	// message thread's timer, so the firmware sees the panel pulses as distinct presses.
-	class WriteSequence : private juce::Timer
-	{
-	public:
-		explicit WriteSequence(ProphecyAudioProcessor &p) : m_proc(p) {}
-		~WriteSequence() override { stopTimer(); }
-		void start() { if (!isTimerRunning()) { m_step = 0; startTimer(400); } }
-	private:
-		void timerCallback() override;
-		ProphecyAudioProcessor &m_proc;
-		int m_step = 0;
-	};
-	WriteSequence      m_writeSeq { *this };
-	std::atomic<bool>  m_writeInProgress { false };
+	friend struct ProphecyProgramControlTestAccess;
+	// Declared before timers/engine so their dependencies outlive them.
+	prophecy::ProgramState m_programState;
+	std::condition_variable_any m_controlWake;
+	std::thread m_controlThread;
+	bool m_controlStopping = false; // control mutex
+	void runProgramControl();
+	prophecy::ProgramMidiRouting m_programMidiRouting; // control mutex
+	prophecy::ProgramMidiInbox m_programMidiInbox;
+	bool m_drainingProgramInput = false; // control mutex; nested requests reuse this prefix
+	void drainProgramInput(); // control mutex
+	void receiveProgramInput(const std::uint8_t* bytes, std::size_t size);
+	bool forwardHostMidi(const std::uint8_t* bytes, std::size_t size, std::uint64_t frame);
+	void replaceProgramRevision();
+	void cancelEditorWork();
+	bool requestProgramEdits(const std::vector<prophecy::ProgramEdit>& edits, int intervalMs = 75);
+	bool firmwareControlAllowed(); // control mutex; admission precedes queue publication
+	bool enqueueFirmwareMidi(int key, const std::uint8_t* bytes, std::size_t size, bool bindChannel = true);
+	void firmwareControlAccepted();
+	std::uint64_t m_firmwareErrorStart = 0; // control mutex; captured before an admitted batch
 
-	// Paced param-burst sender: the firmware drops sysex messages that arrive
-	// back-to-back at line rate while it is busy (verified: mid-burst rename chars
-	// lost with a Motion patch in the edit buffer). One param per tick, the way a
-	// real editor paces sysex. A new start() replaces any burst still in flight.
-	class ParamBurst : private juce::Timer
+	// Control work runs on one owned thread. In particular, stopping a JUCE
+	// message timer does not join a callback already selected for dispatch.
+	class ProgramTimer
 	{
 	public:
-		explicit ParamBurst(ProphecyAudioProcessor &p) : m_proc(p) {}
-		~ParamBurst() override { stopTimer(); }
-		void start(std::vector<std::pair<int, int>> paramValues, int intervalMs = 15)
+		explicit ProgramTimer(ProphecyAudioProcessor& p) : m_proc(p) {}
+		virtual ~ProgramTimer() = default; // owner joins before destroying tasks
+		void cancel() { stopTimer(); cancelled(); }
+		using Clock = std::chrono::steady_clock;
+		Clock::time_point due() const { return m_running ? m_due : Clock::time_point::max(); }
+		void service(Clock::time_point now)
 		{
-			stopTimer();
-			m_items = std::move(paramValues);
-			m_next = 0;
-			startTimer(intervalMs);
+			if (!m_running || now < m_due) return;
+			m_due = now + m_interval;
+			if (!current()) { cancel(); return; }
+			run();
 		}
-		bool cancel()
+	protected:
+		void startTimer(int milliseconds)
 		{
-			const bool wasRunning = isTimerRunning();
-			stopTimer();
-			m_items.clear();
-			m_next = 0;
-			return wasRunning;
+			m_interval = std::chrono::milliseconds(std::max(1, milliseconds));
+			m_due = Clock::now() + m_interval;
+			m_running = true;
+			m_proc.m_controlWake.notify_one();
+		}
+		void stopTimer() { m_running = false; m_proc.m_controlWake.notify_one(); }
+		bool isTimerRunning() const { return m_running; }
+		void startForProgram(int milliseconds)
+		{
+			m_revision = m_proc.m_programState.revision();
+			startTimer(milliseconds);
+		}
+		bool current() const { return m_revision == m_proc.m_programState.revision(); }
+		virtual void run() = 0;
+		virtual void cancelled() {}
+	private:
+		ProphecyAudioProcessor& m_proc;
+		std::uint64_t m_revision = 0; // control mutex
+		Clock::time_point m_due{};
+		std::chrono::milliseconds m_interval{1};
+		bool m_running = false;
+	};
+
+	class ProgramWrite : public ProgramTimer
+	{
+	public:
+		explicit ProgramWrite(ProphecyAudioProcessor &p) : ProgramTimer(p), m_proc(p) {}
+		using ProgramTimer::cancel;
+		void start(int destination, const prophecy::ProgramDocument& document)
+		{
+			m_document = document;
+			m_destination = destination;
+			m_token = m_proc.m_programState.token();
+			startForProgram(10);
 		}
 	private:
-		void timerCallback() override
+		void run() override;
+		void cancelled() override
 		{
-			if (m_next >= m_items.size()) { stopTimer(); return; }
-			m_proc.setParam(m_items[m_next].first, m_items[m_next].second);
-			m_next++;
+			if (m_proc.writeInProgress()) m_proc.m_writeStatus.store(WriteStatus::Cancelled, std::memory_order_release);
 		}
 		ProphecyAudioProcessor &m_proc;
-		std::vector<std::pair<int, int>> m_items;
-		std::size_t m_next = 0;
+		prophecy::ProgramDocument m_document;
+		prophecy::ProgramState::Token m_token;
+		int m_destination = 0;
 	};
-	ParamBurst         m_renameBurst { *this };
-	ParamBurst         m_macroBurst  { *this }; // quick-init patch macros (sendMacro)
+	ProgramWrite m_writeSeq{*this};
+	std::atomic<WriteStatus> m_writeStatus{WriteStatus::Idle};
+	std::atomic<std::uint64_t> m_writeRequestId{0};
+
 
 	// Serialized editor commands share one bounded, coalescing path. The
 	// firmware can wedge its internal H8/V55 link if a patch load overlaps a burst
@@ -245,85 +293,137 @@ private:
 	// byte. MIDI edit commands and panel presses are therefore paced and held behind
 	// the patch-load barrier. ADIN writes model physical controls polled by the
 	// firmware, so they bypass this serial-command pacer.
-	class EditorCommandPacer : private juce::Timer
+	class EditorCommandPacer : public ProgramTimer
 	{
 	public:
-		explicit EditorCommandPacer(ProphecyAudioProcessor &p) : m_proc(p) {}
+		explicit EditorCommandPacer(ProphecyAudioProcessor &p) : ProgramTimer(p), m_proc(p) {}
+		using ProgramTimer::cancel;
 		~EditorCommandPacer() override { stopTimer(); }
+		bool enqueueProgramEdits(const std::vector<prophecy::ProgramEdit>& edits, int intervalMs)
+		{
+			if (!current()) cancel();
+			if (edits.size() > kCapacity - m_queue.size())
+			{
+				m_dropped.fetch_add(edits.size(), std::memory_order_relaxed);
+				m_proc.m_programState.fail(prophecy::ProgramState::Error::Capacity);
+				return false;
+			}
+			// Prepare both changes before publishing either. Allocation failure or
+			// queue exhaustion must not accept only the beginning of a macro/name.
+			auto queued = m_queue;
+			auto through = m_proc.m_programState.token().through;
+			for (const auto& edit : edits)
+			{
+				Command command;
+				command.revision = m_proc.m_programState.revision();
+				command.through = ++through;
+				command.intervalMs = intervalMs;
+				const auto midi = edit.midi();
+				command.bytes.assign(midi.begin(), midi.end());
+				queued.push_back(std::move(command));
+			}
+			if (!m_proc.m_programState.accept(edits)) return false;
+			m_queue.swap(queued);
+			if (!isTimerRunning()) startForProgram(1);
+			return true;
+		}
 		void holdForPatchLoad(int milliseconds)
 		{
 			m_cancelled.fetch_add(m_queue.size(), std::memory_order_relaxed);
 			m_queue.clear();
 			m_holdUntilMs = juce::Time::getMillisecondCounterHiRes()
 				+ (double)std::max(milliseconds, 0);
-			startTimer(10);
+			startForProgram(10);
 		}
 		void extendPatchLoad(int milliseconds)
 		{
 			m_holdUntilMs = std::max(m_holdUntilMs,
 				juce::Time::getMillisecondCounterHiRes()
 					+ (double)std::max(milliseconds, 0));
-			if (!isTimerRunning()) startTimer(10);
+			if (!isTimerRunning()) startForProgram(10);
 		}
-		void enqueueMidi(int key, const std::uint8_t *bytes, std::size_t size)
+		bool enqueueMidi(int key, const std::uint8_t *bytes, std::size_t size, bool bindChannel = true)
 		{
-			if (bytes == nullptr || size == 0) return;
-			for (auto it = m_queue.rbegin(); it != m_queue.rend(); ++it)
+			if (!current()) cancel();
+			if (bytes == nullptr || size == 0) return false;
+			const bool orderedProgramEdit = size == 11 && bytes[0] == 0xf0 && bytes[4] == 0x41 && bytes[5] == 1;
+			// Only consecutive assignments may replace one another. Crossing an
+			// intervening command can erase a required unprotect/load/protect order.
+			if (!orderedProgramEdit && key >= 0 && !m_queue.empty())
 			{
-				if (key >= 0 && it->kind == Command::Kind::Midi && it->key == key)
+				auto& previous = m_queue.back();
+				if (previous.kind == Command::Kind::Midi && previous.key == key && previous.bindChannel == bindChannel)
 				{
-					it->bytes.assign(bytes, bytes + size);
+					previous.bytes.assign(bytes, bytes + size);
 					m_coalesced.fetch_add(1, std::memory_order_relaxed);
-					return;
+					return true;
 				}
 			}
 			if (m_queue.size() >= kCapacity)
 			{
 				m_dropped.fetch_add(1, std::memory_order_relaxed);
-				return;
+				return false;
 			}
 			Command command;
 			command.kind = Command::Kind::Midi;
 			command.key = key;
+			command.bindChannel = bindChannel;
+			command.revision = m_proc.m_programState.revision();
 			command.bytes.assign(bytes, bytes + size);
 			m_queue.push_back(std::move(command));
-			if (!isTimerRunning()) startTimer(1);
+			if (!isTimerRunning() || !current()) startForProgram(1);
+			return true;
 		}
-		void enqueuePanel(int row, int bit)
+		bool enqueuePanel(int row, int bit)
 		{
+			if (!current()) cancel();
 			if (m_queue.size() >= kCapacity)
 			{
 				m_dropped.fetch_add(1, std::memory_order_relaxed);
-				return;
+				return false;
 			}
 			Command command;
 			command.kind = Command::Kind::Panel;
+			command.revision = m_proc.m_programState.revision();
 			command.a = row;
 			command.b = bit;
 			m_queue.push_back(std::move(command));
-			if (!isTimerRunning()) startTimer(1);
+			if (!isTimerRunning() || !current()) startForProgram(1);
+			return true;
 		}
 		bool busy() const
 		{
-			return !m_queue.empty()
-				|| juce::Time::getMillisecondCounterHiRes() < m_holdUntilMs
-				|| m_proc.patchLoadBarrierActive();
+			return !m_queue.empty() || !settled();
+		}
+		bool settled() const
+		{
+			return juce::Time::getMillisecondCounterHiRes() >= m_holdUntilMs
+				&& m_proc.m_engine.producedFrames() >= m_notBeforeFrame
+				&& m_proc.m_engine.producedFrames() >= m_confirmNotBeforeFrame
+				&& !m_proc.patchLoadBarrierActive();
 		}
 		std::uint64_t sent() const { return m_sent.load(std::memory_order_relaxed); }
 		std::uint64_t coalesced() const { return m_coalesced.load(std::memory_order_relaxed); }
 		std::uint64_t cancelled() const { return m_cancelled.load(std::memory_order_relaxed); }
 		std::uint64_t dropped() const { return m_dropped.load(std::memory_order_relaxed); }
 		std::size_t pending() const { return m_queue.size(); }
+		prophecy::ProgramState::Token delivered() const { return m_delivered; }
 	private:
 		struct Command
 		{
 			enum class Kind { Midi, Panel } kind = Kind::Midi;
 			int key = -1;
+			std::uint64_t revision = 0;
+			std::uint64_t through = 0;
 			int a = 0, b = 0;
+			int intervalMs = kIntervalMs;
+			bool bindChannel = true;
 			std::vector<std::uint8_t> bytes;
 		};
-		void timerCallback() override
+		void run() override
 		{
+			if (m_proc.m_engine.programReadbackPending()) { startTimer(10); return; }
+			if (m_proc.m_programState.restoreRequired()) { startTimer(10); return; }
 			const double now = juce::Time::getMillisecondCounterHiRes();
 			if (m_proc.patchLoadBarrierActive())
 			{
@@ -340,24 +440,64 @@ private:
 				return;
 			}
 			if (m_queue.empty()) { stopTimer(); return; }
+			if (m_proc.m_engine.producedFrames() < m_notBeforeFrame)
+			{
+				// Wall time passes while a DAW is stopped. Keep unsent operations in
+				// the savable queue until the firmware has actually progressed.
+				startTimer(10);
+				return;
+			}
 			Command &command = m_queue.front();
+			const auto intervalMs = command.intervalMs;
 			bool accepted = true;
 			if (command.kind == Command::Kind::Midi)
-				accepted = m_proc.pushImmediateMidi(command.bytes.data(), command.bytes.size());
+			{
+				// Editor commands address this synth, regardless of its configured
+				// MIDI channel. Bind at delivery because an earlier queued global
+				// edit may have changed that channel after this command was accepted.
+				const auto channel = m_proc.m_programMidiRouting.channelNumber();
+				if (command.bindChannel && command.bytes.front() == 0xf0 && command.bytes.size() >= 3)
+					command.bytes[2] = std::uint8_t(0x30 | channel);
+				else if (command.bindChannel)
+					for (auto& byte : command.bytes)
+						if (byte >= 0x80 && byte < 0xf0) byte = std::uint8_t((byte & 0xf0) | channel);
+				accepted = m_proc.pushImmediateMidi(command.bytes.data(), command.bytes.size(), command.revision);
+			}
 			else
-				m_proc.m_engine.pushPanelPulse(command.a, command.b);
+			{
+				m_proc.m_engine.pushPanelPulse(command.a, command.b, 75, command.revision);
+				// A panel key can start a program load. Confirm only after the same
+				// firmware settling interval used for an explicit patch selection.
+				m_confirmNotBeforeFrame = m_proc.m_engine.producedFrames()
+					+ std::uint64_t(kPatchLoadSettleSeconds * ProphecyEngine::kSampleRate);
+			}
 			if (accepted)
 			{
+				if (command.through != 0) m_delivered = {command.revision, command.through};
+				m_notBeforeFrame = m_proc.m_engine.producedFrames()
+					+ std::uint64_t(ProphecyEngine::kSampleRate) * std::uint64_t(intervalMs) / 1000;
 				m_queue.pop_front();
 				m_sent.fetch_add(1, std::memory_order_relaxed);
 			}
-			startTimer(accepted ? kIntervalMs : 25);
+			startTimer(accepted ? intervalMs : 25);
+		}
+		void cancelled() override
+		{
+			m_cancelled.fetch_add(m_queue.size(), std::memory_order_relaxed);
+			m_queue.clear();
+			m_holdUntilMs = 0;
+			m_notBeforeFrame = 0;
+			m_confirmNotBeforeFrame = 0;
+			m_delivered = {};
 		}
 		static constexpr std::size_t kCapacity = 256;
 		static constexpr int kIntervalMs = 75;
 		ProphecyAudioProcessor &m_proc;
 		std::deque<Command> m_queue;
 		double m_holdUntilMs = -1.0e9;
+		std::uint64_t m_notBeforeFrame = 0;
+		std::uint64_t m_confirmNotBeforeFrame = 0;
+		prophecy::ProgramState::Token m_delivered;
 		std::atomic<std::uint64_t> m_sent { 0 };
 		std::atomic<std::uint64_t> m_coalesced { 0 };
 		std::atomic<std::uint64_t> m_cancelled { 0 };
@@ -376,19 +516,20 @@ private:
 	static constexpr double kPatchLoadSettleSeconds = 2.0;
 	static constexpr double kPatchSelectMinIntervalMs = 2500.0;
 	bool sendPatchNow(int program);
-	class PatchSelectDelay : private juce::Timer
+	class PatchSelectDelay : public ProgramTimer
 	{
 	public:
-		explicit PatchSelectDelay(ProphecyAudioProcessor &p) : m_proc(p) {}
+		explicit PatchSelectDelay(ProphecyAudioProcessor &p) : ProgramTimer(p), m_proc(p) {}
+		using ProgramTimer::cancel;
 		~PatchSelectDelay() override { stopTimer(); }
-		bool pending() const { return isTimerRunning(); }
+		bool pending() const { return isTimerRunning() && current(); }
 		void schedule(int program)
 		{
 			m_program = program;
-			startTimer(500);
+			startForProgram(500);
 		}
 	private:
-		void timerCallback() override
+		void run() override
 		{
 			stopTimer();
 			if (!m_proc.sendPatchNow(m_program)) startTimer(25);
@@ -398,100 +539,37 @@ private:
 	};
 	PatchSelectDelay   m_patchSelectDelay { *this };
 
-	// Current-program dumps share the firmware MIDI task with Program Change. Keep one
-	// editor request in flight, wait for a recently selected patch to finish loading,
-	// and retry a request the firmware discarded while busy. The WebView and headless
-	// editor-stress scenario both enter through requestProgramDump(), so this is the one
-	// production scheduling policy rather than a second test-only approximation.
-	class ProgramDumpSync : private juce::Timer
+	// Readback belongs to the delivered edit prefix. New intent may be accepted
+	// while it runs, but the command queue waits until that exchange is drained.
+	class ProgramDumpSync : public ProgramTimer
 	{
 	public:
-		explicit ProgramDumpSync(ProphecyAudioProcessor &p) : m_proc(p) {}
-		~ProgramDumpSync() override { stopTimer(); }
+		explicit ProgramDumpSync(ProphecyAudioProcessor& p) : ProgramTimer(p), m_proc(p) {}
+		using ProgramTimer::cancel;
 		std::uint64_t request(int delayMs)
 		{
-			std::uint8_t byte = 0;
-			std::uint32_t currentVersion = 0;
-			m_proc.getProgramData(&byte, 1, &currentVersion);
-			if (isTimerRunning())
-			{
-				// Reuse a genuinely pending transaction, but do not suppress a new manual
-				// refresh merely because the completed transaction's 800 ms check has not run.
-				if (!m_sent.load(std::memory_order_acquire)
-						|| currentVersion <= m_baselineVersion.load(std::memory_order_acquire))
-					return m_generation.load(std::memory_order_acquire);
-				stopTimer();
-			}
-			m_baselineVersion.store(currentVersion, std::memory_order_release);
-			m_generation.store(m_nextGeneration.fetch_add(1, std::memory_order_relaxed) + 1,
-				std::memory_order_release);
+			if (!current()) cancel();
+			if (isTimerRunning()) return m_generation;
+			++m_generation;
 			m_attempts = 0;
-			m_sent.store(false, std::memory_order_release);
-			if (delayMs > 0) startTimer(delayMs);
-			else sendRequest();
-			return m_generation.load(std::memory_order_acquire);
+			startForProgram(std::max(1, delayMs));
+			return m_generation;
 		}
-		void cancel()
-		{
-			stopTimer();
-			m_attempts = 0;
-			m_sent.store(false, std::memory_order_release);
-		}
-		std::uint64_t observe(std::uint32_t version) const
-		{
-			const std::uint64_t generation = m_generation.load(std::memory_order_acquire);
-			if (generation != 0 && m_sent.load(std::memory_order_acquire)
-					&& version > m_baselineVersion.load(std::memory_order_acquire))
-			{
-				std::uint64_t completed = m_completedGeneration.load(std::memory_order_relaxed);
-				while (completed < generation && !m_completedGeneration.compare_exchange_weak(
-					completed, generation, std::memory_order_release, std::memory_order_relaxed)) {}
-			}
-			return m_completedGeneration.load(std::memory_order_acquire);
-		}
+		std::uint64_t completed() const { return m_completed.load(std::memory_order_acquire); }
 	private:
-		void sendRequest()
+		void run() override;
+		void cancelled() override
 		{
-			if (m_proc.m_editorCommandPacer.busy()) { startTimer(100); return; }
-			const bool firstAttempt = m_attempts == 0;
-			++m_attempts;
-			(void)m_proc.sendProgramDumpNow();
-			if (firstAttempt)
-			{
-				// A request may have waited behind a patch load for seconds. Refresh
-				// the baseline immediately after the causal enqueue boundary so an
-				// obsolete reply that arrived during that delay cannot complete this
-				// generation. The firmware cannot round-trip the new serial request
-				// before this same-thread snapshot.
-				std::uint8_t byte = 0;
-				std::uint32_t version = 0;
-				m_proc.getProgramData(&byte, 1, &version);
-				m_baselineVersion.store(version, std::memory_order_release);
-			}
-			m_sent.store(true, std::memory_order_release);
-			startTimer(800);
+			if (m_ticket) m_proc.m_engine.cancelProgramReadback(m_ticket);
+			m_ticket = 0;
 		}
-		void timerCallback() override
-		{
-			if (!m_sent.load(std::memory_order_acquire)) { sendRequest(); return; }
-			std::uint8_t byte = 0;
-			std::uint32_t version = 0;
-			m_proc.getProgramData(&byte, 1, &version);
-			if (observe(version) >= m_generation.load(std::memory_order_acquire))
-				{ stopTimer(); return; }
-			if (m_attempts >= 3) { stopTimer(); return; }
-			sendRequest();
-		}
-		ProphecyAudioProcessor &m_proc;
-		std::atomic<std::uint32_t> m_baselineVersion { 0 };
-		int m_attempts = 0;
-		std::atomic<bool> m_sent { false };
-		std::atomic<std::uint64_t> m_nextGeneration { 0 };
-		std::atomic<std::uint64_t> m_generation { 0 };
-		mutable std::atomic<std::uint64_t> m_completedGeneration { 0 };
+		ProphecyAudioProcessor& m_proc;
+		std::uint64_t m_generation = 0, m_ticket = 0;
+		unsigned m_attempts = 0;
+		prophecy::ProgramState::Token m_prefix;
+		std::atomic<std::uint64_t> m_completed{0};
 	};
-	ProgramDumpSync    m_programDumpSync { *this };
-	bool sendProgramDumpNow();
+	ProgramDumpSync m_programDumpSync{*this};
 	double             m_lastPatchSendMs = -1.0e9;
 
 	// CC->ADIN remap table (target per CC number; 0 = Off = pass through raw). Written on
@@ -507,46 +585,39 @@ private:
 	std::atomic<std::uint8_t> m_wheel2Pos { 0x80 };
 	std::array<std::atomic<std::uint8_t>, 16> m_controllerDisplayValues {};
 	void publishControllerDisplayValue(int source, int value);
-	void handleMappedCc(int cc, int value, CcTarget target); // audio thread
-	// Host state callbacks are not guaranteed to share the JUCE message thread with the
-	// editor. Serialize those non-RT producers with one try only: contention drops the
-	// complete message/event and increments a metric. processBlock uses separate rings and
-	// never touches these flags, so the audio thread cannot block or spin behind UI work.
-	std::atomic_flag m_immediateMidiProducer = ATOMIC_FLAG_INIT;
-	std::atomic_flag m_uiAdinProducer = ATOMIC_FLAG_INIT;
-	std::atomic<std::uint64_t> m_contendedImmediateMidiBytes { 0 };
-	std::atomic<std::uint64_t> m_contendedUiAdinEvents { 0 };
-	bool pushImmediateMidi(const std::uint8_t *bytes, std::size_t n)
+	void handleMappedCc(int cc, int value, CcTarget target, std::uint64_t frame); // audio thread
+	// The control mutex serializes editor and host-state producers. Audio input
+	// uses separate SPSC queues and never takes that mutex.
+	bool pushImmediateMidi(const std::uint8_t *bytes, std::size_t n, std::uint64_t revision = 0)
 	{
-		if (m_immediateMidiProducer.test_and_set(std::memory_order_acquire))
+		if (!m_engine.pushMidi(bytes, n, revision)) return false;
+		if (n == 11 && bytes[0] == 0xf0 && bytes[4] == 0x41 && bytes[5] == 0)
+			(void)m_programMidiRouting.receive(bytes, n);
+		else if (n == 663 && bytes[4] == 0x51 && m_programMidiRouting.sysex(bytes, n))
 		{
-			m_contendedImmediateMidiBytes.fetch_add(n, std::memory_order_relaxed);
-			return false;
+			std::vector<std::uint8_t> globals;
+			for (std::size_t i = 6; i < n - 1;)
+			{
+				const auto high = bytes[i++];
+				for (int bit = 0; bit < 7 && i < n - 1; ++bit)
+					globals.push_back(std::uint8_t(bytes[i++] | (((high >> bit) & 1) << 7)));
+			}
+			(void)m_programMidiRouting.reset(globals);
 		}
-		const bool accepted = m_engine.pushMidi(bytes, n);
-		m_immediateMidiProducer.clear(std::memory_order_release);
-		return accepted;
+		return true;
 	}
 	bool pushUiAdin(int source, int value)
-	{
-		if (m_uiAdinProducer.test_and_set(std::memory_order_acquire))
-		{
-			m_contendedUiAdinEvents.fetch_add(1, std::memory_order_relaxed);
-			return false;
-		}
-		const bool accepted = m_engine.pushAdin(source, value);
-		m_uiAdinProducer.clear(std::memory_order_release);
-		return accepted;
-	}
+	{ return m_engine.pushAdin(source, value); }
 
 	ProphecyEngine     m_engine;
 	std::atomic<bool>  m_started { false };
 	juce::String       m_romPath;             // resolved ROM dir once booted
 	juce::String       m_nvramPath;           // resolved NVRAM dir once booted
 	double             m_hostSampleRate = 48000.0;
-	std::uint64_t      m_hostMidiFrameCursor = 0;
+	prophecy::SampleTimeline m_timeline;
+	std::uint64_t      m_timelineHostFrame = 0;
+	bool               m_timelineAttached = false;
 	int                m_preparedMaxBlock = 0;
-	std::vector<float> m_scratchL, m_scratchR; // mono/resampler output; allocated in prepare
 	std::atomic<std::uint64_t> m_oversizedAudioBlocks { 0 };
 	// Lock-free counters sampled by the optional GUI diagnostic logger. The audio callback
 	// only updates atomics; all formatting and file I/O stays on the message thread.
@@ -566,16 +637,15 @@ private:
 	bool               m_skipStateRestore = false;
 
 	// host!=48k resampling (engine is authoritative at 48 kHz)
-	juce::LagrangeInterpolator m_resampler[2];
-	std::vector<float>         m_rsIn[2];       // leftover 48k input, preallocated
-	int                        m_rsInCount = 0;
+	std::vector<float>         m_rsIn[2];       // absolute native input window, preallocated
 
-	// DAW patch persistence (current-program SysEx dump). setState stashes a dump to inject
-	// once the machine has booted; processBlock does the one-shot injection. The standalone
-	// intentionally ignores this dump and boots from explicitly written synth NVRAM instead.
-	std::vector<std::uint8_t> m_pendingState;
-	std::atomic<bool>         m_pendingReady { false };
-	std::atomic<bool>         m_pendingInjected { false };
+	// Host lifecycle/state operations are serialized off the audio thread.
+	// A retained program becomes confirmed only after firmware readback succeeds.
+	bool bootEngine();
+	bool restoreProgram(bool firmwareHandshake = true);
+	void loadProgramDocument(prophecy::ProgramDocument document); // control mutex and ProcessingPause held
+	std::atomic<bool> m_processingPaused{false};
+	std::atomic<bool> m_callbackAccess{false};
 
 	JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ProphecyAudioProcessor)
 };

@@ -3,6 +3,7 @@
 /build-cmake/
 /build-clean-package/
 /build-real/
+/build-shell/
 /console_host
 /console_host-*
 /lifecycle_host*

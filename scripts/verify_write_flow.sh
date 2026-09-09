@@ -2,8 +2,9 @@
 #
 # verify_write_flow.sh — prove the preset write path end-to-end, on a THROWAWAY bank.
 #
-# Drives exactly what ProphecyAudioProcessor::writePatch() does, over the console
-# harness: rename the edit buffer (Program Name Char = g1 p1..p3), unprotect
+# Legacy hardware-panel protocol probe over the console harness. The plugin's
+# owned WRITE transaction is tested by ProphecyProgramControlTest --write.
+# This probe renames the edit buffer (Program Name Char = g1 p1..p3), unprotects
 # (global p170 = 0), WRITE (panel row 0 bit 0), ENTER (row 1 bit 6) — then reads the
 # name back out of the resulting sysram file.
 #

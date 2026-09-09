@@ -1,9 +1,10 @@
-// No-ROM regression test for the ProphecyAudioProcessor real-time callback contract.
+// Realtime allocation and queue guards; --active uses an isolated firmware fixture.
 #include "PluginProcessor.h"
 
 #include <juce_events/juce_events.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -48,8 +49,153 @@ void operator delete[](void *p) noexcept { std::free(p); }
 void operator delete(void *p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
 
-int main()
+static int activeAudioTest()
 {
+	juce::ScopedJuceInitialiser_GUI juceInitialiser;
+	ProphecyAudioProcessor processor;
+	processor.setCcMap(1, (int) ProphecyAudioProcessor::CcTarget::Wheel1);
+	juce::MidiBuffer empty, midi;
+	midi.ensureSize(4096);
+	const std::uint8_t note[] = {0x90, 60, 64};
+	const std::uint8_t cc[] = {0xb0, 1, 64};
+	const std::uint8_t ignoredProgram[] = {0xc1, 9};
+	const std::uint8_t ignoredBank[] = {0xb1, 32, 1};
+	const auto parameter = prophecy::ProgramEdit{1, 'R'}.midi();
+	std::array<std::uint8_t, 600> sysex{};
+	sysex[0] = 0xf0; sysex[1] = 0x7d; sysex.back() = 0xf7;
+	midi.addEvent(note, sizeof(note), 0);
+	midi.addEvent(cc, sizeof(cc), 0);
+	midi.addEvent(ignoredBank, sizeof(ignoredBank), 0);
+	midi.addEvent(ignoredProgram, sizeof(ignoredProgram), 0);
+	midi.addEvent(parameter.data(), (int)parameter.size(), 0);
+	midi.addEvent(sysex.data(), (int) sysex.size(), 0);
+	juce::AudioBuffer<float> block(2, 512);
+	for (double rate : {48000.0, 44100.0, 96000.0, 192000.0})
+	for (int prepared : {64, 128, 512})
+	{
+		processor.prepareToPlay(rate, prepared);
+		if (!processor.diagnosticSnapshot().engineRunning)
+		{
+			std::fprintf(stderr, "active allocation test requires a running engine and isolated ROM/NVRAM fixture\n");
+			return 1;
+		}
+		for (int count : {1, 17, 64, 127, 511, 512})
+		{
+			// Prime the same real worker and ring off the watched realtime callback.
+			// This avoids turning a no-allocation test into a scheduling benchmark.
+			block.setSize(2, prepared, false, false, true);
+			processor.setNonRealtime(true);
+			for (int prime = 0; prime < 16; ++prime) processor.processBlock(block, empty);
+			processor.setNonRealtime(false);
+			block.setSize(2, std::min(count, prepared), false, false, true);
+			const auto before = processor.diagnosticSnapshot();
+			if (!processWithoutAllocation(processor, block, midi)
+				|| processor.diagnosticSnapshot().audioEngineFrames <= before.audioEngineFrames
+				|| processor.diagnosticSnapshot().audioUnderrunFrames != before.audioUnderrunFrames)
+			{
+				std::fprintf(stderr, "active read/resampling allocated or failed to consume PCM: rate=%.0f block=%d\n", rate, count);
+				return 1;
+			}
+		}
+	}
+	std::puts("PASS active realtime allocation guard: PCM, resampling, program-edit inbox, MIDI SysEx and timed ADIN");
+	return 0;
+}
+
+// Native private-fixture regression: restoration across host lifecycle orders
+// must be acknowledged and read back before a note at host sample 144 (3ms).
+static int initialStateTest(const char* path, const std::string& order)
+{
+	juce::ScopedJuceInitialiser_GUI juceInitialiser;
+	juce::MemoryBlock state;
+	if (!juce::File(path).loadFileAsData(state) || state.getSize() < 8) return 2;
+	const auto* bytes = static_cast<const std::uint8_t*>(state.getData());
+	std::vector<std::uint8_t> expected;
+	for (std::size_t i = 6; i + 1 < state.getSize(); )
+	{
+		const auto high = bytes[i++];
+		for (int bit = 0; bit < 7 && i + 1 < state.getSize(); ++bit)
+			expected.push_back((std::uint8_t) (bytes[i++] | (((high >> bit) & 1) << 7)));
+	}
+	ProphecyAudioProcessor processor;
+	processor.setNonRealtime(true);
+	if (order != "before" && order != "after" && order != "zero" && order != "reprepare"
+		&& order != "before-reprepare" && order != "released" && order != "live") return 2;
+	if (order == "before") processor.setStateInformation(state.getData(), (int) state.getSize());
+	processor.prepareToPlay(48000, 128);
+	juce::MidiBuffer midi;
+	juce::AudioBuffer<float> audio(2, order == "zero" ? 0 : 128);
+	if (order == "live") midi.addEvent(juce::MidiMessage::noteOn(1, 48, (juce::uint8) 64), 127);
+	if (order != "before" && order != "after") processor.processBlock(audio, midi);
+	midi.clear();
+	if (order == "reprepare" || order == "released")
+		processor.releaseResources();
+	if (order == "reprepare") processor.prepareToPlay(48000, 128);
+	if (order != "before") processor.setStateInformation(state.getData(), (int) state.getSize());
+	if (order == "before-reprepare" || order == "released") processor.prepareToPlay(48000, 128);
+	std::uint8_t actual[1024]{};
+	std::uint32_t version = 0;
+	const auto count = processor.getProgramData(actual, sizeof(actual), &version);
+	if (!processor.romOk() || !version || count != expected.size()
+		|| !std::equal(expected.begin(), expected.end(), actual))
+	{
+		std::fprintf(stderr, "initial state readback failed: %s\n", processor.initializationError());
+		return 1;
+	}
+	juce::MemoryBlock saved;
+	processor.getStateInformation(saved);
+	if (saved.getSize() < state.getSize() || std::memcmp(
+		static_cast<const char*>(saved.getData()) + saved.getSize() - state.getSize(),
+		state.getData(), state.getSize()) != 0)
+	{
+		std::fprintf(stderr, "save before the first callback lost the restored program\n");
+		return 1;
+	}
+	audio.setSize(2, 128);
+	int onset = -1;
+	for (int first = 0; first < 48000; first += 128)
+	{
+		midi.clear();
+		if (144 >= first && 144 < first + 128)
+			midi.addEvent(juce::MidiMessage::noteOn(1, 60, (juce::uint8) 64), 144 - first);
+		if (9744 >= first && 9744 < first + 128)
+			midi.addEvent(juce::MidiMessage::noteOff(1, 60), 9744 - first);
+		processor.processBlock(audio, midi);
+		for (int i = 0; i < 128; ++i)
+		{
+			if (!std::isfinite(audio.getSample(0, i)) || !std::isfinite(audio.getSample(1, i))) return 1;
+			if (onset < 0 && std::max(std::abs(audio.getSample(0, i)), std::abs(audio.getSample(1, i))) >= .0001f)
+				onset = first + i;
+		}
+	}
+	if (onset < 144 + processor.getLatencySamples() || onset > 144 + 4800)
+	{
+		std::fprintf(stderr, "initial restored note onset invalid: %d\n", onset);
+		return 1;
+	}
+	std::printf("PASS state lifecycle %s: %zu-byte readback, immediate save, first note %.3fms\n",
+		order.c_str(), count, (onset - 144) / 48.0);
+	return 0;
+}
+
+int main(int argc, char** argv)
+{
+	if (argc == 3 && std::string(argv[1]) == "--export-initial-state")
+	{
+		juce::ScopedJuceInitialiser_GUI juceInitialiser;
+		ProphecyAudioProcessor processor;
+		processor.prepareToPlay(48000, 128);
+		juce::MemoryBlock state;
+		processor.getStateInformation(state);
+		if (!processor.romOk() || state.getSize() <= 6) return 1;
+		const auto* bytes = static_cast<const std::uint8_t*>(state.getData());
+		const std::size_t offset = 6 + 2 * std::size_t(bytes[4]); // PRP2 mapping and wheel preference
+		if (offset >= state.getSize()) return 1;
+		return juce::File(argv[2]).replaceWithData(bytes + offset, state.getSize() - offset) ? 0 : 1;
+	}
+	if (argc == 4 && std::string(argv[1]) == "--initial-state")
+		return initialStateTest(argv[2], argv[3]);
+	if (argc == 2 && std::string(argv[1]) == "--active") return activeAudioTest();
 #if defined(_WIN32)
 	_putenv_s("PROPHECY_FORCE_NO_ROM", "1");
 #else

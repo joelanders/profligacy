@@ -384,7 +384,7 @@ def editor_boundary_scenario(seed: int, phase_seconds: float) -> dict[str, objec
         {"at": 22.650 + offset, "op": "send_midi", "bytes": [0x80, 60, 0]},
         {"at": 22.401 + offset, "op": "daw_midi", "bytes": [0x90, 64, 80]},
         {"at": 22.651 + offset, "op": "daw_midi", "bytes": [0x80, 64, 0]},
-        {"at": 24.000 + offset, "op": "write_patch"},
+        {"at": 24.000 + offset, "op": "write_patch", "args": [3]},
         {"at": 28.500 + offset, "op": "request_program_dump"},
     ]
     actions.sort(key=lambda action: float(action["at"]))
@@ -472,12 +472,14 @@ def editor_storm_scenario(seed: int, phase_seconds: float, seconds: float,
     last_program_dump = -100.0
     last_arp_dump = -100.0
     wrote = False
+    requested_patch = 0
     when = start
     while when < end:
         roll = rng.randrange(100)
         action: dict[str, object]
         if roll < 8:
-            action = {"op": "select_patch", "args": [rng.randrange(128)]}
+            requested_patch = rng.randrange(128)
+            action = {"op": "select_patch", "args": [requested_patch]}
         elif roll < 36:
             action = {"op": "set_param",
                       "args": [rng.choice(program_params), rng.randrange(200)]}
@@ -525,7 +527,7 @@ def editor_storm_scenario(seed: int, phase_seconds: float, seconds: float,
             action = {"op": "send_arp_pattern_data", "args": [rng.randrange(10)],
                       "bytes": [rng.randrange(256) for _ in range(128)]}
         elif roll == 97 and not wrote and seconds >= 40.0:
-            action = {"op": "write_patch"}
+            action = {"op": "write_patch", "args": [requested_patch]}
             wrote = True
         else:
             action = {"op": "set_param",

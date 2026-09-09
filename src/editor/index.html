@@ -634,6 +634,12 @@
   .romgate .pick{display:inline-block; padding:9px 18px; border-radius:6px; cursor:pointer;
     background:var(--accent); color:#06120f; font-weight:700; font-size:12px}
   .romgate .err{margin-top:12px; font-size:10px; color:var(--red); min-height:14px}
+  .programstatus{position:fixed; bottom:12px; left:12px; z-index:45;
+    max-width:calc(100vw - 48px); padding:8px 12px; border:1px solid var(--line);
+    border-radius:5px; background:#333630; color:var(--accent); font:11px/1.5 var(--mono)}
+  .programstatus.error{color:#ffb8ad}
+  .pbrowser button.pwrite{background:none; border:0}
+  .pbrowser button.pwrite:disabled{cursor:wait; opacity:.7}
 </style>
 </head>
 <body>
@@ -650,6 +656,7 @@
   <span class="vchip" id="chip_dev" title="developer panel tools">Dev</span>
 </div>
 
+<div class="programstatus" id="programstatus" role="status" aria-live="polite" hidden></div>
 <aside class="layoutlab" id="layoutlab" hidden>
   <div class="llhead">
     <span class="lltitle">PANEL LAYOUT LAB</span><span class="llspacer"></span>
@@ -744,7 +751,7 @@
   <div class="pcard">
     <div class="phead"><span>Program Select</span>
       <span class="prename" id="brename" title="rename the edit buffer (WRITE commits it)">&#9998; RENAME</span>
-      <span class="pwrite" id="bwrite" title="overwrite the current program slot with the edit buffer">&#9679; WRITE</span>
+      <button type="button" class="pwrite" id="bwrite" title="overwrite the displayed program slot with the edit buffer">&#9679; WRITE</button>
       <input class="pnamein" id="bnamein" maxlength="16" spellcheck="false" hidden>
       <span class="pclose" id="bclose">&times;</span></div>
     <div class="plist" id="blist"></div>
@@ -822,6 +829,13 @@
         ()=>{ inFlight=false; });
     },periodMs);
   }
+  pollNativeLatest('getProgramStateStatus',250,result=>{
+    if(!result)return;
+    const status=document.getElementById('programstatus');
+    status.hidden=!result.pending&&!result.error;
+    status.classList.toggle('error',!!result.error);
+    status.textContent=result.error||(result.pending?'Program changes pending':'');
+  });
 
   // ============================ panel definition ============================
   // All knobs target sysex program group 1; C++ setParam() supplies the group byte. p=param id.
@@ -2626,30 +2640,36 @@
   };
   document.getElementById('bclose').onclick = () => browser.classList.remove('show');
   const bwrite = document.getElementById('bwrite');
-  let writeArmed = 0;
-  async function writePatchAndWait(){
-    const started=!!(await nativeAsync('writePatch'));
-    if(!started)return {started:false,completed:false};
-    for(let poll=0;poll<80;poll++){
+  let writeArmed = -1;
+  async function writePatchAndWait(destination=patch){
+    const request=await nativeAsync('writePatch',destination);
+    if(!request)return {started:false,completed:false};
+    while(document.body.contains(bwrite)){
       await new Promise(resolve=>setTimeout(resolve,100));
-      if(!(await nativeAsync('isWriteInProgress')))
-        return {started:true,completed:true};
+      const result=await nativeAsync('getWriteStatus');
+      if(!result||result.request!==request)return {started:true,completed:false};
+      if(!result.pending)return {started:true,completed:result.succeeded,error:result.error};
     }
     return {started:true,completed:false};
   }
   bwrite.onclick = async () => {
-    if (!writeArmed){
-      writeArmed = 1;
+    if (writeArmed !== patch){
+      writeArmed = patch;
       bwrite.classList.add('arm');
       bwrite.textContent = '\u25CF CONFIRM OVERWRITE ' + bankName(patch);
-      setTimeout(() => { if (writeArmed === 1){ writeArmed = 0; bwrite.classList.remove('arm'); bwrite.textContent = '\u25CF WRITE'; } }, 4000);
+      const armed=writeArmed;
+      setTimeout(() => { if (writeArmed === armed){ writeArmed = -1; bwrite.classList.remove('arm'); bwrite.textContent = '\u25CF WRITE'; } }, 4000);
       return;
     }
-    writeArmed = 0;
+    const destination=writeArmed;
+    writeArmed = -1;
     bwrite.classList.remove('arm');
+    bwrite.disabled = true;
     bwrite.textContent = '\u25CF WRITING\u2026';
-    const state=await writePatchAndWait(); // unprotect -> WRITE -> ENTER -> re-protect
-    bwrite.textContent = state.completed ? '\u25CF WRITE' : '\u25CF WRITE STATUS UNKNOWN';
+    const state=await writePatchAndWait(destination);
+    bwrite.disabled = false;
+    bwrite.textContent = state.completed ? '\u25CF WRITE' : '\u25CF WRITE FAILED';
+    bwrite.title = state.completed ? '' : (state.error||'The WRITE was cancelled or could not be confirmed.');
     if(state.completed)syncPatch();
   };
 
@@ -3440,12 +3460,10 @@
       window.native = en;
       document.getElementById('chip_panel').click();
 
-      // 5d) editor WRITE path through the real bridge (writePatch -> WriteSequence timer
-      // -> unprotect -> WRITE -> ENTER -> re-protect). RELOAD A00 from its slot first
+      // 5d) editor WRITE through the owned firmware transaction. Reload A00 first
       // (select away and back) so the 5c matrix edits are discarded and the write is a
       // true no-op (A00's stored content back to A00 — no persistent change). Then check
-      // the firmware accepted it: the LCD must not show WRITE ERROR (which it would if the
-      // unprotect step failed).
+      // the firmware acknowledged it and the destination/protection readbacks matched.
       const writeReloadA01=await stableProgram(1,'A01');
       const writeReloadA00=await stableProgram(0,'A00');
       if(writeReloadA01.stablePolls<5||writeReloadA00.stablePolls<5)
@@ -3755,6 +3773,10 @@
     nativeAsync("getRomStatus").then(r => {
       if (r && r.ok) romgate.classList.remove('show');
       else           romgate.classList.add('show');
+      if (r && r.error) {
+        romerr.textContent = r.error;
+        romgate.querySelector('h2').textContent = 'Unable to start Profligacy';
+      }
       if (r && r.selftest && !selfTestStarted){
         selfTestStarted = true;
         // No-ROM mode boots no engine, so run the first-run-overlay checks instead of the
