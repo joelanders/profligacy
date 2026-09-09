@@ -29,6 +29,7 @@
 #include "prophecy_engine.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -693,6 +694,19 @@ struct ProphecyEngine::Impl
 	std::atomic<const char*>         initialization_error{""};
 	std::atomic<std::uint64_t>       playback_origin{0};
 	std::mutex                       initialization_mutex; // non-realtime callers only
+	struct Exchange
+	{
+		std::uint64_t ticket = 0, identity = 0, frame = 0;
+		std::uint32_t version = 0;
+	} exchange; // initialization_mutex; a timed-out exchange still owns its replies
+	std::uint64_t next_exchange = 0;
+	std::uint16_t* program_ram = nullptr; // worker only
+	std::mutex snapshot_mutex;
+	std::atomic<bool> snapshot_requested{false};
+	std::atomic<bool> program_snapshot_enabled{false};
+	std::array<std::uint8_t, 574> snapshot{};
+	std::uint32_t snapshot_address = 0;
+	std::size_t snapshot_bytes = 0, snapshot_size = 0;
 	std::atomic<std::uint64_t>       requested{0};
 	std::atomic<std::uint64_t>       next_request{0};
 	std::atomic<bool>                abort{false};
@@ -724,7 +738,11 @@ struct ProphecyEngine::Impl
 		// never waits on a mutex, condition variable, or the emulator.
 		while (host_timeline && requested.load(std::memory_order_acquire) < frame
 				&& !abort.load(std::memory_order_acquire))
+		{
+			serviceSnapshot();
 			std::this_thread::sleep_for(std::chrono::microseconds(50));
+		}
+		serviceSnapshot();
 #if defined(__APPLE__)
 		const auto period = worker_period.load(std::memory_order_acquire);
 		if (host_timeline && period != applied_period)
@@ -733,6 +751,22 @@ struct ProphecyEngine::Impl
 			applied_period = period;
 		}
 #endif
+	}
+
+	void serviceSnapshot()
+	{
+		if (!snapshot_requested.load(std::memory_order_acquire)) return;
+		snapshot_size = 0;
+		if (program_ram)
+		{
+			for (std::size_t i = 0; i < snapshot_bytes; ++i)
+			{
+				const auto address = snapshot_address + i;
+				snapshot[i] = std::uint8_t(program_ram[address / 2] >> ((address & 1) * 8));
+			}
+			snapshot_size = snapshot_bytes;
+		}
+		snapshot_requested.store(false, std::memory_order_release);
 	}
 };
 
@@ -819,6 +853,9 @@ public:
 
 	virtual void add_audio_to_recording(const int16_t *buffer, int samples_this_frame) override
 	{
+		if (!m_impl->program_ram)
+			if (auto* ram = machine().root_device().memshare("sysram"); ram && ram->bytes() >= 0x40000)
+				m_impl->program_ram = static_cast<std::uint16_t*>(ram->ptr());
 		if (buffer != nullptr && samples_this_frame > 0)
 		{
 			const auto first = m_impl->produced.load(std::memory_order_relaxed);
@@ -841,7 +878,11 @@ public:
 					}
 					if (notifyReader) m_impl->output_ready.notify_one();
 					offset += got;
-					if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(50));
+					if (got == 0)
+					{
+						m_impl->serviceSnapshot();
+						std::this_thread::sleep_for(std::chrono::microseconds(50));
+					}
 				}
 			}
 			else
@@ -1092,7 +1133,6 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 	std::lock_guard initializationLock(m_impl->initialization_mutex);
 	if (!running() || !m_impl->host_timeline) return false;
 	const bool wasReady = m_impl->playback_ready.exchange(false, std::memory_order_acq_rel);
-	g_playback_input_enabled.store(false, std::memory_order_release);
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 	auto advance = [&] {
 		if (std::chrono::steady_clock::now() >= deadline) return false;
@@ -1116,6 +1156,16 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 		stop();
 		return false;
 	};
+	// Replacement joins the earlier wire exchange before disabling its input.
+	// Its result may be obsolete, but its reply cannot belong to the new program.
+	if (m_impl->exchange.ticket)
+	{
+		failure = "The previous program operation did not finish before restoration.";
+		while (g_identity_replies.load(std::memory_order_acquire) == m_impl->exchange.identity)
+			if (!advance()) return fail();
+		m_impl->exchange = {};
+	}
+	g_playback_input_enabled.store(false, std::memory_order_release);
 	if (wasReady && state && bytes)
 	{
 		// The processor has paused its callback before a subsequent restore.
@@ -1135,8 +1185,10 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 			|| line1[1] < '0' || line1[1] > '9' || line1[2] < '0' || line1[2] > '9'
 			|| line1[3] != ':')
 			if (!advance()) return fail();
-		// Universal inquiry is independent of the Korg SysEx receive filter and
-		// broadcasts across device channels. Its reply also identifies the channel.
+	}
+	if (firmwareHandshake)
+	{
+		// Rediscover the channel on every restore, including after global edits.
 		failure = "Firmware did not answer its MIDI identity request. Reload the plugin to try again.";
 		const auto identity = g_identity_replies.load(std::memory_order_acquire);
 		const std::uint8_t request[] = {0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
@@ -1167,19 +1219,17 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 		g_program_dump_store.load(nullptr, 0, &before);
 		const std::uint8_t request[] = {0xf0, 0x42,
 			std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)), 0x41, 0x10, 0, 0xf7};
-		// A load acknowledgement can precede completion of the firmware's
-		// patch transition. Requests received while that task is busy are
-		// discarded. Retry one complete query after a bounded response window.
+		// Each retry drains its identity reply first. Never leave an older dump
+		// in flight where the next operation could mistake it for confirmation.
 		do
 		{
-			if (std::getenv("PROPHOST_INIT_STATS")) std::fprintf(stderr, "init query at %llu\n", (unsigned long long) requestedFrames());
-			if (!g_initialization_midi_ring.pushAll(request, sizeof(request))) return fail();
-			const auto end = requestedFrames() + kSampleRate / 2;
-			do
-			{
+			const auto identity = g_identity_replies.load(std::memory_order_acquire);
+			const std::uint8_t fence[]{0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
+			if (!g_initialization_midi_ring.pushAll(request, sizeof(request))
+				|| !g_initialization_midi_ring.pushAll(fence, sizeof(fence))) return fail();
+			while (g_identity_replies.load(std::memory_order_acquire) == identity)
 				if (!advance()) return fail();
-				g_program_dump_store.load(nullptr, 0, &version);
-			} while (version == before && requestedFrames() < end);
+			g_program_dump_store.load(nullptr, 0, &version);
 		} while (version == before && state && bytes);
 		if (state && bytes)
 		{
@@ -1198,15 +1248,16 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 			}
 		}
 	}
-	if (firmwareHandshake && state && bytes)
+	if (firmwareHandshake)
 	{
-		// Drain any outstanding query through the firmware parser before notes.
-		const auto identity = g_identity_replies.load(std::memory_order_acquire);
-		const std::uint8_t request[] = {0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
-		if (!g_initialization_midi_ring.pushAll(request, sizeof(request))) return fail();
-		while (g_identity_replies.load(std::memory_order_acquire) == identity)
-			if (!advance()) return fail();
+		const auto current = readSnapshot(0x4930, 535);
+		std::uint8_t dumped[535]{};
+		const auto size = latestProgramData(dumped, sizeof(dumped), nullptr);
+		failure = "Firmware program memory does not match its MIDI representation.";
+		if (current.size() != 535 || (size && (size != current.size()
+			|| !std::equal(current.begin(), current.end(), dumped)))) return fail();
 	}
+	m_impl->program_snapshot_enabled.store(firmwareHandshake, std::memory_order_release);
 	if (std::getenv("PROPHOST_INIT_STATS")) std::fprintf(stderr, "init ready at %llu\n", (unsigned long long) requestedFrames());
 	m_impl->initialization_error.store("", std::memory_order_release);
 	m_impl->playback_origin.store(requestedFrames(), std::memory_order_release);
@@ -1292,6 +1343,93 @@ std::uint64_t ProphecyEngine::droppedScheduledMidiBytes() const
 {
 	const std::uint64_t rejected = m_impl->rejected_scheduled_midi.load(std::memory_order_acquire);
 	return rejected + (ownsMachineSlot() ? g_host_timed_midi_ring.dropped() : 0);
+}
+
+std::uint64_t ProphecyEngine::beginProgramExchange(const std::uint8_t* batch, std::size_t bytes)
+{
+	std::lock_guard lock(m_impl->initialization_mutex);
+	if (!readyForPlayback() || !m_impl->program_snapshot_enabled.load(std::memory_order_acquire)
+		|| m_impl->exchange.ticket || bytes > kMaxProgramBatchBytes
+		|| (bytes && !batch)) return 0;
+	std::vector<std::uint8_t> message;
+	if (bytes) message.assign(batch, batch + bytes);
+	const std::uint8_t boundary[]{0xf0, 0x42,
+		std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)), 0x41, 0x10, 0, 0xf7,
+		0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
+	message.insert(message.end(), std::begin(boundary), std::end(boundary));
+	std::uint32_t version = 0;
+	g_program_dump_store.load(nullptr, 0, &version);
+	const auto identity = g_identity_replies.load(std::memory_order_acquire);
+	if (!g_host_midi_ring.pushAll(message.data(), message.size())) return 0;
+	const auto ticket = ++m_impl->next_exchange;
+	m_impl->exchange = {ticket, identity, producedFrames(), version};
+	return ticket;
+}
+
+ProphecyEngine::ProgramExchangeStatus ProphecyEngine::pollProgramExchange(
+	std::uint64_t ticket, std::vector<std::uint8_t>& program)
+{
+	std::lock_guard lock(m_impl->initialization_mutex);
+	program.clear();
+	const auto& exchange = m_impl->exchange;
+	if (!running() || ticket == 0 || ticket != exchange.ticket) return ProgramExchangeStatus::Failed;
+	if (g_identity_replies.load(std::memory_order_acquire) == exchange.identity)
+		return producedFrames() - exchange.frame > 5 * kSampleRate
+			? ProgramExchangeStatus::Failed : ProgramExchangeStatus::Pending;
+	std::uint32_t version = 0;
+	g_program_dump_store.load(nullptr, 0, &version);
+	if (version == exchange.version)
+	{
+		m_impl->exchange = {};
+		return ProgramExchangeStatus::NoReply;
+	}
+	// The serial dump was captured before its bytes were transmitted. A physical
+	// control can change RAM during transmission; publish the state at completion.
+	program = readSnapshot(0x4930, 535);
+	if (program.size() != 535) return ProgramExchangeStatus::Failed;
+	m_impl->exchange = {};
+	return ProgramExchangeStatus::Complete;
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotProgram()
+{
+	return readyForPlayback() && m_impl->program_snapshot_enabled.load(std::memory_order_acquire)
+		? readSnapshot(0x4930, 535) : std::vector<std::uint8_t>{};
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotStoredProgram(int program)
+{
+	return readyForPlayback() && m_impl->program_snapshot_enabled.load(std::memory_order_acquire)
+		&& program >= 0 && program < 128
+		? readSnapshot(0x20a10 + std::uint32_t(program) * 535, 535) : std::vector<std::uint8_t>{};
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotGlobals()
+{
+	return readyForPlayback() && m_impl->program_snapshot_enabled.load(std::memory_order_acquire)
+		? readSnapshot(0x3e4, 574) : std::vector<std::uint8_t>{};
+}
+
+std::vector<std::uint8_t> ProphecyEngine::readSnapshot(std::uint32_t address, std::size_t bytes)
+{
+	if (bytes > m_impl->snapshot.size() || address > 0x40000 || bytes > 0x40000 - address) return {};
+	std::lock_guard lock(m_impl->snapshot_mutex);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	auto wait = [&] {
+		while (m_impl->snapshot_requested.load(std::memory_order_acquire))
+		{
+			if (!running() || std::chrono::steady_clock::now() >= deadline) return false;
+			std::this_thread::sleep_for(std::chrono::microseconds(50));
+		}
+		return running();
+	};
+	// A timed-out request retains its transfer storage until the worker finishes.
+	if (!wait()) return {};
+	m_impl->snapshot_address = address;
+	m_impl->snapshot_bytes = bytes;
+	m_impl->snapshot_requested.store(true, std::memory_order_release);
+	if (!wait()) return {};
+	return {m_impl->snapshot.begin(), m_impl->snapshot.begin() + m_impl->snapshot_size};
 }
 
 void ProphecyEngine::pushPanelPulse(int row, int bit, int len_ms)

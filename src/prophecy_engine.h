@@ -114,6 +114,20 @@ public:
 	std::uint64_t droppedImmediateMidiBytes() const;
 	std::uint64_t droppedScheduledMidiBytes() const;
 
+	// Program-owner calls only, off the audio thread. The batch is an ordered
+	// sequence of complete MIDI messages. Only one exchange may be outstanding.
+	// Completion captures live RAM after the query/identity boundary; the serial
+	// dump was generated earlier and can miss a concurrent physical knob change.
+	enum class ProgramExchangeStatus { Pending, Complete, NoReply, Failed };
+	static constexpr std::size_t kMaxProgramBatchBytes = 2048;
+	std::uint64_t beginProgramExchange(const std::uint8_t* batch, std::size_t bytes);
+	ProgramExchangeStatus pollProgramExchange(std::uint64_t ticket, std::vector<std::uint8_t>& program);
+	// Capture without granting frames. This observes firmware state, not whether
+	// an accepted operation has finished. Stored programs are A00..B63 (0..127).
+	std::vector<std::uint8_t> snapshotProgram();
+	std::vector<std::uint8_t> snapshotStoredProgram(int program);
+	std::vector<std::uint8_t> snapshotGlobals();
+
 	// Drain sysex the firmware transmitted (patch dumps, param echoes). Returns bytes copied
 	// (0 if none). Poll from the message thread; the stream is complete 0xF0..0xF7 messages.
 	std::size_t popMidiTx(std::uint8_t *out, std::size_t cap);
@@ -186,5 +200,6 @@ public:
 	std::uint64_t producedFrames() const; // total frames MAME has emitted
 
 private:
+	std::vector<std::uint8_t> readSnapshot(std::uint32_t address, std::size_t bytes);
 	std::unique_ptr<Impl> m_impl;
 };
