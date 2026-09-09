@@ -52,6 +52,8 @@ def find_dsp(stats: dict[str, dict[str, int]], number: int) -> tuple[str, dict[s
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-host", type=Path, required=True)
+    parser.add_argument("--rt-safety-host", type=Path)
+    parser.add_argument("--lifecycle-host", type=Path)
     parser.add_argument("--plugin", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--seconds", type=float, default=6.0)
@@ -109,6 +111,20 @@ def main() -> int:
     log = log_path.read_text(encoding="utf-8", errors="replace")
     stats = parse_jit_runtime(log)
     failures: list[str] = []
+    for name, executable, options in (
+        ('active-rt-safety', args.rt_safety_host, ['--active']),
+        ('engine-lifecycle', args.lifecycle_host, []),
+    ):
+        if executable is None:
+            continue
+        with (args.work / f'{name}.log').open('w', encoding='utf-8') as test_log:
+            test = subprocess.run([str(executable.resolve()), *options], env=environment,
+                                  cwd=args.work, stdout=test_log, stderr=subprocess.STDOUT,
+                                  timeout=90, check=False)
+        if test.returncode:
+            failures.append(f'{name} exited {test.returncode}; see {name}.log')
+            print(f'--- {name}.log tail ---', flush=True)
+            print((args.work / f'{name}.log').read_text(errors='replace')[-8000:], flush=True)
     if completed.returncode:
         failures.append(f"artifact host exited {completed.returncode}")
     if not artifact_receipt_path.is_file():

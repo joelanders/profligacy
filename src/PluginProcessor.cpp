@@ -50,6 +50,7 @@ ProphecyAudioProcessor::ProphecyAudioProcessor()
 	// Read diagnostics outside processBlock. Function-local static initialization and
 	// getenv() are both inappropriate on a host's real-time callback.
 	m_skipStateRestore = std::getenv("PROPHECY_EDITOR_SELFTEST") != nullptr;
+	(void) m_engine.enableHostTimeline();
 }
 
 ProphecyAudioProcessor::~ProphecyAudioProcessor()
@@ -65,8 +66,10 @@ bool ProphecyAudioProcessor::isBusesLayoutSupported(const BusesLayout &layouts) 
 
 void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-	m_hostSampleRate = sampleRate > 0.0 ? sampleRate : (double) ProphecyEngine::kSampleRate;
-	m_hostMidiFrameCursor = 0;
+	m_hostSampleRate = std::isfinite(sampleRate) && sampleRate > 0.0
+		? sampleRate : (double) ProphecyEngine::kSampleRate;
+	const auto quantum = ProphecyEngine::kAudioQuantum;
+	m_timelineHostFrame = 0;
 	m_oversizedAudioBlocks.store(0, std::memory_order_relaxed);
 	m_editorPatchIntents.store(0, std::memory_order_relaxed);
 	m_editorPatchSends.store(0, std::memory_order_relaxed);
@@ -78,23 +81,28 @@ void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 	// ordinary offline/host block-size changes stay allocation-free; a still-larger block
 	// is explicitly silenced and counted in processBlock rather than resizing there.
 	m_preparedMaxBlock = std::max(samplesPerBlock, 16384);
-	m_scratchL.assign((std::size_t) m_preparedMaxBlock, 0.0f);
-	m_scratchR.assign((std::size_t) m_preparedMaxBlock, 0.0f);
 
 	// Prepare the 48 kHz -> host-rate resampler (bypassed when the host runs at 48 kHz).
 	const double ratio = (double) ProphecyEngine::kSampleRate / m_hostSampleRate;
 	const int    cap   = (int) std::ceil(m_preparedMaxBlock * ratio) + 64;
 	m_rsIn[0].assign((size_t) cap, 0.0f);
 	m_rsIn[1].assign((size_t) cap, 0.0f);
-	m_rsInCount = 0;
-	m_resampler[0].reset();
-	m_resampler[1].reset();
 
-	// Report latency for host delay compensation: the backpressured ring stays ~full, so the
-	// ring capacity (at 48k, scaled to the host rate) is the dominant latency.
-	setLatencySamples((int) std::lround(m_engine.ringFrames() * sampleRate / (double) ProphecyEngine::kSampleRate));
+	// Reserve the requested output block, one quantum for grant alignment,
+	// one quantum for worker execution, and interpolation lookahead. A short
+	// preceding callback must not remove the worker execution allowance. Output is explicitly delayed by this
+	// exact integer number of host samples; storage capacity is unrelated.
+	const auto nativeLead = std::max(std::ceil(std::max(samplesPerBlock, 1) * ratio),
+		(double) quantum) + 2 * quantum + 2;
+	setLatencySamples((int) std::ceil(nativeLead / ratio));
+	m_engine.setHostBlockFrames((std::uint32_t) std::ceil(std::max(samplesPerBlock, 1) * ratio));
 
 	maybeBootEngine();
+	// Firmware initialization finishes before the host epoch.
+	// Reprepare starts beyond the previous input grant, independent of worker speed.
+	const auto origin = ((m_engine.requestedFrames() + quantum - 1) / quantum) * quantum;
+	m_timeline.reset(m_hostSampleRate, origin);
+	m_timelineAttached = m_engine.readyForPlayback();
 }
 
 // Boot the engine once, iff a valid ROM set can be located (env / persisted picker
@@ -140,6 +148,10 @@ bool ProphecyAudioProcessor::maybeBootEngine()
 	const bool started = m_engine.start(args);
 	if (started)
 	{
+		// Clean-room CI firmware has its own sentinel protocol, not Korg's boot
+		// screen or SysEx parser. Ordinary firmware must complete the handshake.
+		const bool firmware = std::getenv("PROFLIGACY_CI_EXPOSE_LCD_STATE") == nullptr;
+		if (!m_engine.initializePlayback(firmware)) return false;
 		// Host state can restore Wheel 2 before prepareToPlay. Pre-start engine writes are
 		// intentionally rejected so an unclaimed/second processor cannot touch another
 		// instance's global queue; publish the retained value once this engine owns it.
@@ -161,6 +173,15 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 	juce::ScopedNoDenormals noDenormals;
 	const int numSamples  = buffer.getNumSamples();
 	const int numChannels = buffer.getNumChannels();
+	const bool engineActive = m_engine.readyForPlayback();
+	if (engineActive && (!m_timelineAttached || m_timeline.origin() < m_engine.playbackOrigin()))
+	{
+		// A ROM may be selected long after the DAW started calling processBlock.
+		// Adopt its completed initialization epoch, with the same fixed delay.
+		m_timeline.reset(m_hostSampleRate, m_engine.playbackOrigin());
+		m_timelineHostFrame = 0;
+		m_timelineAttached = true;
+	}
 	m_audioCallbacks.fetch_add(1, std::memory_order_relaxed);
 	m_audioHostFrames.fetch_add((std::uint64_t) std::max(numSamples, 0), std::memory_order_relaxed);
 	if (numSamples > m_preparedMaxBlock)
@@ -171,23 +192,22 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 		buffer.clear();
 		m_oversizedAudioBlocks.fetch_add(1, std::memory_order_relaxed);
 		m_audioUnderrunFrames.fetch_add((std::uint64_t) numSamples, std::memory_order_relaxed);
-		const double nativePerHost = (double)ProphecyEngine::kSampleRate / m_hostSampleRate;
-		m_hostMidiFrameCursor = std::max(m_engine.producedFrames(), m_hostMidiFrameCursor)
-			+ (std::uint64_t)std::llround(numSamples * nativePerHost);
+		m_timelineHostFrame += (std::uint64_t) numSamples;
+		if (engineActive) m_engine.requestThroughFrame(m_timeline.horizon(m_timelineHostFrame));
 		return;
 	}
 
 	// Forward every host MIDI event (note/CC/bend/sysex) into the emulated 31250-baud
-	// UART at its host sample position. The engine runs ahead behind a backpressured audio
-	// ring, so target native frames (not wall time) preserve both intra- and inter-block
-	// timing. The hardware then adds its real serial and scan/voice-allocation latency.
-	const double nativePerHost = (double)ProphecyEngine::kSampleRate / m_hostSampleRate;
-	const std::uint64_t produced = m_engine.producedFrames();
-	const std::uint64_t midiFrameBase = std::max(produced, m_hostMidiFrameCursor);
+	// UART at its absolute sample position, before granting this input range to
+	// the worker. Hardware serial and scan/voice-allocation latency stays intact.
+	const auto timelineBlockStart = m_timelineHostFrame;
+	const auto midiFrameBase = m_timeline.event(timelineBlockStart);
 	const std::uint64_t hostBlockEnd = m_audioHostFrames.load(std::memory_order_relaxed);
 	const std::uint64_t hostBlockStart = hostBlockEnd - (std::uint64_t)numSamples;
 	for (const auto meta : midi)
 	{
+		const auto eventFrame = m_timeline.event(timelineBlockStart
+			+ (std::uint64_t) std::clamp(meta.samplePosition, 0, std::max(numSamples - 1, 0)));
 		// Work from MidiBuffer's borrowed metadata bytes. Constructing a MidiMessage here
 		// can allocate for SysEx payloads, which is forbidden on the audio callback.
 		const std::uint8_t *data = meta.data;
@@ -234,7 +254,7 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 			const auto tgt = (CcTarget) m_ccMap[(std::size_t) cc].load(std::memory_order_relaxed);
 			if (tgt != CcTarget::Off)
 			{
-				handleMappedCc(cc, data[2] & 0x7f, tgt);
+				handleMappedCc(cc, data[2] & 0x7f, tgt, eventFrame);
 				continue;
 			}
 			// An ordinary MIDI mod-wheel message remains ordinary MIDI. Mirror it onto
@@ -250,92 +270,78 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 			const int bend = (data[1] & 0x7f) | ((data[2] & 0x7f) << 7);
 			publishControllerDisplayValue(8, (bend * 255 + 8191) / 16383);
 		}
-		const auto offset = (std::uint64_t)std::llround(
-			(double)meta.samplePosition * nativePerHost);
-		if (m_engine.pushMidiAtFrame(data, (std::size_t) numBytes, midiFrameBase + offset))
+		if (m_engine.pushMidiAtFrame(data, (std::size_t) numBytes, eventFrame))
 			m_hostMidiEventsForwarded.fetch_add(1, std::memory_order_relaxed);
 	}
-	m_hostMidiFrameCursor = midiFrameBase + (std::uint64_t)std::llround(numSamples * nativePerHost);
 
-	// Restore a saved patch once, after the machine is well past its ~2 s boot
-	// (the 11 s threshold is a deliberate safety margin, not the boot time).
-	// Skipped under the editor self-test: the injected dump's firmware apply is a modal
-	// that swallows param sysex sent meanwhile, racing (and flaking) the rename check —
-	// the self-test wants a deterministic clean boot. (State restore has its own console
-	// coverage: PROPHOST_STATE_TEST.)
-	if (!m_skipStateRestore && m_pendingReady.load() && !m_pendingInjected.load()
+	// Preserve the existing state policy: restore once after firmware boot has
+	// had its historical safety margin. The timeline only changes the absolute
+	// frame used for the same one-shot SysEx injection.
+	if (!m_skipStateRestore && engineActive && m_pendingReady.load() && !m_pendingInjected.load()
 			&& m_engine.producedFrames() > (std::uint64_t) ProphecyEngine::kSampleRate * 11)
 	{
 		if (m_engine.pushMidiAtFrame(m_pendingState.data(), m_pendingState.size(), midiFrameBase))
 			m_pendingInjected.store(true);
 	}
+	m_timelineHostFrame += (std::uint64_t) numSamples;
+	if (engineActive) m_engine.requestThroughFrame(m_timeline.horizon(m_timelineHostFrame));
 
-	if (numChannels < 1) return;
-
-	// -------- pass-through: host already runs at the engine's 48 kHz --------
-	if (std::abs(m_hostSampleRate - (double) ProphecyEngine::kSampleRate) < 0.5)
+	buffer.clear();
+	if (numSamples == 0 || numChannels == 0) return;
+	if (!engineActive)
 	{
-		if (numChannels >= 2)
-		{
-			const std::size_t got = m_engine.pull(buffer.getWritePointer(0), buffer.getWritePointer(1), (std::size_t) numSamples);
-			m_audioEngineFrames.fetch_add(got, std::memory_order_relaxed);
-			if (got < (std::size_t) numSamples)
-				m_audioUnderrunFrames.fetch_add((std::size_t) numSamples - got, std::memory_order_relaxed);
-			for (int i = (int) got; i < numSamples; ++i) { buffer.getWritePointer(0)[i] = 0.0f; buffer.getWritePointer(1)[i] = 0.0f; }
-			for (int ch = 2; ch < numChannels; ++ch) buffer.clear(ch, 0, numSamples);
-		}
-		else
-		{
-			const std::size_t got = m_engine.pull(m_scratchL.data(), m_scratchR.data(), (std::size_t) numSamples);
-			m_audioEngineFrames.fetch_add(got, std::memory_order_relaxed);
-			if (got < (std::size_t) numSamples)
-				m_audioUnderrunFrames.fetch_add((std::size_t) numSamples - got, std::memory_order_relaxed);
-			float *out = buffer.getWritePointer(0);
-			for (int i = 0; i < numSamples; ++i)
-			{
-				const auto index = (std::size_t) i;
-				out[i] = (index < got) ? 0.5f * (m_scratchL[index] + m_scratchR[index]) : 0.0f;
-			}
-		}
+		m_audioUnderrunFrames.fetch_add((std::uint64_t) numSamples, std::memory_order_relaxed);
 		return;
 	}
 
-	// -------- resample the engine's 48 kHz stream to the host rate --------
-	const double ratio = (double) ProphecyEngine::kSampleRate / m_hostSampleRate; // input per output
-	const int    capN  = (int) m_rsIn[0].size();
-	const int    need  = std::min((int) std::ceil(numSamples * ratio) + 4, capN);
-	while (m_rsInCount < need)
+	const auto latency = (std::uint64_t) getLatencySamples();
+	// The leading delay is intentional silence, including after a reprepare.
+	const auto firstHost = std::max(timelineBlockStart, latency);
+	if (firstHost >= m_timelineHostFrame) return;
+	const auto outputOffset = (int) (firstHost - timelineBlockStart);
+	const auto outputCount = numSamples - outputOffset;
+	const auto firstPosition = m_timeline.position(firstHost - latency);
+	const auto lastPosition = m_timeline.position(m_timelineHostFrame - latency - 1);
+	const auto firstIndex = (std::uint64_t) std::floor(firstPosition);
+	const auto lastIndex = (std::uint64_t) std::floor(lastPosition);
+	const bool nativeRate = juce::exactlyEqual(m_hostSampleRate, (double) ProphecyEngine::kSampleRate);
+	const auto windowStart = nativeRate ? firstIndex : (firstIndex > 1 ? firstIndex - 2 : 0);
+	const auto windowEnd = lastIndex + (nativeRate ? 1 : 3);
+	const auto needed = (std::size_t) (windowEnd - windowStart);
+	if (needed > m_rsIn[0].size() || needed > ProphecyEngine::kTimelineCapacity)
 	{
-		const std::size_t got = m_engine.pull(m_rsIn[0].data() + m_rsInCount, m_rsIn[1].data() + m_rsInCount,
-				(std::size_t) (need - m_rsInCount));
-		m_audioEngineFrames.fetch_add(got, std::memory_order_relaxed);
-		if (got == 0) // underrun: zero-fill the shortfall so the interpolator has input
+		m_audioUnderrunFrames.fetch_add((std::uint64_t) outputCount, std::memory_order_relaxed);
+		return;
+	}
+	const auto got = m_engine.readAtFrame(m_timeline.origin() + windowStart,
+		m_rsIn[0].data(), m_rsIn[1].data(), needed, isNonRealtime());
+	m_audioEngineFrames.fetch_add(got, std::memory_order_relaxed);
+	m_audioUnderrunFrames.fetch_add(needed - got, std::memory_order_relaxed);
+
+	for (int i = 0; i < outputCount; ++i)
+	{
+		const auto position = m_timeline.position(firstHost - latency + (std::uint64_t) i);
+		const auto index = (std::uint64_t) std::floor(position);
+		const auto fraction = position - index;
+		const auto relative = (std::size_t) (index - windowStart);
+		float stereo[2];
+		for (int channel = 0; channel < 2; ++channel)
 		{
-			m_audioUnderrunFrames.fetch_add((std::uint64_t) (need - m_rsInCount), std::memory_order_relaxed);
-			for (int i = m_rsInCount; i < need; ++i)
-			{
-				const auto index = (std::size_t) i;
-				m_rsIn[0][index] = 0.0f;
-				m_rsIn[1][index] = 0.0f;
-			}
-			m_rsInCount = need;
-			break;
+			const auto* input = m_rsIn[channel].data();
+			stereo[channel] = nativeRate ? input[relative]
+				: prophecy::interpolate(index > 1 ? input[relative - 2] : 0.0f,
+					index > 0 ? input[relative - 1] : 0.0f,
+					input[relative], input[relative + 1], input[relative + 2], fraction);
 		}
-		m_rsInCount += (int) got;
+		if (numChannels == 1)
+			buffer.setSample(0, outputOffset + i, (stereo[0] + stereo[1]) * 0.5f);
+		else
+		{
+			buffer.setSample(0, outputOffset + i, stereo[0]);
+			buffer.setSample(1, outputOffset + i, stereo[1]);
+		}
 	}
 
-	const int used = m_resampler[0].process(ratio, m_rsIn[0].data(), buffer.getWritePointer(0), numSamples);
-	m_resampler[1].process(ratio, m_rsIn[1].data(),
-		numChannels >= 2 ? buffer.getWritePointer(1) : m_scratchR.data(), numSamples);
-	for (int ch = 2; ch < numChannels; ++ch) buffer.clear(ch, 0, numSamples);
-
-	const int rem = std::max(m_rsInCount - used, 0);
-	if (rem > 0)
-	{
-		std::memmove(m_rsIn[0].data(), m_rsIn[0].data() + used, (size_t) rem * sizeof(float));
-		std::memmove(m_rsIn[1].data(), m_rsIn[1].data() + used, (size_t) rem * sizeof(float));
-	}
-	m_rsInCount = rem;
 }
 
 ProphecyAudioProcessor::DiagnosticSnapshot ProphecyAudioProcessor::diagnosticSnapshot() const
@@ -869,13 +875,13 @@ void ProphecyAudioProcessor::controllerDisplaySnapshot(std::uint8_t out[16]) con
 // Ribbon Z = ADIN14, wheel 1 = ADIN8, and wheel 2 = ADIN9. CC 0..127 scales to the physical
 // control direction; ribbon X uses the service-manual range and reversed ADC polarity
 // (left=0x7F, right=0x00). Audio-thread only.
-void ProphecyAudioProcessor::handleMappedCc(int cc, int value, CcTarget target)
+void ProphecyAudioProcessor::handleMappedCc(int cc, int value, CcTarget target, std::uint64_t frame)
 {
 	juce::ignoreUnused(cc);
 	const int s = (value * 255 + 63) / 127; // 0..127 -> 0..255 (rounded), matches editor
-	const auto push = [this](int source, int next)
+	const auto push = [this, frame](int source, int next)
 	{
-		(void) m_engine.pushAdinFromAudio(source, next);
+		(void) m_engine.pushAdinAtFrame(source, next, frame);
 		publishControllerDisplayValue(source, next);
 	};
 	switch (target)

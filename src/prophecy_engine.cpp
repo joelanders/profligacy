@@ -25,6 +25,7 @@
 #include "video/hd44780.h"
 
 #include "led_store.h"
+#include "audio_timeline.h"
 #include "prophecy_engine.h"
 
 #include <algorithm>
@@ -70,24 +71,23 @@ int sdl_entered_debugger = 0;
 namespace {
 
 #if defined(__APPLE__)
-void configure_audio_producer_scheduling()
+void configure_audio_producer_scheduling(std::uint32_t nativeFrames = 960)
 {
-	// MAME publishes 960-frame chunks at 48 kHz, i.e. one production quantum every
-	// 20 ms.  Give that worker an audio-style time constraint with some headroom;
-	// ring backpressure still puts it to sleep whenever it has rendered far enough
-	// ahead.  This mirrors JUCE's macOS realtime-thread implementation.
+	// Match the host's production cadence. Console clients keep their 20 ms
+	// period; the plugin requests a new policy when prepare changes its block.
 	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 	mach_timebase_info_data_t timebase{};
 	kern_return_t result = mach_timebase_info(&timebase);
 	if (result == KERN_SUCCESS && timebase.numer != 0)
 	{
-		auto ticks_for_ms = [&](std::uint64_t ms) {
-			return static_cast<std::uint32_t>(ms * 1'000'000ULL * timebase.denom / timebase.numer);
+		auto ticks_for_ns = [&](std::uint64_t ns) {
+			return static_cast<std::uint32_t>(ns * timebase.denom / timebase.numer);
 		};
+		const auto periodNs = std::uint64_t(nativeFrames) * 1'000'000'000ULL / 48000;
 		thread_time_constraint_policy_data_t policy{};
-		policy.period = ticks_for_ms(20);
-		policy.computation = ticks_for_ms(18);
-		policy.constraint = ticks_for_ms(20);
+		policy.period = ticks_for_ns(periodNs);
+		policy.computation = ticks_for_ns(periodNs * 9 / 10);
+		policy.constraint = policy.period;
 		policy.preemptible = true;
 		result = thread_policy_set(
 			pthread_mach_thread_np(pthread_self()),
@@ -96,8 +96,8 @@ void configure_audio_producer_scheduling()
 			THREAD_TIME_CONSTRAINT_POLICY_COUNT);
 	}
 	if (std::getenv("PROPHOST_SCHED_STATS"))
-		std::fprintf(stderr, "[prophost-sched] producer_time_constraint=%d result=%d\n",
-			result == KERN_SUCCESS, int(result));
+		std::fprintf(stderr, "[prophost-sched] producer_time_constraint=%d result=%d period_frames=%u\n",
+			result == KERN_SUCCESS, int(result), unsigned(nativeFrames));
 }
 #endif
 
@@ -220,6 +220,8 @@ private:
 };
 
 MidiRing g_host_midi_ring;     // host -> emulated UART (RX)
+MidiRing g_initialization_midi_ring; // non-realtime initialization -> UART
+std::atomic<bool> g_playback_input_enabled{true};
 MidiRing g_host_midi_tx_ring;  // emulated UART -> host (TX: patch dumps, param echoes)
 MidiRing g_host_panel_ring;    // host -> panel scan matrix: (row, bit, len_ms lo, len_ms hi) records
 MidiRing g_host_adin_ui_ring;  // message thread -> ADIN mux: (source, value) records
@@ -493,6 +495,8 @@ private:
 };
 
 ProgramDumpStore g_program_dump_store;
+std::atomic<std::uint64_t> g_identity_replies{0};
+std::atomic<std::uint8_t> g_firmware_channel{0};
 
 // Latest 0x69 arpeggio-pattern dump. Keep this independent of popMidiTx(): dump
 // read-back must remain reliable even when another UI consumer drains the raw TX ring.
@@ -605,6 +609,9 @@ static void host_led_impl(uint8_t bank, uint8_t data)
 
 static bool host_midi_pop_impl(uint8_t *out, size_t cap, size_t *n, double emu_seconds)
 {
+	*n = g_initialization_midi_ring.pop(out, cap);
+	if (*n != 0) return true;
+	if (!g_playback_input_enabled.load(std::memory_order_acquire)) return false;
 	*n = g_host_midi_ring.pop(out, cap);
 	if (*n == 0)
 	{
@@ -618,6 +625,13 @@ static bool host_midi_pop_impl(uint8_t *out, size_t cap, size_t *n, double emu_s
 static void host_midi_tx_impl(const uint8_t *bytes, size_t n)
 {
 	g_host_midi_tx_ring.push(bytes, n);
+	if (n == 15 && bytes[0] == 0xf0 && bytes[1] == 0x7e && bytes[3] == 6
+		&& bytes[4] == 2 && bytes[5] == 0x42 && bytes[6] == 0x41 && bytes[7] == 0
+		&& bytes[8] == 1 && bytes[9] == 0 && bytes[14] == 0xf7)
+	{
+		g_firmware_channel.store(bytes[2] & 0x0f, std::memory_order_relaxed);
+		g_identity_replies.fetch_add(1, std::memory_order_release);
+	}
 	// Also capture the current-program dump (F0 42 3n 41 40 00 <packed 7-bit> F7) for the editor's
 	// param read-back: unpack the payload (message[6..n-1)) into raw program bytes + bump version.
 	// Called per complete sysex on the MAME thread (not the audio thread), so allocation is fine.
@@ -658,10 +672,24 @@ static std::size_t ring_frames_from_env()
 struct ProphecyEngine::Impl
 {
 	AudioRing                        ring{ring_frames_from_env()};
+	prophecy::TimelineAudioRing       timeline{ProphecyEngine::kTimelineCapacity};
+	bool                             host_timeline = false; // immutable after start
+	std::atomic<bool>                playback_ready{false};
+	std::atomic<std::uint64_t>       playback_origin{0};
+	std::mutex                       initialization_mutex; // non-realtime callers only
+	std::atomic<std::uint64_t>       requested{0};
+	std::atomic<std::uint64_t>       next_request{0};
+	std::atomic<bool>                abort{false};
+	std::atomic<std::uint32_t>       worker_period{128};
+	std::uint32_t                    applied_period = 0; // worker only
+	std::mutex                       output_mutex; // producer and offline reader only
+	std::condition_variable          output_ready;
+	std::uint64_t                    output_wait_end = 0; // protected by output_mutex
+	std::uint64_t                    completed_horizon = 0; // protected by output_mutex
+	std::uint64_t                    output_wait_horizon = 0; // protected by output_mutex
 	std::thread                      thread;
 	std::atomic<bool>                started{false};
 	std::atomic<bool>                finished{false};
-	std::atomic<running_machine *>   machine{nullptr};
 	std::atomic<uint64_t>            produced{0};
 	int                              exitCode = 0;
 	std::atomic<bool>                owns_singleton{false}; // this engine booted the machine
@@ -671,6 +699,25 @@ struct ProphecyEngine::Impl
 	std::atomic<std::uint64_t>       rejected_scheduled_midi{0};
 	std::atomic<std::uint64_t>       rejected_ui_adin{0};
 	std::atomic<std::uint64_t>       rejected_audio_adin{0};
+	std::atomic<std::uint64_t>       rejected_scheduled_adin{0};
+
+	void waitForRequest(std::uint64_t frame)
+	{
+		next_request.store(frame, std::memory_order_release);
+		// Only the MAME worker sleeps. The realtime host publishes one atomic and
+		// never waits on a mutex, condition variable, or the emulator.
+		while (host_timeline && requested.load(std::memory_order_acquire) < frame
+				&& !abort.load(std::memory_order_acquire))
+			std::this_thread::sleep_for(std::chrono::microseconds(50));
+#if defined(__APPLE__)
+		const auto period = worker_period.load(std::memory_order_acquire);
+		if (host_timeline && period != applied_period)
+		{
+			configure_audio_producer_scheduling(period);
+			applied_period = period;
+		}
+#endif
+	}
 };
 
 namespace {
@@ -718,7 +765,26 @@ public:
 #else
 		sdl_osd_interface::init(machine);
 		#endif
-		m_impl->machine.store(&machine); // captured so stop() can schedule_exit()
+		// No emulated time may pass before the first host input range is known.
+		m_impl->waitForRequest(ProphecyEngine::kAudioQuantum);
+		if (m_impl->abort.load(std::memory_order_acquire)) machine.schedule_exit();
+	}
+
+	std::uint32_t audio_recording_quantum() const override
+	{
+		return m_impl->host_timeline ? ProphecyEngine::kAudioQuantum : 0;
+	}
+
+	void update(bool skipRedraw) override
+	{
+#if defined(SDLMAME_WIN32)
+		osd_common_t::update(skipRedraw);
+#else
+		sdl_osd_interface::update(skipRedraw);
+#endif
+		// Startup UI and paused machines also need a worker-owned cancellation
+		// point, even when the sound timer is not advancing.
+		if (m_impl->abort.load(std::memory_order_acquire)) machine().schedule_exit();
 	}
 
 #if defined(SDLMAME_WIN32)
@@ -739,14 +805,58 @@ public:
 	{
 		if (buffer != nullptr && samples_this_frame > 0)
 		{
-			m_impl->produced.fetch_add(uint64_t(samples_this_frame));
-			m_impl->ring.push(buffer, std::size_t(samples_this_frame) * ProphecyEngine::kChannels);
+			const auto first = m_impl->produced.load(std::memory_order_relaxed);
+			if (m_impl->host_timeline)
+			{
+				std::size_t offset = 0;
+				while (offset < std::size_t(samples_this_frame)
+						&& !m_impl->abort.load(std::memory_order_acquire))
+				{
+					std::size_t got;
+					bool notifyReader;
+					{
+						// Pair publication with the offline predicate to avoid lost
+						// wakeups. The realtime reader never takes this mutex.
+						std::lock_guard lock(m_impl->output_mutex);
+						got = m_impl->timeline.push(first + offset,
+							buffer + offset * 2, std::size_t(samples_this_frame) - offset);
+						notifyReader = m_impl->output_wait_end != 0
+							&& m_impl->timeline.end() >= m_impl->output_wait_end;
+					}
+					if (notifyReader) m_impl->output_ready.notify_one();
+					offset += got;
+					if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(50));
+				}
+			}
+			else
+				m_impl->ring.push(buffer, std::size_t(samples_this_frame) * ProphecyEngine::kChannels);
+			m_impl->produced.store(first + std::uint64_t(samples_this_frame), std::memory_order_release);
 		}
 		#if defined(SDLMAME_WIN32)
 		osd_common_t::add_audio_to_recording(buffer, samples_this_frame);
 		#else
 		sdl_osd_interface::add_audio_to_recording(buffer, samples_this_frame);
 		#endif
+		// Gate the *next* batch, including its MIDI, before advancing the machine.
+		// Timer periods can round just below a sample in attotime. Derive the
+		// boundary from machine time, also tolerating startup/teardown flushes.
+		if (m_impl->host_timeline)
+		{
+			const auto completed = (machine().time().as_ticks(ProphecyEngine::kSampleRate) + 1)
+				/ ProphecyEngine::kAudioQuantum * ProphecyEngine::kAudioQuantum;
+			bool notifyReader;
+			{
+				std::lock_guard lock(m_impl->output_mutex);
+				m_impl->completed_horizon = completed;
+				notifyReader = m_impl->output_wait_end != 0
+					&& completed >= m_impl->output_wait_horizon;
+			}
+			if (notifyReader) m_impl->output_ready.notify_one();
+			m_impl->waitForRequest(completed + ProphecyEngine::kAudioQuantum);
+		}
+		// Only the worker accesses running_machine. Cancellation before init is
+		// remembered, and cancellation during a render or either wait is observed here.
+		if (m_impl->abort.load(std::memory_order_acquire)) machine().schedule_exit();
 	}
 
 private:
@@ -816,7 +926,6 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 		return false;
 	}
 	m_impl->owns_singleton = true;
-	m_impl->status.store(InstanceStatus::Active, std::memory_order_release);
 	apply_audio_config();
 	kprop_set_host_midi_pop(host_midi_pop_impl);   // host MIDI -> emulated UART
 	kprop_set_host_midi_tx(host_midi_tx_impl);     // emulated UART sysex -> host
@@ -830,6 +939,8 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 	// A previous machine in this process must not leak queued UI traffic or observer
 	// bytes into a reconstructed engine. Reset only after acquiring the singleton.
 	g_host_midi_ring.reset();
+	g_initialization_midi_ring.reset();
+	g_playback_input_enabled.store(!m_impl->host_timeline, std::memory_order_release);
 	g_host_midi_tx_ring.reset();
 	g_host_panel_ring.reset();
 	g_host_adin_ui_ring.reset();
@@ -839,6 +950,8 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 	g_host_lcd_store.reset();
 	g_host_lcd_raw_store.reset();
 	g_program_dump_store.reset();
+	g_identity_replies.store(0);
+	g_firmware_channel.store(0);
 	g_arpeggio_pattern_dump_store.reset();
 	g_host_midi_tx_byte_ring.reset();
 	g_host_midi_tx_byte_capture_enabled.store(
@@ -846,10 +959,15 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 	g_host_timed_midi_ring.reset();
 	g_host_timed_panel_ring.reset();
 	g_host_timed_adin_ring.reset();
+	// Publish queue readiness only after initialization, before the worker can
+	// consume input. A ROM-picker boot may race the DAW's audio callback.
+	m_impl->status.store(InstanceStatus::Active, std::memory_order_release);
+	m_impl->playback_ready.store(!m_impl->host_timeline, std::memory_order_release);
 	Impl *impl = m_impl.get();
 	m_impl->thread = std::thread([impl, args]() {
 #if defined(__APPLE__)
-		configure_audio_producer_scheduling();
+		impl->applied_period = impl->host_timeline ? impl->worker_period.load() : 960;
+		configure_audio_producer_scheduling(impl->applied_period);
 #endif
 		std::vector<std::string> a = args; // start_frontend wants a non-const ref
 		#if defined(SDLMAME_WIN32)
@@ -860,13 +978,11 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 		prophecy_osd osd(options, impl);
 		osd.register_options();
 		impl->exitCode = emulator_info::start_frontend(options, osd, a);
-		// The machine is destroyed once start_frontend returns; anyone still holding the
-		// pointer must see null. MAME's SDL OSD handles SIGTERM itself, so on a
-		// signal-quit the machine is gone BEFORE JUCE shutdown reaches
-		// ProphecyEngine::stop() — schedule_exit() on the stale pointer was a
-		// crash-on-quit (2026-07-10 .ips: stop() -> running_machine::schedule_exit).
-		impl->machine.store(nullptr);
-		impl->finished.store(true);
+		{
+			std::lock_guard lock(impl->output_mutex);
+			impl->finished.store(true);
+		}
+		impl->output_ready.notify_all();
 		impl->ring.set_done();
 	});
 	return true;
@@ -886,37 +1002,26 @@ void ProphecyEngine::stop()
 {
 	if (!m_impl->started.load()) return;
 	if (!m_impl->owns_singleton.load(std::memory_order_acquire)) return;
-	// finished first: once the worker returns from start_frontend the machine is freed
-	// (it also nulls the pointer; the pair closes the signal-quit teardown race).
-	if (!m_impl->finished.load())
-		if (running_machine *m = m_impl->machine.load()) m->schedule_exit(); // ask MAME to leave its loop
-	m_impl->ring.set_abort();                                            // unblock a producer stuck on a full ring
-
-	// Bounded join: wait up to ~3 s for MAME to return from start_frontend, then join.
-	// If it doesn't (a wedged teardown), detach rather than ever hanging the host on
-	// unload. A detached machine keeps the process singleton, so no re-boot afterwards.
-	for (int i = 0; i < 300 && !m_impl->finished.load(); ++i)
-		std::this_thread::sleep_for(std::chrono::milliseconds(10));
-	if (m_impl->finished.load())
 	{
-		if (m_impl->thread.joinable()) m_impl->thread.join();
-		// Make this object's global-I/O methods inert before another engine can claim
-		// the slot and install a replacement set of process-global callbacks.
-		m_impl->owns_singleton.store(false, std::memory_order_release);
-		m_impl->status.store(InstanceStatus::Stopped, std::memory_order_release);
-		g_engine_active.store(false, std::memory_order_release);
+		std::lock_guard lock(m_impl->output_mutex);
+		m_impl->abort.store(true, std::memory_order_release);
 	}
-	else if (m_impl->thread.joinable())
-	{
-		m_impl->thread.detach();
-	}
+	m_impl->output_ready.notify_all();
+	m_impl->ring.set_abort(); // release legacy FIFO backpressure too
+	// A plugin cannot unload code or storage still used by a detached worker.
+	// All engine waits observe abort; let the worker request its own MAME exit.
+	if (m_impl->thread.joinable()) m_impl->thread.join();
+	m_impl->owns_singleton.store(false, std::memory_order_release);
+	m_impl->status.store(InstanceStatus::Stopped, std::memory_order_release);
+	g_engine_active.store(false, std::memory_order_release);
 }
 
 bool ProphecyEngine::running() const  { return ownsMachineSlot() && m_impl->started.load() && !m_impl->finished.load(); }
 bool ProphecyEngine::finished() const { return m_impl->finished.load(); }
 bool ProphecyEngine::ownsMachineSlot() const
 {
-	return m_impl->owns_singleton.load(std::memory_order_acquire);
+	return m_impl->owns_singleton.load(std::memory_order_acquire)
+		&& m_impl->status.load(std::memory_order_acquire) == InstanceStatus::Active;
 }
 ProphecyEngine::InstanceStatus ProphecyEngine::instanceStatus() const
 {
@@ -929,10 +1034,154 @@ std::size_t ProphecyEngine::pull(float *left, float *right, std::size_t frames)
 	return m_impl->ring.pop_planar(left, right, frames);
 }
 
+bool ProphecyEngine::enableHostTimeline()
+{
+	if (m_impl->started.load(std::memory_order_acquire)) return false;
+	m_impl->host_timeline = true;
+	return true;
+}
+
+bool ProphecyEngine::readyForPlayback() const
+{
+	return running() && m_impl->playback_ready.load(std::memory_order_acquire);
+}
+
+std::uint64_t ProphecyEngine::playbackOrigin() const
+{
+	return m_impl->playback_origin.load(std::memory_order_acquire);
+}
+
+bool ProphecyEngine::waitingForOutput() const
+{
+	std::lock_guard lock(m_impl->output_mutex);
+	return m_impl->output_wait_end != 0;
+}
+
+bool ProphecyEngine::waitingForInput() const
+{
+	return running() && m_impl->host_timeline
+		&& m_impl->next_request.load(std::memory_order_acquire) > requestedFrames();
+}
+
+bool ProphecyEngine::initializePlayback(bool firmwareHandshake)
+{
+	std::lock_guard initializationLock(m_impl->initialization_mutex);
+	if (!running() || !m_impl->host_timeline) return false;
+	const bool wasReady = m_impl->playback_ready.exchange(false, std::memory_order_acq_rel);
+	g_playback_input_enabled.store(false, std::memory_order_release);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	auto advance = [&] {
+		if (std::chrono::steady_clock::now() >= deadline) return false;
+		const auto end = (requestedFrames() / kAudioQuantum + 4) * kAudioQuantum;
+		// Initialization audio precedes the host epoch and must not fill the ring.
+		m_impl->timeline.seek(end);
+		std::unique_lock lock(m_impl->output_mutex);
+		m_impl->output_wait_end = 1;
+		m_impl->output_wait_horizon = end;
+		requestThroughFrame(end);
+		const bool completed = m_impl->output_ready.wait_until(lock, deadline, [&] {
+			return m_impl->completed_horizon >= end || !running() || m_impl->abort.load();
+		});
+		m_impl->output_wait_end = 0;
+		return completed && running() && !m_impl->abort.load();
+	};
+	const char* failure = "Firmware startup did not complete. Reload the plugin to try again.";
+	auto fail = [&] {
+		std::fprintf(stderr, "Profligacy initialization failed: %s\n", failure);
+		stop();
+		return false;
+	};
+	if (firmwareHandshake && !wasReady)
+	{
+		// The program page is firmware evidence that startup has reached the
+		// MIDI parser. Sending bytes during the power-on self-test can wedge it.
+		char line1[41]{}, line2[41]{};
+		while (!latestLcd(line1, line2, sizeof(line1))
+			|| (line1[0] != 'A' && line1[0] != 'B')
+			|| line1[1] < '0' || line1[1] > '9' || line1[2] < '0' || line1[2] > '9'
+			|| line1[3] != ':')
+			if (!advance()) return fail();
+		// Universal inquiry is independent of the Korg SysEx receive filter and
+		// broadcasts across device channels. Its reply also identifies the channel.
+		failure = "Firmware did not answer its MIDI identity request. Reload the plugin to try again.";
+		const auto identity = g_identity_replies.load(std::memory_order_acquire);
+		const std::uint8_t request[] = {0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
+		if (!g_initialization_midi_ring.pushAll(request, sizeof(request))) return fail();
+		while (g_identity_replies.load(std::memory_order_acquire) == identity)
+			if (!advance()) return fail();
+
+		// A completed program dump proves the firmware's startup work has settled
+		// before the first host-timed note. SysEx reception may be disabled, so a
+		// missing reply delays only this bounded readiness window.
+		std::uint32_t before = 0, version = 0;
+		g_program_dump_store.load(nullptr, 0, &before);
+		const std::uint8_t programRequest[] = {0xf0, 0x42,
+			std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)),
+			0x41, 0x10, 0, 0xf7};
+		if (!g_initialization_midi_ring.pushAll(programRequest, sizeof(programRequest))) return fail();
+		const auto responseEnd = requestedFrames() + kSampleRate / 2;
+		do
+		{
+			if (!advance()) return fail();
+			g_program_dump_store.load(nullptr, 0, &version);
+		} while (version == before && requestedFrames() < responseEnd);
+	}
+	if (std::getenv("PROPHOST_INIT_STATS")) std::fprintf(stderr, "init ready at %llu\n", (unsigned long long) requestedFrames());
+	m_impl->playback_origin.store(requestedFrames(), std::memory_order_release);
+	g_playback_input_enabled.store(true, std::memory_order_release);
+	m_impl->playback_ready.store(true, std::memory_order_release);
+	return true;
+}
+
+void ProphecyEngine::setHostBlockFrames(std::uint32_t frames)
+{
+	m_impl->worker_period.store(std::max(frames, kAudioQuantum), std::memory_order_release);
+}
+
+void ProphecyEngine::requestThroughFrame(std::uint64_t frame)
+{
+	m_impl->requested.store(frame, std::memory_order_release);
+}
+
+std::uint64_t ProphecyEngine::requestedFrames() const
+{
+	return m_impl->requested.load(std::memory_order_acquire);
+}
+
+std::size_t ProphecyEngine::readAtFrame(std::uint64_t first, float *left,
+	float *right, std::size_t frames, bool offline)
+{
+	if (!left || !right || frames == 0) return 0;
+	if (!ownsMachineSlot() || frames > m_impl->timeline.capacity())
+	{
+		std::fill(left, left + frames, 0.0f);
+		std::fill(right, right + frames, 0.0f);
+		return 0;
+	}
+	m_impl->timeline.seek(first);
+	if (offline && running())
+	{
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		std::unique_lock lock(m_impl->output_mutex);
+		m_impl->output_wait_end = first + frames;
+		// A host may return from prefetch to realtime on its very next callback.
+		// Finish every complete quantum of the current input grant, preserving
+		// the same producer lead that realtime processing relies on.
+		m_impl->output_wait_horizon = requestedFrames() / kAudioQuantum * kAudioQuantum;
+		m_impl->output_ready.wait_until(lock, deadline, [&] {
+			return (m_impl->timeline.end() >= first + frames
+				&& m_impl->completed_horizon >= m_impl->output_wait_horizon) || !running()
+				|| m_impl->abort.load(std::memory_order_acquire);
+		});
+		m_impl->output_wait_end = 0;
+	}
+	return m_impl->timeline.read(first, left, right, frames);
+}
+
 bool ProphecyEngine::pushMidi(const std::uint8_t *bytes, std::size_t n)
 {
 	if (bytes == nullptr || n == 0) return true;
-	if (!ownsMachineSlot())
+	if (!ownsMachineSlot() || (m_impl->host_timeline && !m_impl->playback_ready.load(std::memory_order_acquire)))
 	{
 		m_impl->rejected_immediate_midi.fetch_add(n, std::memory_order_relaxed);
 		return false;
@@ -943,7 +1192,7 @@ bool ProphecyEngine::pushMidi(const std::uint8_t *bytes, std::size_t n)
 bool ProphecyEngine::pushMidiAtFrame(const std::uint8_t *bytes, std::size_t n, std::uint64_t frame)
 {
 	if (bytes == nullptr || n == 0) return true;
-	if (!ownsMachineSlot())
+	if (!ownsMachineSlot() || (m_impl->host_timeline && !m_impl->playback_ready.load(std::memory_order_acquire)))
 	{
 		m_impl->rejected_scheduled_midi.fetch_add(n, std::memory_order_relaxed);
 		return false;
@@ -965,7 +1214,7 @@ std::uint64_t ProphecyEngine::droppedScheduledMidiBytes() const
 
 void ProphecyEngine::pushPanelPulse(int row, int bit, int len_ms)
 {
-	if (!ownsMachineSlot()) return;
+	if (!ownsMachineSlot() || (m_impl->host_timeline && !m_impl->playback_ready.load(std::memory_order_acquire))) return;
 	if (row < 0 || row > 7 || bit < 0 || bit > 7) return;
 	if (len_ms <= 0) len_ms = 75;
 	if (len_ms > 2000) len_ms = 2000;
@@ -977,7 +1226,7 @@ void ProphecyEngine::pushPanelPulse(int row, int bit, int len_ms)
 
 bool ProphecyEngine::pushPanelPulseAtFrame(int row, int bit, int len_ms, std::uint64_t frame)
 {
-	if (!ownsMachineSlot() || row < 0 || row > 7 || bit < 0 || bit > 7) return false;
+	if (!ownsMachineSlot() || (m_impl->host_timeline && !m_impl->playback_ready.load(std::memory_order_acquire)) || row < 0 || row > 7 || bit < 0 || bit > 7) return false;
 	if (len_ms <= 0) len_ms = 75;
 	if (len_ms > 2000) len_ms = 2000;
 	const std::uint8_t rec[4] = {
@@ -989,7 +1238,7 @@ bool ProphecyEngine::pushPanelPulseAtFrame(int row, int bit, int len_ms, std::ui
 bool ProphecyEngine::pushAdin(int source, int value)
 {
 	if (source < 0 || source > 15 || value < 0 || value > 255) return false;
-	if (!ownsMachineSlot())
+	if (!ownsMachineSlot() || (m_impl->host_timeline && !m_impl->playback_ready.load(std::memory_order_acquire)))
 	{
 		m_impl->rejected_ui_adin.fetch_add(1, std::memory_order_relaxed);
 		return false;
@@ -1001,7 +1250,7 @@ bool ProphecyEngine::pushAdin(int source, int value)
 bool ProphecyEngine::pushAdinFromAudio(int source, int value)
 {
 	if (source < 0 || source > 15 || value < 0 || value > 255) return false;
-	if (!ownsMachineSlot())
+	if (!ownsMachineSlot() || (m_impl->host_timeline && !m_impl->playback_ready.load(std::memory_order_acquire)))
 	{
 		m_impl->rejected_audio_adin.fetch_add(1, std::memory_order_relaxed);
 		return false;
@@ -1012,8 +1261,12 @@ bool ProphecyEngine::pushAdinFromAudio(int source, int value)
 
 bool ProphecyEngine::pushAdinAtFrame(int source, int value, std::uint64_t frame)
 {
-	if (!ownsMachineSlot() || source < 0 || source > 15 || value < 0 || value > 255)
+	if (source < 0 || source > 15 || value < 0 || value > 255) return false;
+	if (!ownsMachineSlot() || (m_impl->host_timeline && !m_impl->playback_ready.load(std::memory_order_acquire)))
+	{
+		m_impl->rejected_scheduled_adin.fetch_add(1, std::memory_order_relaxed);
 		return false;
+	}
 	const std::uint8_t rec[2] = { (std::uint8_t) source, (std::uint8_t) value };
 	return g_host_timed_adin_ring.push(rec, frame);
 }
@@ -1037,7 +1290,8 @@ std::uint64_t ProphecyEngine::droppedScheduledPanelEvents() const
 
 std::uint64_t ProphecyEngine::droppedScheduledAdinEvents() const
 {
-	return ownsMachineSlot() ? g_host_timed_adin_ring.dropped() : 0;
+	return m_impl->rejected_scheduled_adin.load(std::memory_order_acquire)
+		+ (ownsMachineSlot() ? g_host_timed_adin_ring.dropped() : 0);
 }
 
 std::uint32_t ProphecyEngine::ledSnapshot(std::uint8_t out[12]) const
@@ -1132,6 +1386,6 @@ std::size_t ProphecyEngine::latestArpeggioPatternData(std::uint8_t *out, std::si
 	return g_arpeggio_pattern_dump_store.load(out, cap, version, pattern);
 }
 
-std::size_t   ProphecyEngine::available() const     { return m_impl->ring.count() / kChannels; }
+std::size_t   ProphecyEngine::available() const     { return m_impl->host_timeline ? m_impl->timeline.available() : m_impl->ring.count() / kChannels; }
 std::size_t   ProphecyEngine::ringFrames() const    { return m_impl->ring.capacity_frames(); }
 std::uint64_t ProphecyEngine::producedFrames() const { return m_impl->produced.load(); }
