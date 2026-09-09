@@ -176,6 +176,82 @@ static void concurrentRestore()
 	requireFirstNote(processor);
 }
 
+static void pendingEdits()
+{
+	ProphecyAudioProcessor processor;
+	const auto original = program(47);
+	processor.setStateInformation(original.data(), int(original.size()));
+	processor.prepareToPlay(48000, 128);
+	processor.renamePatch("StoppedRename123");
+	processor.setParam(1, 'Q');
+	processor.setParam(2, 'R');
+	processor.setParam(1, 'Z');
+	const auto frame = processor.diagnosticSnapshot().producedFrames;
+	juce::MemoryBlock saved;
+	processor.getStateInformation(saved);
+	const auto* bytes = static_cast<const std::uint8_t*>(saved.getData());
+	require(saved.getSize() > 6 && std::memcmp(bytes, "PRP3", 4) == 0, "pending edits did not use PRP3");
+	const auto pending = prophecy::ProgramDocument::decode(bytes + 6, saved.getSize() - 6);
+	require(pending && pending->edits.size() == 19, "rename/pending suffix incomplete");
+	require(pending->edits[16].value == 'Q' && pending->edits[17].value == 'R'
+		&& pending->edits[18].value == 'Z', "accepted edit order changed");
+	require(processor.diagnosticSnapshot().producedFrames == frame, "save advanced firmware");
+	processor.setStateInformation(saved.getData(), int(saved.getSize()));
+	auto expected = *pending;
+	for (const auto edit : expected.edits) expected.base[edit.parameter - 1] = std::uint8_t(edit.value);
+	expected.edits.clear();
+	requireSavedProgram(processor, expected.programMidi());
+	processor.setNonRealtime(true);
+	requireFirstNote(processor);
+}
+
+static void stateValidationAndLegacy()
+{
+	ProphecyAudioProcessor processor;
+	const auto raw = program(17);
+	processor.setStateInformation(raw.data(), int(raw.size()));
+	processor.prepareToPlay(48000, 128);
+	processor.setCcMap(9, int(ProphecyAudioProcessor::CcTarget::Wheel1));
+	processor.setWheel2(63);
+	juce::MemoryBlock before;
+	processor.getStateInformation(before);
+	std::vector<std::vector<std::uint8_t>> malformed;
+	auto badMidi = raw;
+	badMidi[12] |= 128;
+	malformed.push_back(badMidi);
+	malformed.push_back({'P','R','P','2',1,7,5,100,0xf0,0xf7});
+	malformed.push_back({'P','R','P','1',2,7,5,7,4}); // duplicate map
+	malformed.push_back({'P','R','P','2',129});
+	malformed.push_back({'P','R','P','3',0,100});
+	for (const auto& invalid : malformed)
+	{
+		processor.setStateInformation(invalid.data(), int(invalid.size()));
+		juce::MemoryBlock after;
+		processor.getStateInformation(after);
+		require(before == after && !processor.programError().empty(), "malformed state partially applied");
+	}
+	for (const bool wheel : {false,true})
+	{
+		std::vector<std::uint8_t> legacy{'P','R','P',std::uint8_t(wheel ? '2' : '1'),1,10,5};
+		if (wheel) legacy.push_back(71);
+		legacy.insert(legacy.end(), raw.begin(), raw.end());
+		processor.setStateInformation(legacy.data(), int(legacy.size()));
+		requireSavedProgram(processor, raw);
+		require(processor.ccMapTarget(10) == 5 && processor.ccMapTarget(9) == 0
+			&& processor.wheel2Pos() == (wheel ? 71 : 128), "legacy preferences changed");
+	}
+	juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Standalone);
+	ProphecyAudioProcessor standalone;
+	juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Undefined);
+	standalone.prepareToPlay(48000, 128);
+	standalone.setStateInformation(before.getData(), int(before.getSize()));
+	standalone.renamePatch("DoNotAutoPersist");
+	juce::MemoryBlock preferences;
+	standalone.getStateInformation(preferences);
+	require(preferences.getSize() == 8 && standalone.ccMapTarget(9) == 4
+		&& standalone.wheel2Pos() == 63, "standalone persisted its edit buffer or lost preferences");
+}
+
 int main()
 {
 	juce::ScopedJuceInitialiser_GUI juceInitialiser;
@@ -193,6 +269,8 @@ int main()
 	restoreWithoutRom();
 	concurrentRestore();
 	latencyNotification();
+	pendingEdits();
+	stateValidationAndLegacy();
 	require(fixture.deleteRecursively(), "fixture cleanup");
 	std::puts("state lifecycle: save/restore, zero callbacks, reprepare, edits and concurrent loading passed");
 }

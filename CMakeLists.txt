@@ -266,7 +266,7 @@ target_link_libraries(ProphecyMultiInstanceContractTest PRIVATE prophecy_engine)
 add_executable(ProphecyEngineLifecycleTest scripts/engine_lifecycle_test.cpp)
 target_link_libraries(ProphecyEngineLifecycleTest PRIVATE prophecy_engine)
 if(NOT PROPHECY_USE_FAKE_ENGINE)
-	add_executable(ProphecyProgramExchangeTest scripts/program_exchange_test.cpp)
+	add_executable(ProphecyProgramExchangeTest scripts/program_exchange_test.cpp src/program_control.cpp)
 	target_link_libraries(ProphecyProgramExchangeTest PRIVATE prophecy_engine)
 endif()
 if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
@@ -420,7 +420,7 @@ foreach(_fmt AU VST3 Standalone)
 endforeach()
 endif()
 
-target_sources(ProphecyPlugin PRIVATE src/PluginProcessor.cpp)
+target_sources(ProphecyPlugin PRIVATE src/PluginProcessor.cpp src/program_control.cpp)
 
 # Embed the WebView editor's HTML/CSS/JS (single self-contained file for now).
 juce_add_binary_data(ProphecyData SOURCES

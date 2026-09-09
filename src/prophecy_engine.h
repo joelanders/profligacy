@@ -10,6 +10,8 @@
 //
 #pragma once
 
+#include "program_document.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -84,7 +86,7 @@ public:
 	// Non-realtime initialization, before playback. Run firmware boot and any
 	// initial patch load outside the host epoch, then publish its native origin.
 	bool initializePlayback(const std::uint8_t *state = nullptr, std::size_t bytes = 0,
-		bool firmwareHandshake = true);
+		bool firmwareHandshake = true, const std::vector<prophecy::ProgramEdit>& edits = {});
 	bool readyForPlayback() const;
 	const char* initializationError() const; // stable message, empty on success
 	std::uint64_t playbackOrigin() const;

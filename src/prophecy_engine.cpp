@@ -1128,12 +1128,20 @@ bool ProphecyEngine::waitingForInput() const
 }
 
 bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t bytes,
-	bool firmwareHandshake)
+	bool firmwareHandshake, const std::vector<prophecy::ProgramEdit>& edits)
 {
 	std::lock_guard initializationLock(m_impl->initialization_mutex);
 	if (!running() || !m_impl->host_timeline) return false;
+	if ((bytes && !prophecy::ProgramDocument::fromMidi(state, bytes))
+		|| (!edits.empty() && (!bytes || !firmwareHandshake))
+		|| edits.size() > prophecy::ProgramDocument::maxEdits
+		|| std::any_of(edits.begin(), edits.end(), [](const auto& edit) { return !edit.supported(); }))
+	{
+		m_impl->initialization_error.store("The saved program is invalid.", std::memory_order_release);
+		return false;
+	}
 	const bool wasReady = m_impl->playback_ready.exchange(false, std::memory_order_acq_rel);
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 	auto advance = [&] {
 		if (std::chrono::steady_clock::now() >= deadline) return false;
 		const auto end = (requestedFrames() / kAudioQuantum + 4) * kAudioQuantum;
@@ -1256,6 +1264,28 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 		failure = "Firmware program memory does not match its MIDI representation.";
 		if (current.size() != 535 || (size && (size != current.size()
 			|| !std::equal(current.begin(), current.end(), dumped)))) return fail();
+	}
+	// Replay semantic operations in their saved order. Use the same per-operation
+	// query/identity boundary as live editing; no host callback is needed here.
+	for (const auto edit : edits)
+	{
+		deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		failure = "A saved program edit did not complete.";
+		const auto message = edit.midi(g_firmware_channel.load(std::memory_order_acquire));
+		if (!g_initialization_midi_ring.pushAll(message.data(), message.size())) return fail();
+		std::uint32_t before = 0, version = 0;
+		g_program_dump_store.load(nullptr, 0, &before);
+		do
+		{
+			const auto identity = g_identity_replies.load(std::memory_order_acquire);
+			const std::uint8_t boundary[]{0xf0, 0x42,
+				std::uint8_t(0x30 | g_firmware_channel.load(std::memory_order_acquire)), 0x41, 0x10, 0, 0xf7,
+				0xf0, 0x7e, 0x7f, 6, 1, 0xf7};
+			if (!g_initialization_midi_ring.pushAll(boundary, sizeof(boundary))) return fail();
+			while (g_identity_replies.load(std::memory_order_acquire) == identity)
+				if (!advance()) return fail();
+			g_program_dump_store.load(nullptr, 0, &version);
+		} while (version == before);
 	}
 	m_impl->program_snapshot_enabled.store(firmwareHandshake, std::memory_order_release);
 	if (std::getenv("PROPHOST_INIT_STATS")) std::fprintf(stderr, "init ready at %llu\n", (unsigned long long) requestedFrames());

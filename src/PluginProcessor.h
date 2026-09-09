@@ -11,6 +11,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "prophecy_engine.h"
+#include "program_control.h"
 
 #include <array>
 #include <atomic>
@@ -42,8 +43,7 @@ public:
 	std::uint64_t droppedScheduledMidiBytes() const
 	{ return m_engine.droppedScheduledMidiBytes(); }
 	std::uint64_t droppedImmediateMidiBytes() const
-	{ return m_engine.droppedImmediateMidiBytes()
-		+ m_contendedImmediateMidiBytes.load(std::memory_order_relaxed); }
+	{ return m_engine.droppedImmediateMidiBytes(); }
 	std::uint64_t droppedUiAdinEvents() const
 	{ return m_engine.droppedUiAdinEvents()
 		+ m_contendedUiAdinEvents.load(std::memory_order_relaxed); }
@@ -105,6 +105,7 @@ public:
 	// ROM picker: where the engine's firmware comes from. If no valid ROM set is found
 	// the engine stays unbooted and the editor shows the first-run picker.
 	bool romOk() const { return m_engine.readyForPlayback(); }
+	std::string programError() const { return m_programControl.error(); }
 	const char* initializationError() const { return m_engine.initializationError(); }
 	bool instanceUnavailable() const
 	{
@@ -155,8 +156,7 @@ public:
 	void renamePatch(const juce::String &name);
 	// Quick-init patch-shaping macros (Init / Saw / Filter THRU / Bypass FX), ported from
 	// the MAME-tree GUI (src/tools/korgprophecy_gui + scripts/korgprophecy_macros.py). Each
-	// is a batch of Parameter Change writes delivered through a paced ParamBurst (the
-	// firmware drops back-to-back sysex). OSC1-specific params are ExID-packed (paramId =
+	// is accepted as one ordered semantic edit sequence. OSC1-specific params are ExID-packed (paramId =
 	// (1<<12)|param); a p154 (OSC Set) write, if present, is re-asserted LAST so the live
 	// DSP1 engine reloads cleanly (a std-osc write right after a reconfig gets clobbered).
 	void sendMacro(const juce::String &name);
@@ -205,298 +205,6 @@ private:
 	WriteSequence      m_writeSeq { *this };
 	std::atomic<bool>  m_writeInProgress { false };
 
-	// Paced param-burst sender: the firmware drops sysex messages that arrive
-	// back-to-back at line rate while it is busy (verified: mid-burst rename chars
-	// lost with a Motion patch in the edit buffer). One param per tick, the way a
-	// real editor paces sysex. A new start() replaces any burst still in flight.
-	class ParamBurst : private juce::Timer
-	{
-	public:
-		explicit ParamBurst(ProphecyAudioProcessor &p) : m_proc(p) {}
-		~ParamBurst() override { stopTimer(); }
-		void start(std::vector<std::pair<int, int>> paramValues, int intervalMs = 15)
-		{
-			stopTimer();
-			m_items = std::move(paramValues);
-			m_next = 0;
-			startTimer(intervalMs);
-		}
-		bool cancel()
-		{
-			const bool wasRunning = isTimerRunning();
-			stopTimer();
-			m_items.clear();
-			m_next = 0;
-			return wasRunning;
-		}
-	private:
-		void timerCallback() override
-		{
-			if (m_next >= m_items.size()) { stopTimer(); return; }
-			m_proc.setParam(m_items[m_next].first, m_items[m_next].second);
-			m_next++;
-		}
-		ProphecyAudioProcessor &m_proc;
-		std::vector<std::pair<int, int>> m_items;
-		std::size_t m_next = 0;
-	};
-	ParamBurst         m_renameBurst { *this };
-	ParamBurst         m_macroBurst  { *this }; // quick-init patch macros (sendMacro)
-
-	// Serialized editor commands share one bounded, coalescing path. The
-	// firmware can wedge its internal H8/V55 link if a patch load overlaps a burst
-	// of independent editor commands even though the host MIDI rings never drop a
-	// byte. MIDI edit commands and panel presses are therefore paced and held behind
-	// the patch-load barrier. ADIN writes model physical controls polled by the
-	// firmware, so they bypass this serial-command pacer.
-	class EditorCommandPacer : private juce::Timer
-	{
-	public:
-		explicit EditorCommandPacer(ProphecyAudioProcessor &p) : m_proc(p) {}
-		~EditorCommandPacer() override { stopTimer(); }
-		void holdForPatchLoad(int milliseconds)
-		{
-			m_cancelled.fetch_add(m_queue.size(), std::memory_order_relaxed);
-			m_queue.clear();
-			m_holdUntilMs = juce::Time::getMillisecondCounterHiRes()
-				+ (double)std::max(milliseconds, 0);
-			startTimer(10);
-		}
-		void extendPatchLoad(int milliseconds)
-		{
-			m_holdUntilMs = std::max(m_holdUntilMs,
-				juce::Time::getMillisecondCounterHiRes()
-					+ (double)std::max(milliseconds, 0));
-			if (!isTimerRunning()) startTimer(10);
-		}
-		void enqueueMidi(int key, const std::uint8_t *bytes, std::size_t size)
-		{
-			if (bytes == nullptr || size == 0) return;
-			for (auto it = m_queue.rbegin(); it != m_queue.rend(); ++it)
-			{
-				if (key >= 0 && it->kind == Command::Kind::Midi && it->key == key)
-				{
-					it->bytes.assign(bytes, bytes + size);
-					m_coalesced.fetch_add(1, std::memory_order_relaxed);
-					return;
-				}
-			}
-			if (m_queue.size() >= kCapacity)
-			{
-				m_dropped.fetch_add(1, std::memory_order_relaxed);
-				return;
-			}
-			Command command;
-			command.kind = Command::Kind::Midi;
-			command.key = key;
-			command.bytes.assign(bytes, bytes + size);
-			m_queue.push_back(std::move(command));
-			if (!isTimerRunning()) startTimer(1);
-		}
-		void enqueuePanel(int row, int bit)
-		{
-			if (m_queue.size() >= kCapacity)
-			{
-				m_dropped.fetch_add(1, std::memory_order_relaxed);
-				return;
-			}
-			Command command;
-			command.kind = Command::Kind::Panel;
-			command.a = row;
-			command.b = bit;
-			m_queue.push_back(std::move(command));
-			if (!isTimerRunning()) startTimer(1);
-		}
-		bool busy() const
-		{
-			return !m_queue.empty()
-				|| juce::Time::getMillisecondCounterHiRes() < m_holdUntilMs
-				|| m_proc.patchLoadBarrierActive();
-		}
-		std::uint64_t sent() const { return m_sent.load(std::memory_order_relaxed); }
-		std::uint64_t coalesced() const { return m_coalesced.load(std::memory_order_relaxed); }
-		std::uint64_t cancelled() const { return m_cancelled.load(std::memory_order_relaxed); }
-		std::uint64_t dropped() const { return m_dropped.load(std::memory_order_relaxed); }
-		std::size_t pending() const { return m_queue.size(); }
-	private:
-		struct Command
-		{
-			enum class Kind { Midi, Panel } kind = Kind::Midi;
-			int key = -1;
-			int a = 0, b = 0;
-			std::vector<std::uint8_t> bytes;
-		};
-		void timerCallback() override
-		{
-			const double now = juce::Time::getMillisecondCounterHiRes();
-			if (m_proc.patchLoadBarrierActive())
-			{
-				// DAW Program Changes extend the frame-based editor-command barrier
-				// on the audio callback. Observe it here instead of starting or
-				// touching a JUCE timer from the real-time thread. Host MIDI itself
-				// remains unfiltered.
-				startTimer(25);
-				return;
-			}
-			if (now < m_holdUntilMs)
-			{
-				startTimer(std::max(1, (int)std::ceil(m_holdUntilMs - now)));
-				return;
-			}
-			if (m_queue.empty()) { stopTimer(); return; }
-			Command &command = m_queue.front();
-			bool accepted = true;
-			if (command.kind == Command::Kind::Midi)
-				accepted = m_proc.pushImmediateMidi(command.bytes.data(), command.bytes.size());
-			else
-				m_proc.m_engine.pushPanelPulse(command.a, command.b);
-			if (accepted)
-			{
-				m_queue.pop_front();
-				m_sent.fetch_add(1, std::memory_order_relaxed);
-			}
-			startTimer(accepted ? kIntervalMs : 25);
-		}
-		static constexpr std::size_t kCapacity = 256;
-		static constexpr int kIntervalMs = 75;
-		ProphecyAudioProcessor &m_proc;
-		std::deque<Command> m_queue;
-		double m_holdUntilMs = -1.0e9;
-		std::atomic<std::uint64_t> m_sent { 0 };
-		std::atomic<std::uint64_t> m_coalesced { 0 };
-		std::atomic<std::uint64_t> m_cancelled { 0 };
-		std::atomic<std::uint64_t> m_dropped { 0 };
-	};
-	EditorCommandPacer m_editorCommandPacer { *this };
-	// Program loading plus concurrent editor mutations can wedge the emulated H8/V55
-	// control link. Hold editor commands and dump requests for a bounded interval after
-	// editor or DAW Program Change, but never discard the host's MIDI stream.
-	void holdEditorCommandsForPatchLoad(double seconds);
-	bool patchLoadBarrierActive() const
-	{
-		return m_audioHostFrames.load(std::memory_order_relaxed)
-			< m_patchLoadBarrierUntilFrame.load(std::memory_order_acquire);
-	}
-	static constexpr double kPatchLoadSettleSeconds = 2.0;
-	static constexpr double kPatchSelectMinIntervalMs = 2500.0;
-	bool sendPatchNow(int program);
-	class PatchSelectDelay : private juce::Timer
-	{
-	public:
-		explicit PatchSelectDelay(ProphecyAudioProcessor &p) : m_proc(p) {}
-		~PatchSelectDelay() override { stopTimer(); }
-		bool pending() const { return isTimerRunning(); }
-		void schedule(int program)
-		{
-			m_program = program;
-			startTimer(500);
-		}
-	private:
-		void timerCallback() override
-		{
-			stopTimer();
-			if (!m_proc.sendPatchNow(m_program)) startTimer(25);
-		}
-		ProphecyAudioProcessor &m_proc;
-		int m_program = 0;
-	};
-	PatchSelectDelay   m_patchSelectDelay { *this };
-
-	// Current-program dumps share the firmware MIDI task with Program Change. Keep one
-	// editor request in flight, wait for a recently selected patch to finish loading,
-	// and retry a request the firmware discarded while busy. The WebView and headless
-	// editor-stress scenario both enter through requestProgramDump(), so this is the one
-	// production scheduling policy rather than a second test-only approximation.
-	class ProgramDumpSync : private juce::Timer
-	{
-	public:
-		explicit ProgramDumpSync(ProphecyAudioProcessor &p) : m_proc(p) {}
-		~ProgramDumpSync() override { stopTimer(); }
-		std::uint64_t request(int delayMs)
-		{
-			std::uint8_t byte = 0;
-			std::uint32_t currentVersion = 0;
-			m_proc.getProgramData(&byte, 1, &currentVersion);
-			if (isTimerRunning())
-			{
-				// Reuse a genuinely pending transaction, but do not suppress a new manual
-				// refresh merely because the completed transaction's 800 ms check has not run.
-				if (!m_sent.load(std::memory_order_acquire)
-						|| currentVersion <= m_baselineVersion.load(std::memory_order_acquire))
-					return m_generation.load(std::memory_order_acquire);
-				stopTimer();
-			}
-			m_baselineVersion.store(currentVersion, std::memory_order_release);
-			m_generation.store(m_nextGeneration.fetch_add(1, std::memory_order_relaxed) + 1,
-				std::memory_order_release);
-			m_attempts = 0;
-			m_sent.store(false, std::memory_order_release);
-			if (delayMs > 0) startTimer(delayMs);
-			else sendRequest();
-			return m_generation.load(std::memory_order_acquire);
-		}
-		void cancel()
-		{
-			stopTimer();
-			m_attempts = 0;
-			m_sent.store(false, std::memory_order_release);
-		}
-		std::uint64_t observe(std::uint32_t version) const
-		{
-			const std::uint64_t generation = m_generation.load(std::memory_order_acquire);
-			if (generation != 0 && m_sent.load(std::memory_order_acquire)
-					&& version > m_baselineVersion.load(std::memory_order_acquire))
-			{
-				std::uint64_t completed = m_completedGeneration.load(std::memory_order_relaxed);
-				while (completed < generation && !m_completedGeneration.compare_exchange_weak(
-					completed, generation, std::memory_order_release, std::memory_order_relaxed)) {}
-			}
-			return m_completedGeneration.load(std::memory_order_acquire);
-		}
-	private:
-		void sendRequest()
-		{
-			if (m_proc.m_editorCommandPacer.busy()) { startTimer(100); return; }
-			const bool firstAttempt = m_attempts == 0;
-			++m_attempts;
-			(void)m_proc.sendProgramDumpNow();
-			if (firstAttempt)
-			{
-				// A request may have waited behind a patch load for seconds. Refresh
-				// the baseline immediately after the causal enqueue boundary so an
-				// obsolete reply that arrived during that delay cannot complete this
-				// generation. The firmware cannot round-trip the new serial request
-				// before this same-thread snapshot.
-				std::uint8_t byte = 0;
-				std::uint32_t version = 0;
-				m_proc.getProgramData(&byte, 1, &version);
-				m_baselineVersion.store(version, std::memory_order_release);
-			}
-			m_sent.store(true, std::memory_order_release);
-			startTimer(800);
-		}
-		void timerCallback() override
-		{
-			if (!m_sent.load(std::memory_order_acquire)) { sendRequest(); return; }
-			std::uint8_t byte = 0;
-			std::uint32_t version = 0;
-			m_proc.getProgramData(&byte, 1, &version);
-			if (observe(version) >= m_generation.load(std::memory_order_acquire))
-				{ stopTimer(); return; }
-			if (m_attempts >= 3) { stopTimer(); return; }
-			sendRequest();
-		}
-		ProphecyAudioProcessor &m_proc;
-		std::atomic<std::uint32_t> m_baselineVersion { 0 };
-		int m_attempts = 0;
-		std::atomic<bool> m_sent { false };
-		std::atomic<std::uint64_t> m_nextGeneration { 0 };
-		std::atomic<std::uint64_t> m_generation { 0 };
-		mutable std::atomic<std::uint64_t> m_completedGeneration { 0 };
-	};
-	ProgramDumpSync    m_programDumpSync { *this };
-	bool sendProgramDumpNow();
-	double             m_lastPatchSendMs = -1.0e9;
 
 	// CC->ADIN remap table (target per CC number; 0 = Off = pass through raw). Written on
 	// the message thread, read on the audio thread. m_padXHeld/m_padYHeld gate ADIN14
@@ -516,21 +224,8 @@ private:
 	// editor. Serialize those non-RT producers with one try only: contention drops the
 	// complete message/event and increments a metric. processBlock uses separate rings and
 	// never touches these flags, so the audio thread cannot block or spin behind UI work.
-	std::atomic_flag m_immediateMidiProducer = ATOMIC_FLAG_INIT;
 	std::atomic_flag m_uiAdinProducer = ATOMIC_FLAG_INIT;
-	std::atomic<std::uint64_t> m_contendedImmediateMidiBytes { 0 };
 	std::atomic<std::uint64_t> m_contendedUiAdinEvents { 0 };
-	bool pushImmediateMidi(const std::uint8_t *bytes, std::size_t n)
-	{
-		if (m_immediateMidiProducer.test_and_set(std::memory_order_acquire))
-		{
-			m_contendedImmediateMidiBytes.fetch_add(n, std::memory_order_relaxed);
-			return false;
-		}
-		const bool accepted = m_engine.pushMidi(bytes, n);
-		m_immediateMidiProducer.clear(std::memory_order_release);
-		return accepted;
-	}
 	bool pushUiAdin(int source, int value)
 	{
 		if (m_uiAdinProducer.test_and_set(std::memory_order_acquire))
@@ -544,6 +239,7 @@ private:
 	}
 
 	ProphecyEngine     m_engine;
+	prophecy::ProgramControl m_programControl{m_engine};
 	std::atomic<bool>  m_started { false };
 	juce::String       m_romPath;             // resolved ROM dir once booted
 	juce::String       m_nvramPath;           // resolved NVRAM dir once booted
@@ -566,7 +262,6 @@ private:
 	std::atomic<std::uint64_t> m_editorPatchSends { 0 };
 	std::atomic<std::uint64_t> m_editorDumpRequests { 0 };
 	std::atomic<std::uint64_t> m_editorDumpSends { 0 };
-	std::atomic<std::uint64_t> m_patchLoadBarrierUntilFrame { 0 };
 	std::array<std::atomic<std::uint64_t>, 2> m_activeHostNotes {};
 	bool               m_skipStateRestore = false;
 
@@ -576,13 +271,10 @@ private:
 	// Host lifecycle/state operations are serialized off the audio thread.
 	// A retained program becomes confirmed only after firmware readback succeeds.
 	std::mutex m_stateMutex;
-	std::vector<std::uint8_t> m_restoredProgram;
-	bool m_restoredProgramConfirmed = false;
 	bool bootEngine();
 	bool restoreProgram(bool firmwareHandshake = true);
 	std::atomic<bool> m_processingPaused{false};
 	std::atomic<bool> m_callbackAccess{false};
-	std::atomic<bool> m_playbackStarted{false}; // current preparation/restoration epoch
 
 	JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ProphecyAudioProcessor)
 };

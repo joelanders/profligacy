@@ -172,8 +172,51 @@ static int initialStateTest(const char* path, const std::string& order)
 	return 0;
 }
 
+static int pendingStateTest()
+{
+	juce::ScopedJuceInitialiser_GUI juceInitialiser;
+	ProphecyAudioProcessor processor;
+	processor.setNonRealtime(true);
+	processor.prepareToPlay(48000, 128);
+	if (!processor.romOk()) return 1;
+	for (const auto& [parameter, value] : {std::pair{1,int('Q')}, {635,99},
+		{635,32}, {154,1}, {154,0}, {1,int('R')}}) processor.setParam(parameter, value);
+	const auto stoppedFrame = processor.diagnosticSnapshot().producedFrames;
+	juce::MemoryBlock pending;
+	processor.getStateInformation(pending);
+	if (pending.getSize() <= 6 || std::memcmp(pending.getData(), "PRP3", 4) != 0
+		|| processor.diagnosticSnapshot().producedFrames != stoppedFrame) return 1;
+	juce::MidiBuffer midi;
+	juce::AudioBuffer<float> audio(2, 128);
+	const auto request = processor.requestProgramDump();
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+	std::array<std::uint8_t, 535> live{}, restored{};
+	std::uint64_t completed = 0;
+	for (int block = 0; completed < request; ++block)
+	{
+		if (std::chrono::steady_clock::now() >= deadline || !processor.programError().empty())
+		{
+			std::fprintf(stderr, "pending live edits: %s\n", processor.programError().c_str());
+			return 1;
+		}
+		processor.processBlock(audio, midi);
+		processor.getProgramData(live.data(), live.size(), nullptr, &completed);
+		if (block % 8 == 0) juce::Thread::sleep(1);
+	}
+	processor.releaseResources();
+	processor.setStateInformation(pending.getData(), int(pending.getSize()));
+	if (!processor.romOk() || processor.getProgramData(restored.data(), restored.size(), nullptr) != live.size()
+		|| live != restored || live[0] != 'R') return 1;
+	juce::MemoryBlock confirmed;
+	processor.getStateInformation(confirmed);
+	if (confirmed.getSize() <= 6 || std::memcmp(confirmed.getData(), "PRP2", 4) != 0) return 1;
+	std::puts("PASS processor immediate PRP3 save and stopped restore match all 535 live program bytes");
+	return 0;
+}
+
 int main(int argc, char** argv)
 {
+	if (argc == 2 && std::string(argv[1]) == "--pending-state") return pendingStateTest();
 	if (argc == 3 && std::string(argv[1]) == "--export-initial-state")
 	{
 		juce::ScopedJuceInitialiser_GUI juceInitialiser;

@@ -41,6 +41,16 @@ struct ProphecyEngine::Impl
 	mutable std::mutex programMutex;
 	std::vector<std::uint8_t> program;
 	std::uint32_t programVersion = 0;
+	std::uint64_t nextExchange = 0, exchange = 0, exchangeFrame = 0;
+	std::vector<std::uint8_t> exchangeBytes;
+	void applyEdit(prophecy::ProgramEdit edit)
+	{
+		// The shell models name edits only. Secondary-effect behavior is tested
+		// against native firmware, never inferred from this deterministic stub.
+		if (program.size() == 535 && edit.parameter >= 1 && edit.parameter <= 16)
+			program[edit.parameter - 1] = std::uint8_t(edit.value);
+	}
+
 	void loadProgram(const std::uint8_t* state, std::size_t bytes)
 	{
 		if (bytes < 8 || state[0] != 0xf0 || state[4] != 0x40 || state[bytes - 1] != 0xf7) return;
@@ -79,9 +89,13 @@ bool ProphecyEngine::start(const std::vector<std::string> &)
 
 bool ProphecyEngine::enableMidiTxByteCapture(bool) { return !m_impl->started.load(); }
 bool ProphecyEngine::enableHostTimeline() { return !m_impl->started.load(); }
-bool ProphecyEngine::initializePlayback(const std::uint8_t* state, std::size_t bytes, bool)
+bool ProphecyEngine::initializePlayback(const std::uint8_t* state, std::size_t bytes, bool,
+	const std::vector<prophecy::ProgramEdit>& edits)
 {
-	if (!running()) return false;
+	if (!running() || (bytes && !prophecy::ProgramDocument::fromMidi(state, bytes))
+		|| (!edits.empty() && !bytes)
+		|| edits.size() > prophecy::ProgramDocument::maxEdits
+		|| std::any_of(edits.begin(), edits.end(), [](const auto& edit) { return !edit.supported(); })) return false;
 	m_impl->ready.store(false);
 	{
 		std::unique_lock lock(initializationMutex);
@@ -97,6 +111,8 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t* state, std::size_t b
 			m_impl->program.assign(535, 0);
 			++m_impl->programVersion;
 		}
+		for (const auto edit : edits) m_impl->applyEdit(edit);
+		m_impl->exchange = 0;
 	}
 	if (state && bytes)
 	{
@@ -232,3 +248,45 @@ std::size_t ProphecyEngine::latestArpeggioPatternData(std::uint8_t *, std::size_
 std::size_t ProphecyEngine::available() const { return running() ? ringFrames() : 0; }
 std::size_t ProphecyEngine::ringFrames() const { return 2048; }
 std::uint64_t ProphecyEngine::producedFrames() const { return m_impl->produced.load(); }
+
+
+std::uint64_t ProphecyEngine::beginProgramExchange(const std::uint8_t* bytes, std::size_t size)
+{
+	std::lock_guard lock(m_impl->programMutex);
+	if (!readyForPlayback() || m_impl->exchange || size > kMaxProgramBatchBytes || (size && !bytes)) return 0;
+	m_impl->exchangeBytes.clear();
+	if (size) m_impl->exchangeBytes.assign(bytes, bytes + size);
+	m_impl->exchangeFrame = producedFrames();
+	return m_impl->exchange = ++m_impl->nextExchange;
+}
+
+ProphecyEngine::ProgramExchangeStatus ProphecyEngine::pollProgramExchange(
+	std::uint64_t ticket, std::vector<std::uint8_t>& program)
+{
+	std::lock_guard lock(m_impl->programMutex);
+	program.clear();
+	if (!running() || !ticket || ticket != m_impl->exchange) return ProgramExchangeStatus::Failed;
+	if (producedFrames() == m_impl->exchangeFrame) return ProgramExchangeStatus::Pending;
+	const auto& bytes = m_impl->exchangeBytes;
+	if (const auto edit = prophecy::ProgramEdit::fromMidi(bytes.data(), bytes.size())) m_impl->applyEdit(*edit);
+	else if (!bytes.empty()) m_impl->loadProgram(bytes.data(), bytes.size());
+	program = m_impl->program;
+	m_impl->exchange = 0;
+	return ProgramExchangeStatus::Complete;
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotProgram()
+{
+	std::lock_guard lock(m_impl->programMutex);
+	return readyForPlayback() ? m_impl->program : std::vector<std::uint8_t>{};
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotStoredProgram(int slot)
+{
+	return slot >= 0 && slot < 128 ? snapshotProgram() : std::vector<std::uint8_t>{};
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotGlobals()
+{
+	return readyForPlayback() ? std::vector<std::uint8_t>(574, 0) : std::vector<std::uint8_t>{};
+}
