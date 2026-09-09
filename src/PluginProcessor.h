@@ -6,6 +6,8 @@
 //
 #pragma once
 
+#include "audio_timeline.h"
+
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "prophecy_engine.h"
@@ -14,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -24,7 +27,7 @@ public:
 	~ProphecyAudioProcessor() override;
 
 	void prepareToPlay(double sampleRate, int samplesPerBlock) override;
-	void releaseResources() override {}
+	void releaseResources() override;
 	bool isBusesLayoutSupported(const BusesLayout &layouts) const override;
 	void processBlock(juce::AudioBuffer<float> &, juce::MidiBuffer &) override;
 
@@ -45,7 +48,7 @@ public:
 	{ return m_engine.droppedUiAdinEvents()
 		+ m_contendedUiAdinEvents.load(std::memory_order_relaxed); }
 	std::uint64_t droppedAudioAdinEvents() const
-	{ return m_engine.droppedAudioAdinEvents(); }
+	{ return m_engine.droppedAudioAdinEvents() + m_engine.droppedScheduledAdinEvents(); }
 	std::uint64_t oversizedAudioBlocks() const
 	{ return m_oversizedAudioBlocks.load(std::memory_order_relaxed); }
 	struct DiagnosticSnapshot
@@ -101,7 +104,8 @@ public:
 	double hostSampleRate() const { return m_hostSampleRate; }
 	// ROM picker: where the engine's firmware comes from. If no valid ROM set is found
 	// the engine stays unbooted and the editor shows the first-run picker.
-	bool romOk() const { return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active; }
+	bool romOk() const { return m_engine.readyForPlayback(); }
+	const char* initializationError() const { return m_engine.initializationError(); }
 	bool instanceUnavailable() const
 	{
 		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Unavailable;
@@ -185,6 +189,8 @@ public:
 	{ return m_engine.latestArpeggioPatternData(out, cap, version, pattern); }
 
 private:
+	mutable std::recursive_mutex m_stateMutex; // host state and editor timers; never audio
+
 	// Drives writePatch()'s unprotect -> WRITE -> ENTER -> ENTER -> re-protect sequence off the
 	// message thread's timer, so the firmware sees the panel pulses as distinct presses.
 	class WriteSequence : private juce::Timer
@@ -193,6 +199,7 @@ private:
 		explicit WriteSequence(ProphecyAudioProcessor &p) : m_proc(p) {}
 		~WriteSequence() override { stopTimer(); }
 		void start() { if (!isTimerRunning()) { m_step = 0; startTimer(400); } }
+		bool cancel() { stopTimer(); return m_proc.m_writeInProgress.exchange(false); }
 	private:
 		void timerCallback() override;
 		ProphecyAudioProcessor &m_proc;
@@ -228,6 +235,8 @@ private:
 	private:
 		void timerCallback() override
 		{
+			std::unique_lock stateLock(m_proc.m_stateMutex, std::try_to_lock);
+			if (!stateLock || !isTimerRunning()) return;
 			if (m_next >= m_items.size()) { stopTimer(); return; }
 			m_proc.setParam(m_items[m_next].first, m_items[m_next].second);
 			m_next++;
@@ -303,6 +312,13 @@ private:
 			m_queue.push_back(std::move(command));
 			if (!isTimerRunning()) startTimer(1);
 		}
+		void cancel()
+		{
+			stopTimer();
+			m_cancelled.fetch_add(m_queue.size(), std::memory_order_relaxed);
+			m_queue.clear();
+			m_holdUntilMs = -1.0e9;
+		}
 		bool busy() const
 		{
 			return !m_queue.empty()
@@ -324,6 +340,8 @@ private:
 		};
 		void timerCallback() override
 		{
+			std::unique_lock stateLock(m_proc.m_stateMutex, std::try_to_lock);
+			if (!stateLock || !isTimerRunning()) return;
 			const double now = juce::Time::getMillisecondCounterHiRes();
 			if (m_proc.patchLoadBarrierActive())
 			{
@@ -382,6 +400,7 @@ private:
 		explicit PatchSelectDelay(ProphecyAudioProcessor &p) : m_proc(p) {}
 		~PatchSelectDelay() override { stopTimer(); }
 		bool pending() const { return isTimerRunning(); }
+		void cancel() { stopTimer(); }
 		void schedule(int program)
 		{
 			m_program = program;
@@ -390,6 +409,8 @@ private:
 	private:
 		void timerCallback() override
 		{
+			std::unique_lock stateLock(m_proc.m_stateMutex, std::try_to_lock);
+			if (!stateLock || !isTimerRunning()) return;
 			stopTimer();
 			if (!m_proc.sendPatchNow(m_program)) startTimer(25);
 		}
@@ -473,6 +494,8 @@ private:
 		}
 		void timerCallback() override
 		{
+			std::unique_lock stateLock(m_proc.m_stateMutex, std::try_to_lock);
+			if (!stateLock || !isTimerRunning()) return;
 			if (!m_sent.load(std::memory_order_acquire)) { sendRequest(); return; }
 			std::uint8_t byte = 0;
 			std::uint32_t version = 0;
@@ -507,7 +530,7 @@ private:
 	std::atomic<std::uint8_t> m_wheel2Pos { 0x80 };
 	std::array<std::atomic<std::uint8_t>, 16> m_controllerDisplayValues {};
 	void publishControllerDisplayValue(int source, int value);
-	void handleMappedCc(int cc, int value, CcTarget target); // audio thread
+	void handleMappedCc(int cc, int value, CcTarget target, std::uint64_t frame); // audio thread
 	// Host state callbacks are not guaranteed to share the JUCE message thread with the
 	// editor. Serialize those non-RT producers with one try only: contention drops the
 	// complete message/event and increments a metric. processBlock uses separate rings and
@@ -544,9 +567,10 @@ private:
 	juce::String       m_romPath;             // resolved ROM dir once booted
 	juce::String       m_nvramPath;           // resolved NVRAM dir once booted
 	double             m_hostSampleRate = 48000.0;
-	std::uint64_t      m_hostMidiFrameCursor = 0;
+	prophecy::SampleTimeline m_timeline;
+	std::uint64_t      m_timelineHostFrame = 0;
+	bool               m_timelineAttached = false;
 	int                m_preparedMaxBlock = 0;
-	std::vector<float> m_scratchL, m_scratchR; // mono/resampler output; allocated in prepare
 	std::atomic<std::uint64_t> m_oversizedAudioBlocks { 0 };
 	// Lock-free counters sampled by the optional GUI diagnostic logger. The audio callback
 	// only updates atomics; all formatting and file I/O stays on the message thread.
@@ -566,16 +590,17 @@ private:
 	bool               m_skipStateRestore = false;
 
 	// host!=48k resampling (engine is authoritative at 48 kHz)
-	juce::LagrangeInterpolator m_resampler[2];
-	std::vector<float>         m_rsIn[2];       // leftover 48k input, preallocated
-	int                        m_rsInCount = 0;
+	std::vector<float>         m_rsIn[2];       // absolute native input window, preallocated
 
-	// DAW patch persistence (current-program SysEx dump). setState stashes a dump to inject
-	// once the machine has booted; processBlock does the one-shot injection. The standalone
-	// intentionally ignores this dump and boots from explicitly written synth NVRAM instead.
-	std::vector<std::uint8_t> m_pendingState;
-	std::atomic<bool>         m_pendingReady { false };
-	std::atomic<bool>         m_pendingInjected { false };
+	// Host lifecycle/state operations are serialized off the audio thread.
+	// A retained program becomes confirmed only after firmware readback succeeds.
+	std::vector<std::uint8_t> m_restoredProgram;
+	bool m_restoredProgramConfirmed = false;
+	bool bootEngine();
+	bool restoreProgram(bool firmwareHandshake = true);
+	std::atomic<bool> m_processingPaused{false};
+	std::atomic<bool> m_callbackAccess{false};
+	std::atomic<bool> m_playbackStarted{false}; // current preparation/restoration epoch
 
 	JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ProphecyAudioProcessor)
 };

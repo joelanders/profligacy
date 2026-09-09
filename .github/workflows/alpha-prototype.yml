@@ -12,6 +12,10 @@ on:
           - both
           - macos-arm64
           - windows-x64
+      include_sdk:
+        description: Upload native SDK for local development
+        type: boolean
+        default: false
 
 concurrency:
   group: alpha-release-${{ github.ref }}-${{ inputs.target }}
@@ -21,8 +25,8 @@ permissions:
   contents: read
 
 env:
-  MAME_SHA: f558ea734930284de1e1326cb0033ce16832940c
-  MAME_TREE: 074790ea0648e0f50527c7c621b37a9fd55e77f9
+  MAME_SHA: 72e702f92fd6d45849f036e01b5004847859abc6
+  MAME_TREE: cd0c0d5b7bf7f14decec74dc45caaf1b517fc6b9
 
 jobs:
   macos-arm64:
@@ -100,6 +104,16 @@ jobs:
           if test -d "$RUNNER_TEMP/mame-build-full"; then
             cmake -E remove_directory "$RUNNER_TEMP/mame-build-full"
           fi
+      - name: Upload optional development SDK
+        if: inputs.include_sdk
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: development-sdk-macos-arm64-${{ env.MAME_SHA }}
+          path: |
+            ${{ runner.temp }}/mame-sdk-macos-arm64.zip
+            ${{ runner.temp }}/sdl2-2.32.10
+          retention-days: 3
+          if-no-files-found: error
       - name: Configure the real product
         run: >-
           cmake -S . -B build-prototype -G "Unix Makefiles"
@@ -115,15 +129,18 @@ jobs:
           ProphecyPlugin_VST3
           ProphecyPlugin_Standalone
           ProphecyArtifactHost
+          ProphecyPluginLatencyHost
           ProphecyPluginTimingHost
           ProphecyPluginRtSafetyTest
           ProphecyMultiInstanceContractTest
+          ProphecyEngineLifecycleTest
+          ProphecyAudioTimelineTest
       - name: Run no-ROM product and publication gates
         env:
           PROPHECY_FORCE_NO_ROM: "1"
         run: |
           ctest --test-dir build-prototype --output-on-failure \
-            -R '^(alpha_release_policy|mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
+            -R '^(audio_timeline|alpha_release_policy|mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
           build-prototype/ProphecyArtifactHost_artefacts/Release/ProphecyArtifactHost \
             --plugin build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 \
             --receipt "$RUNNER_TEMP/real-engine-macos-arm64.json" \
@@ -133,6 +150,8 @@ jobs:
         run: >-
           python3 -B scripts/run_ci_rom_e2e.py
           --artifact-host build-prototype/ProphecyArtifactHost_artefacts/Release/ProphecyArtifactHost
+          --rt-safety-host build-prototype/ProphecyPluginRtSafetyTest
+          --lifecycle-host build-prototype/ProphecyEngineLifecycleTest
           --plugin build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3
           --work "$RUNNER_TEMP/clean-room-three-dsp"
           --seconds 6
@@ -150,7 +169,7 @@ jobs:
           done
       - name: Package macOS alpha ZIP
         run: |
-          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.7-macOS-arm64"
+          package="$RUNNER_TEMP/Profligacy-1.0.0-alpha.8-macOS-arm64"
           mkdir -p "$package"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/AU/Profligacy.component "$package/Profligacy.component"
           ditto build-prototype/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3 "$package/Profligacy.vst3"
@@ -160,10 +179,16 @@ jobs:
           (cd "$RUNNER_TEMP" && shasum -a 256 "$(basename "$package.zip")") > "$package.zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.7-macOS-arm64-${{ github.sha }}
+          name: latency-host-macos-arm64-${{ github.sha }}
+          path: build-prototype/ProphecyPluginLatencyHost_artefacts/Release/ProphecyPluginLatencyHost
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Profligacy-1.0.0-alpha.8-macOS-arm64-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.7-macOS-arm64.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.7-macOS-arm64.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.8-macOS-arm64.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.8-macOS-arm64.zip.sha256
           retention-days: 7
           if-no-files-found: error
 
@@ -297,7 +322,9 @@ jobs:
         shell: pwsh
         run: |
           cmake --build build-prototype --config Release --parallel 4 --target `
+            ProphecyAudioTimelineTest `
             ProphecyMultiInstanceContractTest `
+            ProphecyEngineLifecycleTest `
             ProphecyPluginTimingHost `
             ProphecyPluginRtSafetyTest
           if ($LASTEXITCODE -ne 0) { throw "contract-test build exited $LASTEXITCODE" }
@@ -311,7 +338,7 @@ jobs:
         run: |
           $env:PROPHECY_FORCE_NO_ROM = '1'
           ctest --test-dir build-prototype -C Release --output-on-failure `
-            -R '^(alpha_release_policy|mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
+            -R '^(audio_timeline|alpha_release_policy|mame_sdk|multi_instance_contract|plugin_rt_safety|product_identity|release_licensing|run_headless_midi_stress)$'
           if ($LASTEXITCODE -ne 0) { throw "CTest exited $LASTEXITCODE" }
           & build-prototype\ProphecyArtifactHost_artefacts\Release\ProphecyArtifactHost.exe `
             --plugin build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
@@ -359,6 +386,8 @@ jobs:
         run: |
           python -B scripts/run_ci_rom_e2e.py `
             --artifact-host build-prototype\ProphecyArtifactHost_artefacts\Release\ProphecyArtifactHost.exe `
+            --rt-safety-host build-prototype\Release\ProphecyPluginRtSafetyTest.exe `
+            --lifecycle-host build-prototype\Release\ProphecyEngineLifecycleTest.exe `
             --plugin build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
             --work "$env:RUNNER_TEMP\clean-room-three-dsp" `
             --seconds 6 `
@@ -375,7 +404,7 @@ jobs:
       - name: Package Windows alpha ZIP
         shell: pwsh
         run: |
-          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.7-Windows-x64-experimental'
+          $package = Join-Path $env:RUNNER_TEMP 'Profligacy-1.0.0-alpha.8-Windows-x64-experimental'
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item -Recurse -LiteralPath `
             build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3 `
@@ -390,9 +419,9 @@ jobs:
           "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -Encoding ascii -NoNewline "$zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.7-Windows-x64-experimental-${{ github.sha }}
+          name: Profligacy-1.0.0-alpha.8-Windows-x64-experimental-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.7-Windows-x64-experimental.zip
-            ${{ runner.temp }}/Profligacy-1.0.0-alpha.7-Windows-x64-experimental.zip.sha256
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.8-Windows-x64-experimental.zip
+            ${{ runner.temp }}/Profligacy-1.0.0-alpha.8-Windows-x64-experimental.zip.sha256
           retention-days: 7
           if-no-files-found: error

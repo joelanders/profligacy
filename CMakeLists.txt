@@ -12,6 +12,12 @@ endif()
 include(CTest)
 
 if(BUILD_TESTING)
+	add_executable(ProphecyAudioTimelineTest scripts/audio_timeline_test.cpp)
+	target_include_directories(ProphecyAudioTimelineTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+	target_compile_features(ProphecyAudioTimelineTest PRIVATE cxx_std_20)
+	add_test(NAME audio_timeline COMMAND $<TARGET_FILE:ProphecyAudioTimelineTest>)
+	set_tests_properties(audio_timeline PROPERTIES TIMEOUT 30)
+
 	add_executable(ProphecyLedStoreTest scripts/led_store_test.cpp)
 	target_include_directories(ProphecyLedStoreTest PRIVATE
 		${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -20,6 +26,7 @@ if(BUILD_TESTING)
 
 	find_package(Python3 REQUIRED COMPONENTS Interpreter)
 	foreach(_prophecy_python_test
+		analyze_plugin_latency
 		alpha_release_policy
 		build_ci_probe_roms
 		correctness_checkpoint
@@ -256,24 +263,30 @@ target_link_libraries(ProphecyConsoleHost PRIVATE prophecy_engine)
 # construct/tear down two plugin objects" from independent simultaneous synthesis.
 add_executable(ProphecyMultiInstanceContractTest scripts/multi_instance_contract_test.cpp)
 target_link_libraries(ProphecyMultiInstanceContractTest PRIVATE prophecy_engine)
+add_executable(ProphecyEngineLifecycleTest scripts/engine_lifecycle_test.cpp)
+target_link_libraries(ProphecyEngineLifecycleTest PRIVATE prophecy_engine)
 if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
 	# MAME's Windows OSD expects the Common Controls v6 activation context from
 	# its executable resource.  Add that dependency to MSBuild's generated
 	# executable manifest (JUCE executables embed an equivalent dependency).
-	foreach(_prophecy_manifest_target ProphecyConsoleHost ProphecyMultiInstanceContractTest)
+	foreach(_prophecy_manifest_target ProphecyConsoleHost ProphecyMultiInstanceContractTest ProphecyEngineLifecycleTest)
 		target_link_options(${_prophecy_manifest_target} PRIVATE
 			"/MANIFESTDEPENDENCY:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 	endforeach()
 endif()
 if(BUILD_TESTING)
 	add_test(NAME multi_instance_contract COMMAND $<TARGET_FILE:ProphecyMultiInstanceContractTest>)
+	add_test(NAME engine_lifecycle COMMAND $<TARGET_FILE:ProphecyEngineLifecycleTest>)
+	set_tests_properties(engine_lifecycle PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 	set_tests_properties(multi_instance_contract PROPERTIES TIMEOUT 15)
 endif()
 
 # ---------------------------------------------------------------------------
 # JUCE plugin
 # ---------------------------------------------------------------------------
-add_subdirectory(extern/JUCE)
+set(JUCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/JUCE" CACHE PATH "Pinned JUCE source tree")
+add_subdirectory("${JUCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/JUCE")
+include(scripts/juce_prefetch.cmake)
 
 if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
 	# JUCE module targets do not consistently inherit the directory-level
@@ -431,7 +444,7 @@ target_link_libraries(ProphecyPlugin
 add_executable(ProphecyPluginTimingHost scripts/plugin_timing_host.cpp)
 target_include_directories(ProphecyPluginTimingHost PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/src
-	${CMAKE_CURRENT_SOURCE_DIR}/extern/JUCE/modules)
+	${JUCE_DIR}/modules)
 target_compile_definitions(ProphecyPluginTimingHost PRIVATE
 	JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
 target_link_libraries(ProphecyPluginTimingHost PRIVATE ProphecyPlugin)
@@ -446,7 +459,7 @@ endif()
 add_executable(ProphecyPluginRtSafetyTest scripts/plugin_rt_safety_test.cpp)
 target_include_directories(ProphecyPluginRtSafetyTest PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/src
-	${CMAKE_CURRENT_SOURCE_DIR}/extern/JUCE/modules)
+	${JUCE_DIR}/modules)
 target_compile_definitions(ProphecyPluginRtSafetyTest PRIVATE
 	JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
 target_link_libraries(ProphecyPluginRtSafetyTest PRIVATE ProphecyPlugin)
@@ -460,6 +473,25 @@ if(BUILD_TESTING)
 	set_tests_properties(plugin_rt_safety PROPERTIES TIMEOUT 10)
 endif()
 
+if(BUILD_TESTING AND PROPHECY_USE_FAKE_ENGINE)
+	foreach(_test IN ITEMS Timeline State)
+		string(TOLOWER "${_test}" _test_name)
+		set(_test_target ProphecyPlugin${_test}Test)
+		add_executable(${_test_target} scripts/plugin_${_test_name}_test.cpp)
+		target_include_directories(${_test_target} PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR}/src ${JUCE_DIR}/modules)
+		target_compile_definitions(${_test_target} PRIVATE
+			JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
+		target_link_libraries(${_test_target} PRIVATE ProphecyPlugin)
+		if(WIN32)
+			target_compile_definitions(${_test_target} PRIVATE JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
+			target_link_libraries(${_test_target} PRIVATE juce::juce_webview2)
+		endif()
+		add_test(NAME plugin_${_test_name} COMMAND $<TARGET_FILE:${_test_target}>)
+		set_tests_properties(plugin_${_test_name} PROPERTIES TIMEOUT 30)
+	endforeach()
+endif()
+
 # Artifact-level VST3 smoke host. Unlike the timing and RT harnesses above, this
 # executable does not link ProphecyPlugin: it scans and loads the packaged VST3
 # through JUCE's host API, then drives its public MIDI/audio/state interface.
@@ -470,8 +502,29 @@ target_compile_definitions(ProphecyArtifactHost PRIVATE
 target_link_libraries(ProphecyArtifactHost PRIVATE
 	juce::juce_audio_utils juce::juce_audio_formats)
 
+if(BUILD_TESTING)
+	add_executable(ProphecyLatencySequenceTest scripts/latency_sequence_test.cpp)
+	target_compile_definitions(ProphecyLatencySequenceTest PRIVATE JUCE_USE_CURL=0)
+	target_link_libraries(ProphecyLatencySequenceTest PRIVATE juce::juce_audio_basics)
+	add_test(NAME latency_sequence COMMAND $<TARGET_FILE:ProphecyLatencySequenceTest>)
+	set_tests_properties(latency_sequence PROPERTIES TIMEOUT 10)
+endif()
+
+if(APPLE)
+	# Precise macOS AU/VST3 callback pacing and offline capture, without linking
+	# the processor under test. Keep the measured artifact boundary intact.
+	juce_add_console_app(ProphecyPluginLatencyHost PRODUCT_NAME "Prophecy Latency Host")
+	target_sources(ProphecyPluginLatencyHost PRIVATE scripts/plugin_latency_host.cpp)
+	target_compile_definitions(ProphecyPluginLatencyHost PRIVATE
+		JUCE_PLUGINHOST_VST3=1 JUCE_PLUGINHOST_AU=1 JUCE_PLUGINHOST_VST=0
+		JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1)
+	target_link_libraries(ProphecyPluginLatencyHost PRIVATE
+		juce::juce_audio_processors juce::juce_audio_formats
+		"-framework AudioUnit" "-framework CoreAudioKit")
+endif()
+
 if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
-	foreach(_prophecy_windows_target prophecy_engine ProphecyPlugin ProphecyConsoleHost ProphecyMultiInstanceContractTest ProphecyPluginTimingHost ProphecyPluginRtSafetyTest ProphecyArtifactHost)
+	foreach(_prophecy_windows_target prophecy_engine ProphecyPlugin ProphecyConsoleHost ProphecyMultiInstanceContractTest ProphecyEngineLifecycleTest ProphecyPluginTimingHost ProphecyPluginRtSafetyTest ProphecyArtifactHost)
 		if(TARGET ${_prophecy_windows_target})
 			set_property(TARGET ${_prophecy_windows_target} PROPERTY
 				MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
