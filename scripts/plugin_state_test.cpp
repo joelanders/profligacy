@@ -89,6 +89,19 @@ static void restoreAndSave(Order order)
 	if (order == Order::reprepare) processor.prepareToPlay(48000, 128);
 	if (order != Order::before) processor.setStateInformation(state.data(), (int) state.size());
 	requireSavedProgram(processor, state);
+	processor.selectPatch(8);
+	processor.renamePatch("obsolete");
+	processor.setStateInformation(state.data(), (int)state.size());
+	const auto timerDeadline = juce::Time::getMillisecondCounterHiRes() + 550;
+	while (juce::Time::getMillisecondCounterHiRes() < timerDeadline)
+	{
+		juce::Timer::callPendingTimersSynchronously();
+		juce::Thread::sleep(1);
+	}
+	require(processor.diagnosticSnapshot().editorPatchSends == 0,
+		"an old editor selection survived host restoration");
+	require(processor.diagnosticSnapshot().editorCommandsPending == 0,
+		"old editor edits survived host restoration");
 	if (order == Order::beforeReprepare || order == Order::released) processor.prepareToPlay(48000, 128);
 	requireSavedProgram(processor, state);
 	requireFirstNote(processor);

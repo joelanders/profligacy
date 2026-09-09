@@ -172,8 +172,96 @@ static int initialStateTest(const char* path, const std::string& order)
 	return 0;
 }
 
+// The host may save after callbacks stop. Query the firmware independently
+// afterwards, so a stale dump cache cannot make both sides of the test agree.
+static int stateRegressionTest()
+{
+	juce::ScopedJuceInitialiser_GUI gui;
+	ProphecyAudioProcessor processor;
+	processor.setNonRealtime(true);
+	processor.prepareToPlay(48000, 128);
+	if (!processor.romOk()) return 1;
+	juce::AudioBuffer<float> audio(2, 128);
+	juce::MidiBuffer midi;
+	auto render = [&](int blocks) {
+		for (int block = 0; block < blocks; ++block) processor.processBlock(audio, midi);
+	};
+	auto unpack = [](const juce::MemoryBlock& state) {
+		std::vector<std::uint8_t> raw;
+		if (state.getSize() < 13) return raw;
+		const auto* bytes = static_cast<const std::uint8_t*>(state.getData());
+		const auto begin = 6 + 2 * std::size_t(bytes[4]);
+		for (auto i = begin + 6; i + 1 < state.getSize();)
+		{
+			const auto high = bytes[i++];
+			for (int bit = 0; bit < 7 && i + 1 < state.getSize(); ++bit)
+				raw.push_back(bytes[i++] | (((high >> bit) & 1) << 7));
+		}
+		return raw;
+	};
+	auto fresh = [&] {
+		std::vector<std::uint8_t> raw(535);
+		std::uint32_t before = 0, version = 0;
+		processor.getProgramData(nullptr, 0, &before);
+		const std::uint8_t request[]{0xf0, 0x42, 0x30, 0x41, 0x10, 0, 0xf7};
+		processor.sendMidi(request, sizeof(request));
+		for (int block = 0; block < 3750; ++block)
+		{
+			render(1);
+			const auto size = processor.getProgramData(raw.data(), raw.size(), &version);
+			if (version != before && size == raw.size()) return raw;
+		}
+		return std::vector<std::uint8_t>{};
+	};
+
+	juce::MemoryBlock original, saved;
+	processor.getStateInformation(original);
+	const auto expected = unpack(original);
+	if (expected.size() != 535) return 1;
+	processor.selectPatch(8);
+	processor.renamePatch("obsolete edit");
+	processor.setStateInformation(original.getData(), int(original.getSize()));
+	const auto deadline = juce::Time::getMillisecondCounterHiRes() + 800;
+	while (juce::Time::getMillisecondCounterHiRes() < deadline)
+	{
+		juce::Timer::callPendingTimersSynchronously();
+		render(1);
+		juce::Thread::sleep(1);
+	}
+	render(1500);
+	if (fresh() != expected || processor.diagnosticSnapshot().editorPatchSends != 0)
+	{
+		std::fputs("restoration was overwritten by delayed editor work\n", stderr);
+		return 1;
+	}
+	midi.addEvent(juce::MidiMessage::programChange(1, 8), 0);
+	render(1);
+	midi.clear();
+	render(1500);
+	const auto beforeSave = processor.diagnosticSnapshot().producedFrames;
+	processor.getStateInformation(saved);
+	const auto stopped = unpack(saved);
+	if (processor.diagnosticSnapshot().producedFrames != beforeSave)
+	{
+		std::fputs("stopped save advanced emulated audio\n", stderr);
+		return 1;
+	}
+	const auto actual = fresh();
+	if (actual.size() != 535 || actual == expected || stopped != actual)
+	{
+		std::fputs("stopped save used an obsolete program dump\n", stderr);
+		return 1;
+	}
+	processor.releaseResources();
+	processor.getStateInformation(saved);
+	if (unpack(saved) != actual) return 1;
+	std::puts("PASS stopped/released save matches all 535 firmware bytes; restore cancels old editor timers");
+	return 0;
+}
+
 int main(int argc, char** argv)
 {
+	if (argc == 2 && std::string(argv[1]) == "--state-regressions") return stateRegressionTest();
 	if (argc == 3 && std::string(argv[1]) == "--export-initial-state")
 	{
 		juce::ScopedJuceInitialiser_GUI juceInitialiser;

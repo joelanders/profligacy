@@ -93,6 +93,15 @@ ProphecyAudioProcessor::ProphecyAudioProcessor()
 
 ProphecyAudioProcessor::~ProphecyAudioProcessor()
 {
+	{
+		std::lock_guard stateLock(m_stateMutex);
+		m_patchSelectDelay.cancel();
+		(void)m_renameBurst.cancel();
+		(void)m_macroBurst.cancel();
+		m_programDumpSync.cancel();
+		m_editorCommandPacer.cancel();
+		(void)m_writeSeq.cancel();
+	}
 	m_engine.stop();
 }
 
@@ -423,6 +432,7 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 
 ProphecyAudioProcessor::DiagnosticSnapshot ProphecyAudioProcessor::diagnosticSnapshot() const
 {
+	std::lock_guard stateLock(m_stateMutex);
 	DiagnosticSnapshot s;
 	s.producedFrames = m_engine.producedFrames();
 	s.bufferedFrames = m_engine.available();
@@ -478,28 +488,8 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 			dump = m_restoredProgram;
 		else if (m_engine.readyForPlayback())
 		{
-			// Initialization supplied a confirmed snapshot. A new request before
-			// this epoch's first nonempty callback would queue behind startup.
-			std::uint32_t before = 0;
-			m_engine.latestProgramData(nullptr, 0, &before);
-			if (m_playbackStarted.load(std::memory_order_acquire))
-			{
-				const std::uint8_t request[] = {0xf0, 0x42, 0x30, 0x41, 0x10, 0, 0xf7};
-				if (pushImmediateMidi(request, sizeof(request)))
-				{
-					const auto deadline = juce::Time::getMillisecondCounterHiRes() + 400.0;
-					std::uint32_t version = before;
-					while (version == before && juce::Time::getMillisecondCounterHiRes() < deadline)
-					{
-						juce::Thread::sleep(5);
-						m_engine.latestProgramData(nullptr, 0, &version);
-					}
-				}
-			}
-			// Read the shared snapshot, without competing with the editor for TX
-			// bytes. If callbacks stopped, this remains the last confirmed buffer.
-			std::uint8_t raw[1024]{};
-			const auto size = m_engine.latestProgramData(raw, sizeof(raw), nullptr);
+			const auto raw = m_engine.snapshotProgram();
+			const auto size = raw.size();
 			if (size)
 			{
 				dump = {0xf0, 0x42, 0x30, 0x41, 0x40, 0x01};
@@ -591,6 +581,15 @@ void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 
 	if (dumpLen > 0 && dumpLen <= 1024)
 	{
+		// Host restoration supersedes delayed editor work for the old program.
+		m_patchSelectDelay.cancel();
+		(void)m_renameBurst.cancel();
+		(void)m_macroBurst.cancel();
+		m_programDumpSync.cancel();
+		m_editorCommandPacer.cancel();
+		const bool cancelledWrite = m_writeSeq.cancel();
+		m_patchLoadBarrierUntilFrame.store(0, std::memory_order_release);
+		m_lastPatchSendMs = -1.0e9;
 		m_restoredProgram.assign(dump, dump + dumpLen);
 		m_restoredProgramConfirmed = false;
 		if (!m_skipStateRestore && m_engine.readyForPlayback())
@@ -600,11 +599,13 @@ void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 			ProcessingPause pause(m_processingPaused, m_callbackAccess);
 			(void) restoreProgram();
 		}
+		if (cancelledWrite) setParamG(0, 170, 1); // complete the old sequence's re-protection
 	}
 }
 
 void ProphecyAudioProcessor::selectPatch(int program)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	if (program < 0 || program > 127) return;
 	m_editorPatchIntents.fetch_add(1, std::memory_order_relaxed);
 	// A patch change discards the current edit buffer, so cancel work belonging to the old
@@ -668,6 +669,7 @@ void ProphecyAudioProcessor::holdEditorCommandsForPatchLoad(double seconds)
 
 void ProphecyAudioProcessor::sendMidi(const std::uint8_t *bytes, std::size_t size)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	(void)pushImmediateMidi(bytes, size);
 }
 
@@ -712,6 +714,7 @@ juce::StringArray ProphecyAudioProcessor::patchNames() const
 
 std::uint64_t ProphecyAudioProcessor::requestProgramDump()
 {
+	std::lock_guard stateLock(m_stateMutex);
 	m_editorDumpRequests.fetch_add(1, std::memory_order_relaxed);
 	// Program Change and current-program dump assembly share the firmware MIDI task. A dump
 	// sent during the patch-load transaction is silently discarded, so wait out any pending/recent
@@ -729,6 +732,7 @@ std::uint64_t ProphecyAudioProcessor::requestProgramDump()
 std::size_t ProphecyAudioProcessor::getProgramData(std::uint8_t *out, std::size_t cap,
 	std::uint32_t *version, std::uint64_t *completedRequestGeneration) const
 {
+	std::lock_guard stateLock(m_stateMutex);
 	std::uint32_t observedVersion = 0;
 	const std::size_t bytes = m_engine.latestProgramData(out, cap, &observedVersion);
 	if (version != nullptr) *version = observedVersion;
@@ -749,6 +753,7 @@ bool ProphecyAudioProcessor::sendProgramDumpNow()
 
 void ProphecyAudioProcessor::selectArpeggioPattern(int pattern)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	if (pattern < 0 || pattern > 9) return;
 	// NRPN MSB=0, LSB=1 (Arpeggio Pattern Select), Data Entry MSB=INT pattern 0..9.
 	const std::uint8_t msg[9] = {0xB0, 0x63, 0x00, 0xB0, 0x62, 0x01,
@@ -758,6 +763,7 @@ void ProphecyAudioProcessor::selectArpeggioPattern(int pattern)
 
 void ProphecyAudioProcessor::setArpeggiatorControl(int control, int value)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	// Documented NRPNs: 2=On/Off, 3=Octaves, 4=Latch, 5=Key Sync.
 	if (control < 2 || control > 5) return;
 	value = std::clamp(value, 0, control == 3 ? 3 : 127);
@@ -768,6 +774,7 @@ void ProphecyAudioProcessor::setArpeggiatorControl(int control, int value)
 
 void ProphecyAudioProcessor::requestArpeggioPatternDump(int pattern)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	if (pattern < 0 || pattern > 9) return;
 	const std::uint8_t req[8] = {0xF0, 0x42, 0x30, 0x41, 0x34,
 		(std::uint8_t) pattern, 0x00, 0xF7};
@@ -779,6 +786,7 @@ void ProphecyAudioProcessor::requestArpeggioPatternDump(int pattern)
 
 void ProphecyAudioProcessor::sendArpeggioPatternData(int pattern, const std::vector<std::uint8_t> &raw)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	if (pattern < 0 || pattern > 9 || raw.size() != 128) return;
 	// Korg 7-in-8 packing: a high-bit bitmap followed by up to seven low-7-bit bytes.
 	std::vector<std::uint8_t> msg;
@@ -805,6 +813,7 @@ void ProphecyAudioProcessor::setParam(int paramId, int value)
 
 void ProphecyAudioProcessor::setParamG(int group, int paramId, int value)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	// Korg PARAMETER_CHANGE (0x41). 14-bit param id + 14-bit value (two's complement
 	// for bipolar params). F0 42 30 41 41 <group> pLSB pMSB vLSB vMSB F7.
 	const int p = paramId & 0x3FFF;
@@ -820,12 +829,14 @@ void ProphecyAudioProcessor::setParamG(int group, int paramId, int value)
 
 void ProphecyAudioProcessor::panelPulse(int row, int bit)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	if (row < 0 || bit < 0) return;
 	m_editorCommandPacer.enqueuePanel(row, bit);
 }
 
 void ProphecyAudioProcessor::renamePatch(const juce::String &name)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	// Program Name Char 1..16 = group-1 params 1..16 (ascii_char, manifest-verified).
 	// Paced (one param per timer tick): 16 sysexes sent back-to-back at line rate get
 	// partially dropped by the firmware when the edit buffer holds a busy patch.
@@ -850,6 +861,7 @@ void ProphecyAudioProcessor::renamePatch(const juce::String &name)
 // setParamG splits the 14-bit id, so passing 4096|388 emits the correct ExID addressing.
 void ProphecyAudioProcessor::sendMacro(const juce::String &name)
 {
+	std::lock_guard stateLock(m_stateMutex);
 	constexpr int E1 = 1 << 12; // OSC1 ExID: paramId = (1<<12)|param
 
 	// {paramId, value} pairs (paramId already ExID-packed where needed).
@@ -1031,12 +1043,15 @@ void ProphecyAudioProcessor::handleMappedCc(int cc, int value, CcTarget target, 
 
 void ProphecyAudioProcessor::writePatch()
 {
+	std::lock_guard stateLock(m_stateMutex);
 	m_writeInProgress.store(true, std::memory_order_release);
 	m_writeSeq.start();
 }
 
 void ProphecyAudioProcessor::WriteSequence::timerCallback()
 {
+	std::unique_lock stateLock(m_proc.m_stateMutex, std::try_to_lock);
+	if (!stateLock || !isTimerRunning()) return;
 	switch (m_step++)
 	{
 	case 0: m_proc.setParamG(0, 170, 0); break; // Program Memory Protect = off

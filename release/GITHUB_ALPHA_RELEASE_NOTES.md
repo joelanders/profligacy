@@ -1,44 +1,20 @@
-# Profligacy 1.0.0 alpha 7
+# Profligacy 1.0.0 alpha 8
 
 Profligacy is an independent AU, VST3, and standalone software instrument
 compatible with user-supplied Korg Prophecy firmware. It is not affiliated with
 or endorsed by Korg.
 
-## Changes in alpha 7
+## Changes in alpha 8
 
-- Corrected the independent clocks on the Prophecy's internal serial link. The
-  V55 now runs at 31.25 kbit/s and the H8 at 32 kbit/s, matching measured
-  hardware rather than forcing both endpoints to one rate.
-- Added the H8/3003 external-bus costs used by the instrument and routed the
-  V55 P33 signal to the H8 IRQ1 input according to the service-manual wiring and
-  physical traces. This replaces synthetic interrupt timing with the modeled
-  board signal path.
-- Replaced the DSP host-update timing surrogate with the TMS57002's native
-  EMPTY state and complete 16-word update queue.
-- Corrected the H8 watchdog interval-overflow and overflow-clear behavior.
-- Preserved ordinary MIDI arriving after Program Change. Earlier builds could
-  discard two seconds of otherwise valid follow-up traffic.
-- Sent modeled front-panel analog controls directly to the hardware input path
-  instead of throttling them with serialized editor commands, so fast wheel and
-  ribbon gestures reach the firmware at their natural update rate.
-- Corrected the software X-Y surface's ribbon direction, momentary pressure,
-  and release behavior. The editor now also mirrors incoming pitch-bend and
-  modulation-wheel movement without applying those MIDI messages twice.
-- Latched very short front-panel LED pulses long enough for the editor to show
-  them reliably, without changing the timing seen by the emulated hardware.
-- Simplified the Program signal-flow view and made its module layout, mixer
-  routing, visual hierarchy, and developer-only diagnostics more consistent.
-- Added deterministic control-path, lifecycle, firmware-version, and
-  cross-platform no-ROM regressions. The retained DSP corpus still passes all
-  554 hardware-oracle cases, and the packaged-product gates exercise all three
-  DSPs without distributing Korg firmware.
-- A narrow phase-dependent firmware scheduling window can defer a parameter
-  update until the following roughly 4 ms host-transfer pass. The transaction
-  and DSP command remain intact; this is recorded as firmware control flow, not
-  hidden as a fixed-latency claim.
-- Retains alpha 6's guarded-delivery stability work, alpha 5's paced editor
-  SysEx path, alpha 4's MIDI-stability fixes, alpha 3's native TMS57002 JIT
-  improvements, and alpha 2's WebView2 editor fix.
+- Reduced internal audio buffering and report the processing delay to the DAW
+  for latency compensation.
+- Keep MIDI and audio aligned across sample rates and changing buffer sizes,
+  including long sessions.
+- Support faster-than-real-time offline rendering and VST3 prefetch.
+- Finish firmware startup and preset restoration before playing the first note,
+  avoiding the previous long delay after some restore sequences.
+- Save the current sound when DAW processing has stopped, and cancel delayed
+  editor actions when a project or preset restores another sound.
 
 ## Supported systems
 
@@ -94,8 +70,8 @@ an experimental preview and does not include an installer or code signature.
 
 - Only one synth engine can be active in a host process. Additional Profligacy
   instances stay inert.
-- DAW bounce/render must use real-time 1x. Unrestricted offline rendering can be
-  silent.
+- Let editor changes finish applying before saving a DAW project. Pending
+  editor gestures are not part of the saved program.
 - Host automation for the deep SysEx editor is not yet exposed.
 - Some unknown or packed SysEx fields are intentionally read-only rather than
   guessed.

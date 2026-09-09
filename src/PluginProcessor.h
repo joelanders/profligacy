@@ -189,6 +189,8 @@ public:
 	{ return m_engine.latestArpeggioPatternData(out, cap, version, pattern); }
 
 private:
+	mutable std::recursive_mutex m_stateMutex; // host state and editor timers; never audio
+
 	// Drives writePatch()'s unprotect -> WRITE -> ENTER -> ENTER -> re-protect sequence off the
 	// message thread's timer, so the firmware sees the panel pulses as distinct presses.
 	class WriteSequence : private juce::Timer
@@ -197,6 +199,7 @@ private:
 		explicit WriteSequence(ProphecyAudioProcessor &p) : m_proc(p) {}
 		~WriteSequence() override { stopTimer(); }
 		void start() { if (!isTimerRunning()) { m_step = 0; startTimer(400); } }
+		bool cancel() { stopTimer(); return m_proc.m_writeInProgress.exchange(false); }
 	private:
 		void timerCallback() override;
 		ProphecyAudioProcessor &m_proc;
@@ -232,6 +235,8 @@ private:
 	private:
 		void timerCallback() override
 		{
+			std::unique_lock stateLock(m_proc.m_stateMutex, std::try_to_lock);
+			if (!stateLock || !isTimerRunning()) return;
 			if (m_next >= m_items.size()) { stopTimer(); return; }
 			m_proc.setParam(m_items[m_next].first, m_items[m_next].second);
 			m_next++;
@@ -307,6 +312,13 @@ private:
 			m_queue.push_back(std::move(command));
 			if (!isTimerRunning()) startTimer(1);
 		}
+		void cancel()
+		{
+			stopTimer();
+			m_cancelled.fetch_add(m_queue.size(), std::memory_order_relaxed);
+			m_queue.clear();
+			m_holdUntilMs = -1.0e9;
+		}
 		bool busy() const
 		{
 			return !m_queue.empty()
@@ -328,6 +340,8 @@ private:
 		};
 		void timerCallback() override
 		{
+			std::unique_lock stateLock(m_proc.m_stateMutex, std::try_to_lock);
+			if (!stateLock || !isTimerRunning()) return;
 			const double now = juce::Time::getMillisecondCounterHiRes();
 			if (m_proc.patchLoadBarrierActive())
 			{
@@ -386,6 +400,7 @@ private:
 		explicit PatchSelectDelay(ProphecyAudioProcessor &p) : m_proc(p) {}
 		~PatchSelectDelay() override { stopTimer(); }
 		bool pending() const { return isTimerRunning(); }
+		void cancel() { stopTimer(); }
 		void schedule(int program)
 		{
 			m_program = program;
@@ -394,6 +409,8 @@ private:
 	private:
 		void timerCallback() override
 		{
+			std::unique_lock stateLock(m_proc.m_stateMutex, std::try_to_lock);
+			if (!stateLock || !isTimerRunning()) return;
 			stopTimer();
 			if (!m_proc.sendPatchNow(m_program)) startTimer(25);
 		}
@@ -477,6 +494,8 @@ private:
 		}
 		void timerCallback() override
 		{
+			std::unique_lock stateLock(m_proc.m_stateMutex, std::try_to_lock);
+			if (!stateLock || !isTimerRunning()) return;
 			if (!m_sent.load(std::memory_order_acquire)) { sendRequest(); return; }
 			std::uint8_t byte = 0;
 			std::uint32_t version = 0;
@@ -575,7 +594,6 @@ private:
 
 	// Host lifecycle/state operations are serialized off the audio thread.
 	// A retained program becomes confirmed only after firmware readback succeeds.
-	std::mutex m_stateMutex;
 	std::vector<std::uint8_t> m_restoredProgram;
 	bool m_restoredProgramConfirmed = false;
 	bool bootEngine();

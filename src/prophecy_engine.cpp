@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -321,6 +322,7 @@ public:
 	}
 
 	std::uint64_t dropped() const { return m_dropped.load(std::memory_order_acquire); }
+	void discard() { m_head.store(m_tail.load(std::memory_order_acquire), std::memory_order_release); }
 	void reset()
 	{
 		m_head.store(0, std::memory_order_relaxed);
@@ -693,6 +695,22 @@ struct ProphecyEngine::Impl
 	std::atomic<const char*>         initialization_error{""};
 	std::atomic<std::uint64_t>       playback_origin{0};
 	std::mutex                       initialization_mutex; // non-realtime callers only
+
+	std::mutex                       snapshot_mutex; // non-realtime callers only
+	std::atomic<bool>                snapshot_requested{false};
+	std::atomic<bool>                snapshot_enabled{false};
+	std::array<std::uint8_t, 535>     program_snapshot{};
+	const std::uint16_t*             program_ram = nullptr; // worker only
+	bool                             snapshot_available = false;
+
+	void serviceSnapshot()
+	{
+		if (!snapshot_requested.load(std::memory_order_acquire)) return;
+		snapshot_available = program_ram != nullptr;
+		if (snapshot_available)
+			std::memcpy(program_snapshot.data(), program_ram + 0x4930 / 2, program_snapshot.size());
+		snapshot_requested.store(false, std::memory_order_release);
+	}
 	std::atomic<std::uint64_t>       requested{0};
 	std::atomic<std::uint64_t>       next_request{0};
 	std::atomic<bool>                abort{false};
@@ -724,7 +742,11 @@ struct ProphecyEngine::Impl
 		// never waits on a mutex, condition variable, or the emulator.
 		while (host_timeline && requested.load(std::memory_order_acquire) < frame
 				&& !abort.load(std::memory_order_acquire))
+		{
+			serviceSnapshot();
 			std::this_thread::sleep_for(std::chrono::microseconds(50));
+		}
+		serviceSnapshot();
 #if defined(__APPLE__)
 		const auto period = worker_period.load(std::memory_order_acquire);
 		if (host_timeline && period != applied_period)
@@ -819,6 +841,10 @@ public:
 
 	virtual void add_audio_to_recording(const int16_t *buffer, int samples_this_frame) override
 	{
+		if (!m_impl->program_ram)
+			if (auto* ram = machine().root_device().memshare("sysram"); ram && ram->bytes() >= 0x40000)
+				m_impl->program_ram = static_cast<const std::uint16_t*>(ram->ptr());
+		m_impl->serviceSnapshot();
 		if (buffer != nullptr && samples_this_frame > 0)
 		{
 			const auto first = m_impl->produced.load(std::memory_order_relaxed);
@@ -841,7 +867,11 @@ public:
 					}
 					if (notifyReader) m_impl->output_ready.notify_one();
 					offset += got;
-					if (got == 0) std::this_thread::sleep_for(std::chrono::microseconds(50));
+					if (got == 0)
+					{
+						m_impl->serviceSnapshot();
+						std::this_thread::sleep_for(std::chrono::microseconds(50));
+					}
 				}
 			}
 			else
@@ -1124,6 +1154,11 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 		if (!advance()) return fail();
 		g_host_midi_ring.discard();
 		g_host_timed_midi_ring.discard();
+		g_host_panel_ring.discard();
+		g_host_timed_panel_ring.discard();
+		g_host_adin_ui_ring.discard();
+		g_host_adin_rt_ring.discard();
+		g_host_timed_adin_ring.discard();
 	}
 	if (firmwareHandshake && !wasReady)
 	{
@@ -1208,11 +1243,33 @@ bool ProphecyEngine::initializePlayback(const std::uint8_t *state, std::size_t b
 			if (!advance()) return fail();
 	}
 	if (std::getenv("PROPHOST_INIT_STATS")) std::fprintf(stderr, "init ready at %llu\n", (unsigned long long) requestedFrames());
+	m_impl->snapshot_enabled.store(firmwareHandshake, std::memory_order_release);
 	m_impl->initialization_error.store("", std::memory_order_release);
 	m_impl->playback_origin.store(requestedFrames(), std::memory_order_release);
 	g_playback_input_enabled.store(true, std::memory_order_release);
 	m_impl->playback_ready.store(true, std::memory_order_release);
 	return true;
+}
+
+std::vector<std::uint8_t> ProphecyEngine::snapshotProgram()
+{
+	// Copy applied firmware state at a worker boundary even when the DAW has
+	// stopped requesting audio. Saving neither sends MIDI nor advances time.
+	if (!readyForPlayback() || !m_impl->snapshot_enabled.load(std::memory_order_acquire)) return {};
+	std::lock_guard lock(m_impl->snapshot_mutex);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	auto wait = [&] {
+		while (m_impl->snapshot_requested.load(std::memory_order_acquire))
+		{
+			if (!running() || std::chrono::steady_clock::now() >= deadline) return false;
+			std::this_thread::sleep_for(std::chrono::microseconds(50));
+		}
+		return running();
+	};
+	if (!wait()) return {};
+	m_impl->snapshot_requested.store(true, std::memory_order_release);
+	if (!wait() || !m_impl->snapshot_available) return {};
+	return {m_impl->program_snapshot.begin(), m_impl->program_snapshot.end()};
 }
 
 void ProphecyEngine::setHostBlockFrames(std::uint32_t frames)

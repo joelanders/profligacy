@@ -173,6 +173,10 @@ public:
 	// Copy the most recently captured current-program dump, UNPACKED into raw program bytes (the
 	// editor reads knob values out of it by manifest offset). Returns bytes copied (0 if none yet);
 	// *version is a monotonic counter so a poller can detect a fresh dump. Message thread only.
+	// Applied edit buffer, copied by the worker without advancing emulated time.
+	// Non-realtime callers only; empty when unavailable.
+	std::vector<std::uint8_t> snapshotProgram();
+
 	std::size_t latestProgramData(std::uint8_t *out, std::size_t cap, std::uint32_t *version) const;
 
 	// Copy the most recently captured single arpeggio-pattern dump, unpacked into its

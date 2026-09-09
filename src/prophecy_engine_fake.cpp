@@ -220,6 +220,13 @@ bool ProphecyEngine::latestLcd(char *line1, char *line2, std::size_t cap) const
 	line1[0] = line2[0] = '\0';
 	return false;
 }
+std::vector<std::uint8_t> ProphecyEngine::snapshotProgram()
+{
+	std::uint8_t raw[535]{};
+	const auto size = latestProgramData(raw, sizeof(raw), nullptr);
+	return {raw, raw + size};
+}
+
 std::size_t ProphecyEngine::latestProgramData(std::uint8_t* out, std::size_t cap, std::uint32_t* version) const
 {
 	std::lock_guard lock(m_impl->programMutex);
