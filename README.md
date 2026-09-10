@@ -24,6 +24,13 @@ First rule of emulation development is that I can't help you get the firmware. T
 
 On first launch a folder picker opens. Point it at a directory containing `korgprop/ic12_v17.bin` and `korgprop/ic22_v17.bin` *or* `korgprop.zip` containing those two bin files.
 
+In AU and VST3 hosts, the eleven continuous performance controls are available as DAW
+automation parameters under the `Performance:` prefix: Speed, Knobs 1–5, Wheel 1/Pitch,
+Wheel 2/Mod, X/Ribbon X, Y/Log-Wheel 3, and Z/Ribbon Pressure. Moving them on the panel
+records host automation; playing or editing host automation updates the visible controls.
+Their values are saved in projects, while older project states continue to load with the
+modeled hardware defaults for controls they did not store.
+
 
 ## Technical stuff
 

@@ -25,6 +25,8 @@
 class ProphecyAudioProcessor : public juce::AudioProcessor
 {
 public:
+	static constexpr int kPerformanceParameterCount = 11;
+
 	ProphecyAudioProcessor();
 	~ProphecyAudioProcessor() override;
 
@@ -122,6 +124,8 @@ public:
 	// MAME thread at 1 kHz; SCANQ reports pulses to the firmware as real scan codes).
 	void panelPulse(int row, int bit);
 	void setAdin(int source, int value);
+	void beginAdinGesture(int source);
+	void endAdinGesture(int source);
 	// CC -> analog-controller remap. Host control-change (0xB0) messages whose CC number is
 	// mapped are translated to a front-panel ADIN write (the editor's composite X-Y control,
 	// ribbon Z, or wheel 1/2) instead of being forwarded raw. The X-Y control combines the
@@ -135,8 +139,8 @@ public:
 	// patches route it to level/timbre, so its assumed position materially changes the sound.
 	// Persisted in the plugin state and applied as an ADIN9 write. Default 0x80 matches the
 	// driver's built-in ADIN9 rest, so an unset/legacy session sounds byte-for-byte identical.
-	void setWheel2(int value);                   // message thread: stores + pushes ADIN9 (0..255)
-	void setWheel2FromEditor(int value);         // editor path: stores + pushes physical ADIN directly
+	void setWheel2(int value);                   // state path: stores + schedules ADIN9 (0..255)
+	void setWheel2FromEditor(int value);         // editor path: reports to host + schedules ADIN9
 	int  wheel2Pos() const { return m_wheel2Pos.load(std::memory_order_relaxed); } // 0..255
 	// Latest host-observed performance-controller input for editor display. This is not an
 	// engine acknowledgement: raw MIDI bend/CC remains on the synth's UART, while mapped CC
@@ -191,6 +195,23 @@ public:
 	{ return m_engine.latestArpeggioPatternData(out, cap, version, pattern); }
 
 private:
+	class PerformanceParameter final : public juce::AudioParameterInt
+	{
+	public:
+		PerformanceParameter(ProphecyAudioProcessor &owner, int controlIndex,
+			const juce::ParameterID &id, const juce::String &displayName, int defaultValue);
+	private:
+		void valueChanged(int newValue) override;
+		ProphecyAudioProcessor &m_owner;
+		int m_controlIndex;
+	};
+	void performanceParameterChanged(int controlIndex, int value);
+	static int performanceControlForAdin(int source);
+	void setPerformanceValue(int controlIndex, int value, bool notifyHost);
+	void applyPendingPerformanceParameters(std::uint64_t frame);
+	std::array<PerformanceParameter *, kPerformanceParameterCount> m_performanceParameters {};
+	std::atomic<std::uint16_t> m_performanceDirtyMask { 0 };
+
 	// Drives writePatch()'s unprotect -> WRITE -> ENTER -> ENTER -> re-protect sequence off the
 	// message thread's timer, so the firmware sees the panel pulses as distinct presses.
 	class WriteSequence : private juce::Timer

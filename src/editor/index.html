@@ -864,6 +864,15 @@
         ()=>{ inFlight=false; });
     },periodMs);
   }
+  const activeAdinGestures=new Set();
+  function beginAdin(src){
+    if(activeAdinGestures.has(src))return;
+    activeAdinGestures.add(src);native('beginAdinGesture',src);
+  }
+  function endAdin(src){
+    if(!activeAdinGestures.delete(src))return;
+    native('endAdinGesture',src);
+  }
 
   // ============================ panel definition ============================
   // All knobs target sysex program group 1; C++ setParam() supplies the group byte. p=param id.
@@ -2491,7 +2500,15 @@
     perf("#arpoct",e=>{arpPerf.octaves=+e.target.value;native("setArpControl",3,arpPerf.octaves-1);});
     perf("#arplatch",e=>{arpPerf.latch=e.target.checked;native("setArpControl",4,arpPerf.latch?127:0);});
     perf("#arpkeysync",e=>{arpPerf.keySync=e.target.checked;native("setArpControl",5,arpPerf.keySync?127:0);});
-    const speed=arpRoot.querySelector("#arpspeed");if(speed){speed.oninput=()=>arpRoot.querySelector("#arpspeedout").textContent=speed.value;speed.onchange=()=>{arpPerf.speed=+speed.value;native("setAdin",0,arpPerf.speed);};}
+    const speed=arpRoot.querySelector("#arpspeed");if(speed){
+      speed.onpointerdown=()=>beginAdin(0);
+      speed.oninput=()=>{arpPerf.speed=+speed.value;arpRoot.querySelector("#arpspeedout").textContent=speed.value;native("setAdin",0,arpPerf.speed);};
+      speed.onpointerup=()=>endAdin(0);
+      speed.onpointercancel=()=>endAdin(0);
+      speed.onlostpointercapture=()=>endAdin(0);
+      speed.onkeydown=e=>{if(['ArrowLeft','ArrowRight','Home','End','PageUp','PageDown'].includes(e.key))beginAdin(0);};
+      speed.onkeyup=()=>endAdin(0);speed.onblur=()=>endAdin(0);
+    }
     const test=arpRoot.querySelector("#arptest"),panic=arpRoot.querySelector("#arppanic");if(test)test.onclick=playArpTestChord;if(panic)panic.onclick=arpPanic;
     if(!arpData){
       arpRoot.querySelectorAll("select").forEach(select=>upgradeSmallSelect(select));
@@ -2620,8 +2637,14 @@
     numEl.onchange = applyCc; selEl.onchange = applyCc;
     upgradeSmallSelect(selEl);
     const w2rng = sect.querySelector("#w2rng"), w2val = sect.querySelector("#w2val");
+    w2rng.onpointerdown = () => beginAdin(9);
     w2rng.oninput = () => { wheel2Pos = Math.max(0, Math.min(255, parseInt(w2rng.value,10) || 0));
       w2val.textContent = wheel2Pos; native('setWheel2', wheel2Pos); };
+    w2rng.onpointerup = () => endAdin(9);
+    w2rng.onpointercancel = () => endAdin(9);
+    w2rng.onlostpointercapture = () => endAdin(9);
+    w2rng.onkeydown = e => { if(['ArrowLeft','ArrowRight','Home','End','PageUp','PageDown'].includes(e.key)) beginAdin(9); };
+    w2rng.onkeyup = () => endAdin(9); w2rng.onblur = () => endAdin(9);
     return sect;
   }
   // Restore the persisted mapping into the editor row (first mapped CC wins).
@@ -3374,12 +3397,15 @@
       ok('canvas lcd surface', lcdpx[1] > 60 && lcdpx[1] > lcdpx[0], 'rgb ' + lcdpx[0] + ',' + lcdpx[1] + ',' + lcdpx[2]);
 
       // 4) pointer handlers on the real canvas: count native sends during synthetic events
-      let sends = {sendMidi:0, panelPulse:0, setAdin:0, setParam:0};
+      let sends = {sendMidi:0, panelPulse:0, setAdin:0, setParam:0,
+        beginAdinGesture:0,endAdinGesture:0};
       let adinLog = [];   // every setAdin (src, val) — the pad gate bypasses adin[]
+      let gestureLog = [];
       const origNative = native;
       window.native = function(name, a, b){
         if (name in sends) sends[name]++;
         if (name === 'setAdin') adinLog.push([a|0, b|0]);
+        if (name === 'beginAdinGesture' || name === 'endAdinGesture') gestureLog.push([name,a|0]);
         return origNative.apply(this, arguments); };
       const toClient = window.__faceToClient;
       ok('transform exposed', !!toClient);
@@ -3408,6 +3434,10 @@
       fire('pointerdown', panelLayout.leftTrackX+panelLayout.leftTrackW/2, panelLayout.speedY);
       fire('pointerup', panelLayout.leftTrackX+panelLayout.leftTrackW/2, panelLayout.speedY);
       ok('slider -> setAdin', sends.setAdin >= 1, sends.setAdin);
+      ok('slider -> host automation gesture',
+         gestureLog.some(c=>c[0]==='beginAdinGesture'&&c[1]===0)
+           && gestureLog.some(c=>c[0]==='endAdinGesture'&&c[1]===0),
+         JSON.stringify(gestureLog));
       adinLog = [];
       const zSliderY=panelLayout.xyY+panelLayout.leftTrackW+24;
       fire('pointerdown', panelLayout.leftTrackX+panelLayout.leftTrackW*.75,zSliderY);
@@ -3442,6 +3472,10 @@
       ok('xy pad release -> rest + gate off',
          z && z[1] === 0x00 && adUp && adUp[12] === 0x80 && adUp[13] === 0x74 && adUp[14] === 0x00,
          'calls ' + JSON.stringify(adinLog));
+      ok('xy pad -> three host automation gestures',
+         [12,13,14].every(src=>gestureLog.some(c=>c[0]==='beginAdinGesture'&&c[1]===src)
+           && gestureLog.some(c=>c[0]==='endAdinGesture'&&c[1]===src)),
+         JSON.stringify(gestureLog));
       window.native = origNative;
 
       // 4b) Program's oscillator model decodes from the dump (A00 = value 3 =
@@ -5316,10 +5350,10 @@
     const k = hitKey(p);
     if (k>=0){ drag={kind:'key'}; noteOn(k); return; }
     const kn = hitKnob(p);
-    if (kn>=0){ drag={kind:'knob',i:kn,lx:e.clientX,ly:e.clientY}; return; }
+    if (kn>=0){ drag={kind:'knob',i:kn,lx:e.clientX,ly:e.clientY}; beginAdin(kn+1); return; }
     const s = hitSlider(p);
-    if (s){ drag={kind:'slider',s}; adin[s.src]=Math.round(Math.min(1,Math.max(0,(p.x-L.leftTrackX)/L.leftTrackW))*255); sendAdin(s.src); dirty=true; return; }
-    if (inXY(p)){ drag={kind:'xy'}; xyTouch=true;
+    if (s){ drag={kind:'slider',s}; beginAdin(s.src); adin[s.src]=Math.round(Math.min(1,Math.max(0,(p.x-L.leftTrackX)/L.leftTrackW))*255); sendAdin(s.src); dirty=true; return; }
+    if (inXY(p)){ drag={kind:'xy'}; xyTouch=true; beginAdin(12); beginAdin(13); beginAdin(14);
       adin[12]=unitToRibbonXAdc((p.x-L.leftTrackX)/L.leftTrackW);
       adin[13]=unitToAdcAroundRest(1-(p.y-L.xyY)/L.leftTrackW,0x74);
       // A mouse has no pressure axis. Match Korg's software gesture: full Z while
@@ -5379,6 +5413,9 @@
       adin[12]=0x80; adin[13]=0x74; adin[14]=0x00;
       sendAdin(12); sendAdin(13); sendAdin(14); dirty=true;
     }
+    if (drag && drag.kind==='knob') endAdin(drag.i+1);
+    if (drag && drag.kind==='slider' && drag.s) endAdin(drag.s.src);
+    if (drag && drag.kind==='xy'){ endAdin(12); endAdin(13); endAdin(14); }
     drag=null;
   }
   canvas.addEventListener('pointerup', finishPointer);
@@ -5386,9 +5423,9 @@
   canvas.addEventListener('pointerleave', () => { if (tip || hover){ tip=null; hover=null; dirty=true; } });
   canvas.addEventListener('dblclick', e => {
     const p = toDesign(e);
-    const kn = hitKnob(p); if (kn>=0){ adin[kn+1]=0x80; sendAdin(kn+1); dirty=true; }
-    const s = hitSlider(p); if (s){ adin[s.src]=s.rest; sendAdin(s.src); dirty=true; }
-    if (inXY(p)){ adin[12]=0x80; adin[13]=0x74; sendAdin(12); sendAdin(13); dirty=true; }
+    const kn = hitKnob(p); if (kn>=0){ beginAdin(kn+1); adin[kn+1]=0x80; sendAdin(kn+1); endAdin(kn+1); dirty=true; }
+    const s = hitSlider(p); if (s){ beginAdin(s.src); adin[s.src]=s.rest; sendAdin(s.src); endAdin(s.src); dirty=true; }
+    if (inXY(p)){ beginAdin(12);beginAdin(13);adin[12]=0x80;adin[13]=0x74;sendAdin(12);sendAdin(13);endAdin(12);endAdin(13);dirty=true; }
   });
 
   // ---- raw LCD poll: char codes + CGRAM, version-gated ----
@@ -5420,13 +5457,19 @@
   // use ADIN. Ignore an in-progress local drag so a stale in-flight snapshot cannot
   // pull the handle backwards; the next poll reconciles it after release.
   pollNativeLatest('getControllers',33,r => {
-      if (!r || drag) return;
+      if (!r) return;
       const values = r.values || [];
       let changed = false;
       for (let i = 0; i < Math.min(adin.length, values.length); i++) {
+        if(activeAdinGestures.has(i))continue;
         const next = Math.max(0,Math.min(255,values[i]|0));
         if (adin[i] !== next) { adin[i] = next; changed = true; }
       }
+      arpPerf.speed=adin[0]; wheel2Pos=adin[9];
+      const speed=document.getElementById('arpspeed'), speedOut=document.getElementById('arpspeedout');
+      if(speed){speed.value=arpPerf.speed;if(speedOut)speedOut.textContent=arpPerf.speed;}
+      const w2=document.getElementById('w2rng'),w2out=document.getElementById('w2val');
+      if(w2){w2.value=wheel2Pos;if(w2out)w2out.textContent=wheel2Pos;}
       if (changed) dirty = true;
   });
 

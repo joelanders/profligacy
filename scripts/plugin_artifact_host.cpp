@@ -277,6 +277,20 @@ int main(int argc, char **argv)
 	}
 	const bool stateMarkerOk = options.expectStateMarker.isEmpty()
 		|| observedStateMarker == options.expectStateMarker.toStdString();
+	juce::Array<juce::var> parameterInventory;
+	int automatableParameterCount = 0;
+	for (auto *parameter : instance->getParameters())
+	{
+		if (!parameter->isAutomatable()) continue;
+		++automatableParameterCount;
+		auto *entry = new juce::DynamicObject();
+		entry->setProperty("index", parameter->getParameterIndex());
+		entry->setProperty("name", parameter->getName(128));
+		if (auto *ranged = dynamic_cast<juce::RangedAudioParameter *>(parameter))
+			entry->setProperty("id", ranged->getParameterID());
+		entry->setProperty("value", parameter->getValue());
+		parameterInventory.add(juce::var(entry));
+	}
 	writer->flush();
 	writer.reset();
 	instance->releaseResources();
@@ -300,6 +314,8 @@ int main(int argc, char **argv)
 	receiptObject->setProperty("input_channels", inputChannels);
 	receiptObject->setProperty("output_channels", outputChannels);
 	receiptObject->setProperty("state_bytes", (juce::int64)state.getSize());
+	receiptObject->setProperty("parameter_count", automatableParameterCount);
+	receiptObject->setProperty("parameters", std::move(parameterInventory));
 	receiptObject->setProperty("sample_rate", options.sampleRate);
 	receiptObject->setProperty("block_size", options.blockSize);
 	receiptObject->setProperty("duration_seconds", options.seconds);

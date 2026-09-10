@@ -23,6 +23,31 @@
 #include <sstream>
 #include <string>
 
+namespace {
+struct PerformanceParameterDefinition
+{
+	const char *id;
+	const char *name;
+	int adin;
+	int defaultValue;
+};
+
+constexpr std::array<PerformanceParameterDefinition,
+	ProphecyAudioProcessor::kPerformanceParameterCount> kPerformanceParameters {{
+	{ "perf.speed",   "Performance: Speed",             0,  0x01 },
+	{ "perf.knob1",   "Performance: Knob 1",            1,  0x00 },
+	{ "perf.knob2",   "Performance: Knob 2",            2,  0x00 },
+	{ "perf.knob3",   "Performance: Knob 3",            3,  0x00 },
+	{ "perf.knob4",   "Performance: Knob 4",            4,  0x00 },
+	{ "perf.knob5",   "Performance: Knob 5",            5,  0x00 },
+	{ "perf.wheel1",  "Performance: Wheel 1 / Pitch",   8,  0x80 },
+	{ "perf.wheel2",  "Performance: Wheel 2 / Mod",     9,  0x80 },
+	{ "perf.ribbonX", "Performance: X / Ribbon X",     12,  0x80 },
+	{ "perf.logY",    "Performance: Y / Log-Wheel 3",  13,  0x74 },
+	{ "perf.ribbonZ", "Performance: Z / Ribbon Pressure", 14, 0x00 },
+}};
+}
+
 #if defined(_WIN32)
 static int prophecy_setenv(const char *name, const char *value, int overwrite)
 {
@@ -37,6 +62,17 @@ static int prophecy_setenv(const char *name, const char *value, int overwrite)
 ProphecyAudioProcessor::ProphecyAudioProcessor()
 	: AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
+	// Parameter IDs and order are part of the AU/VST3 project contract. Additions may be
+	// appended in later releases, but these first eleven IDs must never be renamed/reordered.
+	for (int i = 0; i < kPerformanceParameterCount; ++i)
+	{
+		const auto &definition = kPerformanceParameters[(std::size_t)i];
+		auto parameter = std::make_unique<PerformanceParameter>(*this, i,
+			juce::ParameterID { definition.id, 1 }, definition.name, definition.defaultValue);
+		m_performanceParameters[(std::size_t)i] = parameter.get();
+		addParameter(parameter.release());
+	}
+
 	// Match the driver's physical ADIN defaults until the host observes a gesture.
 	// Most inputs start at zero; these are the modeled nonzero rests/sensors.
 	for (auto &value : m_controllerDisplayValues)
@@ -51,6 +87,67 @@ ProphecyAudioProcessor::ProphecyAudioProcessor()
 	// getenv() are both inappropriate on a host's real-time callback.
 	m_skipStateRestore = std::getenv("PROPHECY_EDITOR_SELFTEST") != nullptr;
 	(void) m_engine.enableHostTimeline();
+}
+
+ProphecyAudioProcessor::PerformanceParameter::PerformanceParameter(
+	ProphecyAudioProcessor &owner, int controlIndex, const juce::ParameterID &id,
+	const juce::String &displayName, int defaultValue)
+	: juce::AudioParameterInt(id, displayName, 0, 255, defaultValue),
+	  m_owner(owner), m_controlIndex(controlIndex)
+{
+}
+
+void ProphecyAudioProcessor::PerformanceParameter::valueChanged(int newValue)
+{
+	m_owner.performanceParameterChanged(m_controlIndex, newValue);
+}
+
+int ProphecyAudioProcessor::performanceControlForAdin(int source)
+{
+	for (int i = 0; i < kPerformanceParameterCount; ++i)
+		if (kPerformanceParameters[(std::size_t)i].adin == source) return i;
+	return -1;
+}
+
+void ProphecyAudioProcessor::performanceParameterChanged(int controlIndex, int value)
+{
+	if (controlIndex < 0 || controlIndex >= kPerformanceParameterCount) return;
+	const int source = kPerformanceParameters[(std::size_t)controlIndex].adin;
+	value = std::clamp(value, 0, 255);
+	publishControllerDisplayValue(source, value);
+	if (source == 9) m_wheel2Pos.store((std::uint8_t)value, std::memory_order_relaxed);
+	m_performanceDirtyMask.fetch_or((std::uint16_t)(1u << controlIndex), std::memory_order_release);
+}
+
+void ProphecyAudioProcessor::setPerformanceValue(int controlIndex, int value, bool notifyHost)
+{
+	if (controlIndex < 0 || controlIndex >= kPerformanceParameterCount) return;
+	auto *parameter = m_performanceParameters[(std::size_t)controlIndex];
+	const float normalized = parameter->getNormalisableRange().convertTo0to1(
+		(float)std::clamp(value, 0, 255));
+	if (notifyHost) parameter->setValueNotifyingHost(normalized);
+	else if (parameter->get() != value)
+		static_cast<juce::AudioProcessorParameter *>(parameter)->setValue(normalized);
+	else
+	{
+		const int source = kPerformanceParameters[(std::size_t)controlIndex].adin;
+		publishControllerDisplayValue(source, value);
+		if (source == 9) m_wheel2Pos.store((std::uint8_t)value, std::memory_order_relaxed);
+	}
+}
+
+void ProphecyAudioProcessor::applyPendingPerformanceParameters(std::uint64_t frame)
+{
+	const auto dirty = m_performanceDirtyMask.exchange(0, std::memory_order_acq_rel);
+	for (int i = 0; i < kPerformanceParameterCount; ++i)
+	{
+		const auto bit = (std::uint16_t)(1u << i);
+		if ((dirty & bit) == 0) continue;
+		const auto &definition = kPerformanceParameters[(std::size_t)i];
+		const int value = m_performanceParameters[(std::size_t)i]->get();
+		if (!m_engine.pushAdinAtFrame(definition.adin, value, frame))
+			m_performanceDirtyMask.fetch_or(bit, std::memory_order_release);
+	}
 }
 
 ProphecyAudioProcessor::~ProphecyAudioProcessor()
@@ -240,6 +337,10 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 	// the worker. Hardware serial and scan/voice-allocation latency stays intact.
 	const auto timelineBlockStart = m_timelineHostFrame;
 	const auto midiFrameBase = m_timeline.event(timelineBlockStart);
+	// Parameter callbacks only publish a fixed atomic bitset. Deliver the latest value for
+	// each changed control at this block's exact engine-frame boundary, on the same bounded
+	// audio-thread queue used by sample-positioned mapped CC input.
+	if (engineActive) applyPendingPerformanceParameters(midiFrameBase);
 	const std::uint64_t hostBlockEnd = m_audioHostFrames.load(std::memory_order_relaxed);
 	const std::uint64_t hostBlockStart = hostBlockEnd - (std::uint64_t)numSamples;
 	for (const auto meta : midi)
@@ -419,10 +520,10 @@ ProphecyAudioProcessor::DiagnosticSnapshot ProphecyAudioProcessor::diagnosticSna
 //  The standalone deliberately persists preferences only: quitting it is not an implicit
 //  patch-save operation, and the emulated synth should boot from its explicitly written NVRAM.
 //============================================================
-// State container (backward compatible): a legacy state is the bare sysex program dump
-// (starts with 0xF0). A new state starts with the magic "PRP1" and carries the CC->ADIN
-// map alongside the dump, so old saves still load and the mapping survives even before the
-// engine has booted (no dump yet). Layout: "PRP1" | u8 N | N*(u8 cc, u8 target) | dump...
+// State container (backward compatible): a legacy state is the bare SysEx program dump.
+// PRP1 adds the CC->ADIN map; PRP2 adds Wheel 2. PRP3 stores the complete stable host
+// performance-parameter bank. Layout:
+// "PRP3" | u8 mapCount | map pairs | u8 parameterCount | parameter bytes | dump...
 void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 {
 	dest.reset();
@@ -456,9 +557,8 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 		}
 	}
 
-	// Header + mapping (non-Off CC entries). PRP2 adds a WHEEL2 (ADIN9) rest byte after the
-	// map; PRP1 (no wheel byte) still loads, defaulting the wheel to the driver rest (0x80).
-	dest.append("PRP2", 4);
+	// Header + mapping (non-Off CC entries) + the stable performance-parameter bank.
+	dest.append("PRP3", 4);
 	std::vector<std::uint8_t> map;
 	for (int cc = 0; cc < 128; ++cc)
 	{
@@ -468,8 +568,12 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 	const std::uint8_t n = (std::uint8_t) (map.size() / 2);
 	dest.append(&n, 1);
 	if (!map.empty()) dest.append(map.data(), map.size());
-	const std::uint8_t w2 = (std::uint8_t) wheel2Pos();
-	dest.append(&w2, 1);
+	const std::uint8_t parameterCount = kPerformanceParameterCount;
+	dest.append(&parameterCount, 1);
+	std::array<std::uint8_t, kPerformanceParameterCount> parameterValues {};
+	for (int i = 0; i < kPerformanceParameterCount; ++i)
+		parameterValues[(std::size_t)i] = (std::uint8_t)m_performanceParameters[(std::size_t)i]->get();
+	dest.append(parameterValues.data(), parameterValues.size());
 	if (!dump.empty()) dest.append(dump.data(), dump.size());
 
 	// Opt-in packaged-product CI marker carried through the standard VST3 state
@@ -498,22 +602,54 @@ void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 
 	const std::uint8_t *dump = p;
 	int dumpLen = size;
+	const bool prp3 = (size >= 5 && std::memcmp(p, "PRP3", 4) == 0);
 	const bool prp2 = (size >= 5 && std::memcmp(p, "PRP2", 4) == 0);
 	const bool prp1 = (size >= 5 && std::memcmp(p, "PRP1", 4) == 0);
-	if (prp1 || prp2)
+	if (prp1 || prp2 || prp3)
 	{
 		const int n = p[4];
 		int mapEnd = 5 + n * 2;
-		// A blob whose declared map (+ the PRP2 wheel byte) overruns the buffer is corrupt —
+		// A blob whose declared map (+ its controller payload) overruns the buffer is corrupt —
 		// bail entirely rather than feeding the magic bytes to the firmware as a dump.
-		if (mapEnd + (prp2 ? 1 : 0) > size) return;
+		if (mapEnd + (prp2 || prp3 ? 1 : 0) > size) return;
+		const int prp3Count = prp3 ? p[mapEnd] : 0;
+		if (prp3 && mapEnd + 1 + prp3Count > size) return;
 		for (int cc = 0; cc < 128; ++cc) setCcMap(cc, 0);
 		for (int i = 0; i < n; ++i) setCcMap(p[5 + i * 2], p[5 + i * 2 + 1]);
-		// PRP2 carries the WHEEL2 rest; legacy PRP1 predates it -> restore the driver default.
-		setWheel2(prp2 ? p[mapEnd] : 0x80);
-		if (prp2) mapEnd += 1;
+		// Reset parameters absent from legacy states to the exact modeled hardware defaults.
+		for (int i = 0; i < kPerformanceParameterCount; ++i)
+			setPerformanceValue(i, kPerformanceParameters[(std::size_t)i].defaultValue, false);
+		if (prp3)
+		{
+			++mapEnd;
+			if (wrapperType == juce::AudioProcessor::wrapperType_Standalone)
+			{
+				// Preserve the standalone's hardware-like persistence policy: Wheel 2 is
+				// friction-held state, while sprung/touch controls and PE knobs restart at
+				// their modeled defaults. AU/VST3 projects restore the complete bank below.
+				constexpr int wheel2Index = 7;
+				if (prp3Count > wheel2Index)
+					setPerformanceValue(wheel2Index, p[mapEnd + wheel2Index], false);
+			}
+			else
+			{
+				for (int i = 0; i < std::min(prp3Count, kPerformanceParameterCount); ++i)
+					setPerformanceValue(i, p[mapEnd + i], false);
+			}
+			mapEnd += prp3Count;
+		}
+		else if (prp2)
+		{
+			setWheel2(p[mapEnd++]);
+		}
 		dump = p + mapEnd;
 		dumpLen = size - mapEnd;
+	}
+	else
+	{
+		// Bare-SysEx projects predate all controller state.
+		for (int i = 0; i < kPerformanceParameterCount; ++i)
+			setPerformanceValue(i, kPerformanceParameters[(std::size_t)i].defaultValue, false);
 	}
 
 	// JUCE's standalone wrapper automatically reloads its last state blob. Keep the
@@ -863,35 +999,46 @@ int ProphecyAudioProcessor::ccMapTarget(int cc) const
 	return (int) m_ccMap[(std::size_t) cc].load(std::memory_order_relaxed);
 }
 
-// WHEEL2 = ADIN9. Store the chosen rest and push it into the ADIN mux. drain_host_adin()
-// no-ops when the value already matches (so pushing the 0x80 default costs nothing), and the
-// retained value is published by maybeBootEngine once this processor owns the MAME slot,
-// so this is safe to call pre-boot (e.g. from setStateInformation). Last write wins vs. a
-// live CC->Wheel2 remap, which is expected.
+// WHEEL2 = ADIN9. Store the chosen rest as the host parameter and schedule its ADIN write
+// at the next audio-block boundary. maybeBootEngine also publishes the retained value once
+// this processor owns the MAME slot, so state restore remains safe before boot. Last write
+// wins versus a live CC->Wheel2 remap, which is expected.
 void ProphecyAudioProcessor::setWheel2(int value)
 {
-	if (value < 0)   value = 0;
-	if (value > 255) value = 255;
-	m_wheel2Pos.store((std::uint8_t) value, std::memory_order_relaxed);
-	publishControllerDisplayValue(9, value);
-	(void) pushUiAdin(9, value);
+	setPerformanceValue(performanceControlForAdin(9), value, false);
 }
 
 void ProphecyAudioProcessor::setWheel2FromEditor(int value)
 {
-	if (value < 0) value = 0;
-	if (value > 255) value = 255;
-	m_wheel2Pos.store((std::uint8_t)value, std::memory_order_relaxed);
-	publishControllerDisplayValue(9, value);
-	(void) pushUiAdin(9, value);
+	setAdin(9, value);
 }
 
 void ProphecyAudioProcessor::setAdin(int source, int value)
 {
 	if (source < 0 || source > 15) return;
 	value = std::clamp(value, 0, 255);
+	const int controlIndex = performanceControlForAdin(source);
+	if (controlIndex >= 0)
+	{
+		setPerformanceValue(controlIndex, value, true);
+		return;
+	}
 	publishControllerDisplayValue(source, value);
 	(void) pushUiAdin(source, value);
+}
+
+void ProphecyAudioProcessor::beginAdinGesture(int source)
+{
+	const int controlIndex = performanceControlForAdin(source);
+	if (controlIndex >= 0)
+		m_performanceParameters[(std::size_t)controlIndex]->beginChangeGesture();
+}
+
+void ProphecyAudioProcessor::endAdinGesture(int source)
+{
+	const int controlIndex = performanceControlForAdin(source);
+	if (controlIndex >= 0)
+		m_performanceParameters[(std::size_t)controlIndex]->endChangeGesture();
 }
 
 void ProphecyAudioProcessor::publishControllerDisplayValue(int source, int value)
@@ -1313,6 +1460,18 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
 				{
 					if (args.size() >= 2) { diag("UI setAdin source=" + juce::String((int) args[0]) + " value=" + juce::String((int) args[1])); m_proc.setAdin((int) args[0], (int) args[1]); }
+					complete(juce::var{});
+				})
+			.withNativeFunction("beginAdinGesture",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					if (!args.isEmpty()) m_proc.beginAdinGesture((int)args[0]);
+					complete(juce::var{});
+				})
+			.withNativeFunction("endAdinGesture",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					if (!args.isEmpty()) m_proc.endAdinGesture((int)args[0]);
 					complete(juce::var{});
 				})
 			.withNativeFunction("getLeds",
