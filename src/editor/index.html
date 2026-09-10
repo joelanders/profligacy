@@ -3401,11 +3401,14 @@
         beginAdinGesture:0,endAdinGesture:0};
       let adinLog = [];   // every setAdin (src, val) — the pad gate bypasses adin[]
       let gestureLog = [];
+      let automationLog = [];
       const origNative = native;
       window.native = function(name, a, b){
         if (name in sends) sends[name]++;
-        if (name === 'setAdin') adinLog.push([a|0, b|0]);
-        if (name === 'beginAdinGesture' || name === 'endAdinGesture') gestureLog.push([name,a|0]);
+        if (name === 'setAdin') { adinLog.push([a|0, b|0]); automationLog.push([name,a|0,b|0]); }
+        if (name === 'beginAdinGesture' || name === 'endAdinGesture') {
+          gestureLog.push([name,a|0]); automationLog.push([name,a|0]);
+        }
         return origNative.apply(this, arguments); };
       const toClient = window.__faceToClient;
       ok('transform exposed', !!toClient);
@@ -3447,6 +3450,32 @@
       ok('Z slider springs to zero on release',
          zSliderRelease && zSliderRelease[1]===0 && zSliderState && zSliderState[14]===0,
          'calls '+JSON.stringify(adinLog));
+      const pitchSliderY=zSliderY+(panelLayout.system ? 40 : 42);
+      const checkPitchRelease=(releaseType,position)=>{
+        automationLog=[];
+        fire('pointerdown',panelLayout.leftTrackX+panelLayout.leftTrackW*position,pitchSliderY);
+        fire(releaseType,panelLayout.leftTrackX+panelLayout.leftTrackW*position,pitchSliderY);
+        const pitchOps=automationLog.filter(c=>c[1]===8);
+        const lastSet=pitchOps.filter(c=>c[0]==='setAdin').pop();
+        const state=window.__adinDebug ? window.__adinDebug() : null;
+        return {pitchOps,lastSet,state};
+      };
+      const pitchUp=checkPitchRelease('pointerup',.75);
+      ok('Pitch slider release centers before ending gesture',
+         pitchUp.pitchOps.length>=4
+           && pitchUp.pitchOps[0][0]==='beginAdinGesture'
+           && pitchUp.lastSet && pitchUp.lastSet[2]===0x80
+           && pitchUp.pitchOps[pitchUp.pitchOps.length-1][0]==='endAdinGesture'
+           && pitchUp.state && pitchUp.state[8]===0x80,
+         JSON.stringify(pitchUp.pitchOps));
+      const pitchCancel=checkPitchRelease('pointercancel',.25);
+      ok('Pitch slider cancellation centers before ending gesture',
+         pitchCancel.pitchOps.length>=4
+           && pitchCancel.pitchOps[0][0]==='beginAdinGesture'
+           && pitchCancel.lastSet && pitchCancel.lastSet[2]===0x80
+           && pitchCancel.pitchOps[pitchCancel.pitchOps.length-1][0]==='endAdinGesture'
+           && pitchCancel.state && pitchCancel.state[8]===0x80,
+         JSON.stringify(pitchCancel.pitchOps));
       adinLog = [];
       fire('pointerdown', panelLayout.leftTrackX+panelLayout.leftTrackW/2,
            panelLayout.xyY+panelLayout.leftTrackW/2);
@@ -4083,8 +4112,8 @@
     const pitchStep=L.system ? 40 : 42;
     return [
       {label:'SPEED',cy:L.speedY,src:0,blue:1,rest:0x80},
-      {label:'Z',cy:zY,src:14,blue:0,rest:0x00},
-      {label:'PITCH',cy:zY+pitchStep,src:8,blue:0,rest:0x80},
+      {label:'Z',cy:zY,src:14,blue:0,rest:0x00,spring:1},
+      {label:'PITCH',cy:zY+pitchStep,src:8,blue:0,rest:0x80,spring:1},
       {label:'MOD',cy:zY+80,src:9,blue:0,rest:0x80}
     ];
   }
@@ -5399,10 +5428,11 @@
   });
   function finishPointer(){
     if (drag && drag.kind==='key') noteOff();
-    if (drag && drag.kind==='slider' && drag.s && drag.s.src===14){
-      // The physical Z sensor measures finger pressure and returns to zero when
-      // released. Preserve continuous control while held, but never latch it.
-      adin[14]=0x00; sendAdin(14); dirty=true;
+    if (drag && drag.kind==='slider' && drag.s && drag.s.spring){
+      // Wheel 1 is spring-centered and the Z sensor loses pressure when released.
+      // Publish the physical rest before ending the gesture so the host records the
+      // complete movement and remains solely responsible for automation arbitration.
+      adin[drag.s.src]=drag.s.rest; sendAdin(drag.s.src); dirty=true;
     }
     if (drag && drag.kind==='xy'){ xyTouch=false;
       // Release the composite gesture: ribbon X and Log/Wheel 3 return to their
