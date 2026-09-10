@@ -6,24 +6,35 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 
 struct ProphecyEngine::Impl
 {
 	std::atomic<bool> started{false};
 	std::atomic<bool> finished{false};
 	std::atomic<bool> owns{false};
+	std::atomic<bool> playback_ready{false};
 	std::atomic<std::uint64_t> produced{0};
+	std::atomic<std::uint64_t> requested{0};
+	const bool probe = std::getenv("PROPHECY_FAKE_TIMELINE_PROBE") != nullptr;
+	std::array<std::uint64_t, 128> notes{};
+	std::size_t note_count = 0;
 	std::atomic<std::uint64_t> dropped_immediate{0};
 	std::atomic<std::uint64_t> dropped_scheduled{0};
 	std::atomic<std::uint64_t> dropped_ui_adin{0};
 	std::atomic<std::uint64_t> dropped_audio_adin{0};
 	std::atomic<std::uint64_t> dropped_scheduled_panel{0};
 	std::atomic<std::uint64_t> dropped_scheduled_adin{0};
+	std::atomic<std::size_t> immediate_midi_bytes{0};
+	std::atomic<std::size_t> audio_adin_events{0};
 	std::atomic<std::uint32_t> lcd_version{0};
 };
 
-ProphecyEngine::ProphecyEngine() : m_impl(std::make_unique<Impl>()) { }
+ProphecyEngine::ProphecyEngine() : m_impl(std::make_shared<Impl>()) { }
 ProphecyEngine::~ProphecyEngine() { stop(); }
 
 bool ProphecyEngine::start(const std::vector<std::string> &)
@@ -32,19 +43,60 @@ bool ProphecyEngine::start(const std::vector<std::string> &)
 	if (!m_impl->started.compare_exchange_strong(expected, true)) return false;
 	m_impl->owns.store(true);
 	m_impl->finished.store(false);
+	m_impl->playback_ready.store(false);
 	return true;
 }
 
 bool ProphecyEngine::enableMidiTxByteCapture(bool) { return !m_impl->started.load(); }
+bool ProphecyEngine::enableHostTimeline() { return !m_impl->started.load(); }
+bool ProphecyEngine::initializePlayback(bool)
+{
+	if (const auto* delay = std::getenv("PROPHECY_FAKE_INITIALIZATION_MS"))
+		for (int remaining = std::max(std::atoi(delay), 0); running() && remaining > 0; --remaining)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	const bool ready = running();
+	m_impl->playback_ready.store(ready);
+	return ready;
+}
+bool ProphecyEngine::readyForPlayback() const { return running() && m_impl->playback_ready.load(); }
+std::uint64_t ProphecyEngine::playbackOrigin() const { return 0; }
+bool ProphecyEngine::waitingForOutput() const { return false; }
+bool ProphecyEngine::waitingForInput() const { return false; }
+void ProphecyEngine::setHostBlockFrames(std::uint32_t) {}
+void ProphecyEngine::requestThroughFrame(std::uint64_t frame) { m_impl->requested.store(frame); }
+std::uint64_t ProphecyEngine::requestedFrames() const { return m_impl->requested.load(); }
+std::size_t ProphecyEngine::readAtFrame(std::uint64_t first, float* left, float* right,
+	std::size_t frames, bool)
+{
+	std::fill(left, left + frames, 0.0f);
+	std::fill(right, right + frames, 0.0f);
+	if (!running()) return 0;
+	const auto horizon = requestedFrames() / kAudioQuantum * kAudioQuantum;
+	const auto count = horizon > first
+		? (std::size_t) std::min<std::uint64_t>(horizon - first, frames) : 0;
+	if (m_impl->probe)
+		for (std::size_t i = 0; i < count; ++i)
+			for (std::size_t note = 0; note < m_impl->note_count; ++note)
+				if (first + i >= m_impl->notes[note] && first + i < m_impl->notes[note] + 32)
+				{
+					left[i] = 0.5f;
+					right[i] = -0.25f;
+				}
+	m_impl->produced.store(horizon);
+	return count;
+}
 
-void ProphecyEngine::stop()
+void ProphecyEngine::requestStop()
 {
 	if (m_impl->started.exchange(false))
 	{
 		m_impl->owns.store(false);
+		m_impl->playback_ready.store(false);
 		m_impl->finished.store(true);
 	}
 }
+
+void ProphecyEngine::stop() { requestStop(); }
 
 bool ProphecyEngine::running() const { return m_impl->started.load() && !m_impl->finished.load(); }
 bool ProphecyEngine::finished() const { return m_impl->finished.load(); }
@@ -65,8 +117,26 @@ std::size_t ProphecyEngine::pull(float *left, float *right, std::size_t frames)
 	return frames;
 }
 
-bool ProphecyEngine::pushMidi(const std::uint8_t *, std::size_t n) { if (!running()) { m_impl->dropped_immediate.fetch_add(n); return false; } return true; }
-bool ProphecyEngine::pushMidiAtFrame(const std::uint8_t *, std::size_t n, std::uint64_t) { if (!running()) { m_impl->dropped_scheduled.fetch_add(n); return false; } return true; }
+bool ProphecyEngine::pushMidi(const std::uint8_t *, std::size_t n)
+{
+	if (n == 0) return true;
+	auto used = m_impl->immediate_midi_bytes.load();
+	if (!running() || n > 4096 - std::min<std::size_t>(used, 4096)
+			|| !m_impl->immediate_midi_bytes.compare_exchange_strong(used, used + n))
+	{
+		m_impl->dropped_immediate.fetch_add(n);
+		return false;
+	}
+	return true;
+}
+bool ProphecyEngine::pushMidiAtFrame(const std::uint8_t *bytes, std::size_t n, std::uint64_t frame)
+{
+	if (!running()) { m_impl->dropped_scheduled.fetch_add(n); return false; }
+	if (m_impl->probe && n == 3 && (bytes[0] & 0xf0) == 0x90 && bytes[2] > 0
+			&& m_impl->note_count < m_impl->notes.size())
+		m_impl->notes[m_impl->note_count++] = frame;
+	return true;
+}
 std::uint64_t ProphecyEngine::droppedImmediateMidiBytes() const { return m_impl->dropped_immediate.load(); }
 std::uint64_t ProphecyEngine::droppedScheduledMidiBytes() const { return m_impl->dropped_scheduled.load(); }
 std::size_t ProphecyEngine::popMidiTx(std::uint8_t *, std::size_t) { return 0; }
@@ -76,7 +146,17 @@ std::uint64_t ProphecyEngine::droppedMidiTxByteEvents() const { return 0; }
 void ProphecyEngine::pushPanelPulse(int, int, int) { }
 bool ProphecyEngine::pushPanelPulseAtFrame(int, int, int, std::uint64_t) { return running(); }
 bool ProphecyEngine::pushAdin(int, int) { if (!running()) m_impl->dropped_ui_adin.fetch_add(1); return running(); }
-bool ProphecyEngine::pushAdinFromAudio(int, int) { if (!running()) m_impl->dropped_audio_adin.fetch_add(1); return running(); }
+bool ProphecyEngine::pushAdinFromAudio(int, int)
+{
+	auto used = m_impl->audio_adin_events.load();
+	if (!running() || used >= 2048
+			|| !m_impl->audio_adin_events.compare_exchange_strong(used, used + 1))
+	{
+		m_impl->dropped_audio_adin.fetch_add(1);
+		return false;
+	}
+	return true;
+}
 bool ProphecyEngine::pushAdinAtFrame(int, int, std::uint64_t) { if (!running()) m_impl->dropped_scheduled_adin.fetch_add(1); return running(); }
 std::uint64_t ProphecyEngine::droppedUiAdinEvents() const { return m_impl->dropped_ui_adin.load(); }
 std::uint64_t ProphecyEngine::droppedAudioAdinEvents() const { return m_impl->dropped_audio_adin.load(); }

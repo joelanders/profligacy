@@ -4,9 +4,9 @@
 //
 // This header deliberately includes NO MAME and NO JUCE headers. The engine runs
 // the real korgprop MAME machine on a background thread and buffers its 48 kHz
-// stereo output in a ring; a host (the console harness, or the JUCE AudioProcessor)
-// pulls fixed blocks at its own real-time cadence. Backpressure inside the engine
-// throttles MAME to the pull rate. All MAME types live in prophecy_engine.cpp.
+// stereo output in a ring. Plugin hosts grant timestamped input ranges and read
+// output at absolute sample positions. Console clients may instead pull from a
+// free-running, backpressured FIFO. All MAME types live in prophecy_engine.cpp.
 //
 #pragma once
 
@@ -16,11 +16,15 @@
 #include <string>
 #include <vector>
 
+class ProphecyEngineLifecycleTestAccess;
+
 class ProphecyEngine
 {
 public:
 	static constexpr int kSampleRate = 48000;
 	static constexpr int kChannels   = 2;
+	static constexpr std::uint32_t kAudioQuantum = 64;
+	static constexpr std::size_t kTimelineCapacity = 262144;
 	static constexpr std::size_t kLcdA00GlyphRowBytes = 256 * 8;
 	enum class InstanceStatus : std::uint8_t
 	{
@@ -49,8 +53,9 @@ public:
 
 	// Boot the machine on a background thread. `args` is a MAME command line, e.g.
 	// {"prophecy","korgprop","-rompath",romdir,"-video","none","-sound","none","-nothrottle"}.
-	// Non-blocking; returns false if already started or another engine owns MAME's
-	// process-global machine slot. instanceStatus() distinguishes those cases.
+	// Non-blocking; returns false if already started, another engine owns MAME's
+	// process-global machine slot, or the current module cannot be retained for safe
+	// bounded teardown. instanceStatus() distinguishes an unavailable singleton.
 	bool start(const std::vector<std::string> &args);
 
 	// Enable the raw MIDI OUT observer. Call before start(); it is disabled by default so
@@ -58,7 +63,11 @@ public:
 	// observer ring and dropped-event count. Returns false once the engine has started.
 	bool enableMidiTxByteCapture(bool enabled = true);
 
-	// Ask the machine to exit and join the thread. Safe to call from a destructor.
+	// Ask the machine to exit and finish ownership cleanup. Safe to call from a
+	// destructor and bounded even if MAME fails to reach a cancellation point.
+	// requestStop() is non-blocking and may be used to cancel initialization before
+	// joining an owner-managed initialization thread.
+	void requestStop();
 	void stop();
 
 	bool running() const;   // thread launched and machine not yet finished
@@ -76,11 +85,30 @@ public:
 	// real-time-safe: no locks held across MAME, no allocation in steady state.
 	std::size_t pull(float *left, float *right, std::size_t frames);
 
+	// Plugin timeline mode is selected before start; console clients retain pull's
+	// free-running contract. Publish all scheduled input before granting its range.
+	bool enableHostTimeline();
+	// Potentially blocking initialization for caller-managed background lifecycle
+	// work. Finish firmware boot outside the host epoch, then publish its native origin.
+	bool initializePlayback(bool firmwareHandshake = true);
+	bool readyForPlayback() const;
+	std::uint64_t playbackOrigin() const;
+	bool waitingForInput() const;
+	bool waitingForOutput() const; // diagnostic only; takes the offline mutex
+	void setHostBlockFrames(std::uint32_t nativeFrames);
+	void requestThroughFrame(std::uint64_t exclusiveEnd);
+	std::uint64_t requestedFrames() const;
+	// Read an absolute output window. Realtime calls never wait. Offline calls
+	// wait for that window, with cancellation/engine-exit and a failure timeout.
+	// first must be nondecreasing; overlapping interpolation windows are allowed.
+	std::size_t readAtFrame(std::uint64_t first, float *left, float *right,
+		std::size_t frames, bool offline);
+
 	// Push one complete raw host MIDI message (note/CC/bend/sysex) to the emulated
 	// 31250-baud serial UART. This immediate queue has one producer: the message thread.
 	// The write is all-or-nothing; false means the bounded queue was full and the complete
-	// message was dropped (never torn). Bytes sent before boot (~2 s) are consumed by the
-	// driver but ignored by the firmware.
+	// message was dropped (never torn). Timeline hosts reject input until
+	// initializePlayback succeeds; console hosts must wait for firmware boot.
 	bool pushMidi(const std::uint8_t *bytes, std::size_t n);
 
 	// Schedule one host MIDI message at a native 48 kHz engine-output frame. This is
@@ -163,5 +191,7 @@ public:
 	std::uint64_t producedFrames() const; // total frames MAME has emitted
 
 private:
-	std::unique_ptr<Impl> m_impl;
+	friend class ProphecyEngineLifecycleTestAccess;
+	void setWorkerExitDelayForTesting(std::uint32_t milliseconds);
+	std::shared_ptr<Impl> m_impl;
 };

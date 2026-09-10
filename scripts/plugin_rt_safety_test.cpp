@@ -1,9 +1,10 @@
-// No-ROM regression test for the ProphecyAudioProcessor real-time callback contract.
+// Realtime allocation and queue guards; --active uses an isolated firmware fixture.
 #include "PluginProcessor.h"
 
 #include <juce_events/juce_events.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -48,8 +49,56 @@ void operator delete[](void *p) noexcept { std::free(p); }
 void operator delete(void *p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
 
-int main()
+static int activeAudioTest()
 {
+	juce::ScopedJuceInitialiser_GUI juceInitialiser;
+	ProphecyAudioProcessor processor;
+	processor.setCcMap(1, (int) ProphecyAudioProcessor::CcTarget::Wheel1);
+	juce::MidiBuffer empty, midi;
+	midi.ensureSize(4096);
+	const std::uint8_t note[] = {0x90, 60, 64};
+	const std::uint8_t cc[] = {0xb0, 1, 64};
+	std::array<std::uint8_t, 600> sysex{};
+	sysex[0] = 0xf0; sysex[1] = 0x7d; sysex.back() = 0xf7;
+	midi.addEvent(note, sizeof(note), 0);
+	midi.addEvent(cc, sizeof(cc), 0);
+	midi.addEvent(sysex.data(), (int) sysex.size(), 0);
+	juce::AudioBuffer<float> block(2, 512);
+	for (double rate : {48000.0, 44100.0, 96000.0, 192000.0})
+	for (int prepared : {64, 128, 512})
+	{
+		processor.prepareToPlay(rate, prepared);
+		if (!processor.diagnosticSnapshot().engineRunning)
+		{
+			std::fprintf(stderr, "active allocation test requires a running engine and isolated ROM/NVRAM fixture\n");
+			return 1;
+		}
+		for (int count : {1, 17, 64, 127, 511, 512})
+		{
+			// Prime the same real worker and ring off the watched realtime callback.
+			// This avoids turning a no-allocation test into a scheduling benchmark.
+			block.setSize(2, prepared, false, false, true);
+			processor.setNonRealtime(true);
+			for (int prime = 0; prime < 16; ++prime) processor.processBlock(block, empty);
+			processor.setNonRealtime(false);
+			block.setSize(2, std::min(count, prepared), false, false, true);
+			const auto before = processor.diagnosticSnapshot();
+			if (!processWithoutAllocation(processor, block, midi)
+				|| processor.diagnosticSnapshot().audioEngineFrames <= before.audioEngineFrames
+				|| processor.diagnosticSnapshot().audioUnderrunFrames != before.audioUnderrunFrames)
+			{
+				std::fprintf(stderr, "active read/resampling allocated or failed to consume PCM: rate=%.0f block=%d\n", rate, count);
+				return 1;
+			}
+		}
+	}
+	std::puts("PASS active realtime allocation guard: PCM reads, resampling, MIDI SysEx and timed ADIN");
+	return 0;
+}
+
+int main(int argc, char** argv)
+{
+	if (argc == 2 && std::string(argv[1]) == "--active") return activeAudioTest();
 #if defined(_WIN32)
 	_putenv_s("PROPHECY_FORCE_NO_ROM", "1");
 #else
@@ -73,7 +122,7 @@ int main()
 	constexpr int legalBlockSizes[] = { 1, 17, 64, 511, 512, 1024, 4096, 16384 };
 	for (double rate : rates)
 	{
-		processor.prepareToPlay(rate, 64);
+		processor.prepareToPlay(rate, 16384);
 		for (int frames : legalBlockSizes)
 		{
 			juce::AudioBuffer<float> stereo(2, frames);
