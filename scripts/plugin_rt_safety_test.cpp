@@ -22,6 +22,19 @@ struct WatchAllocations
 	~WatchAllocations() { g_watch_allocations = false; }
 };
 
+struct ParameterListener final : juce::AudioProcessorParameter::Listener
+{
+	void parameterValueChanged(int, float) override { ++values; }
+	void parameterGestureChanged(int, bool starting) override
+	{
+		if (starting) ++begins;
+		else ++ends;
+	}
+	int values = 0;
+	int begins = 0;
+	int ends = 0;
+};
+
 void *allocate(std::size_t size)
 {
 	if (g_watch_allocations)
@@ -107,16 +120,140 @@ int main(int argc, char** argv)
 	juce::ScopedJuceInitialiser_GUI juceInitialiser;
 	ProphecyAudioProcessor processor;
 	juce::MidiBuffer emptyMidi;
+	const std::array<const char *, ProphecyAudioProcessor::kPerformanceParameterCount> expectedIds {{
+		"perf.speed", "perf.knob1", "perf.knob2", "perf.knob3", "perf.knob4",
+		"perf.knob5", "perf.wheel1", "perf.wheel2", "perf.ribbonX", "perf.logY",
+		"perf.ribbonZ"
+	}};
+	const std::array<int, ProphecyAudioProcessor::kPerformanceParameterCount> expectedDefaults {{
+		0x01, 0, 0, 0, 0, 0, 0x80, 0x80, 0x80, 0x74, 0
+	}};
+	const auto &parameters = processor.getParameters();
+	if (parameters.size() != ProphecyAudioProcessor::kPerformanceParameterCount)
+	{
+		std::fprintf(stderr, "host parameter count is %d, expected %d\n", parameters.size(),
+			ProphecyAudioProcessor::kPerformanceParameterCount);
+		return 1;
+	}
+	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
+	{
+		auto *ranged = dynamic_cast<juce::RangedAudioParameter *>(parameters[i]);
+		auto *integer = dynamic_cast<juce::AudioParameterInt *>(parameters[i]);
+		if (ranged == nullptr || integer == nullptr || ranged->getParameterID() != expectedIds[(std::size_t)i]
+				|| integer->get() != expectedDefaults[(std::size_t)i])
+		{
+			std::fprintf(stderr, "host parameter %d identity/default mismatch\n", i);
+			return 1;
+		}
+	}
+
+	// Editor writes must be host-visible and bracketed by automation gestures. Conversely,
+	// a host parameter write must immediately reach the editor's controller snapshot.
+	ParameterListener listener;
+	parameters[8]->addListener(&listener);
+	processor.beginAdinGesture(12);
+	processor.setAdin(12, 37);
+	processor.endAdinGesture(12);
+	parameters[8]->removeListener(&listener);
+	if (dynamic_cast<juce::AudioParameterInt *>(parameters[8])->get() != 37
+			|| listener.values != 1 || listener.begins != 1 || listener.ends != 1)
+	{
+		std::fprintf(stderr, "editor/host automation gesture contract failed\n");
+		return 1;
+	}
+	auto *hostY = dynamic_cast<juce::RangedAudioParameter *>(parameters[9]);
+	hostY->setValue(hostY->getNormalisableRange().convertTo0to1(203.0f));
 	std::uint8_t controllerValues[16] = {};
 	processor.controllerDisplaySnapshot(controllerValues);
+	if (controllerValues[12] != 37 || controllerValues[13] != 203)
+	{
+		std::fprintf(stderr, "host parameter change did not update controller display\n");
+		return 1;
+	}
 	const std::uint8_t expectedControllerDefaults[16] = {
 		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa6,
 		0x80, 0x80, 0x00, 0x00, 0x80, 0x74, 0x00, 0x00 };
+	// Restore the two values changed above before checking the complete physical defaults.
+	processor.setAdin(12, 0x80);
+	hostY->setValue(hostY->getNormalisableRange().convertTo0to1(0x74));
+	processor.controllerDisplaySnapshot(controllerValues);
 	if (!std::equal(controllerValues, controllerValues + 16, expectedControllerDefaults))
 	{
 		std::fprintf(stderr, "controller display defaults are wrong\n");
 		return 1;
 	}
+
+	// PRP3 round-trips all host controls. PRP1, PRP2 and bare SysEx retain their old layouts
+	// and supply exact hardware defaults for values those formats did not store.
+	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
+	{
+		auto *ranged = dynamic_cast<juce::RangedAudioParameter *>(parameters[i]);
+		ranged->setValue(ranged->getNormalisableRange().convertTo0to1((float)(i * 19 + 7)));
+	}
+	processor.setCcMap(74, (int)ProphecyAudioProcessor::CcTarget::PadX);
+	juce::MemoryBlock state;
+	processor.getStateInformation(state);
+	if (state.getSize() < 5 || std::memcmp(state.getData(), "PRP3", 4) != 0)
+	{
+		std::fprintf(stderr, "state writer did not emit PRP3\n");
+		return 1;
+	}
+	ProphecyAudioProcessor restored;
+	restored.setStateInformation(state.getData(), (int)state.getSize());
+	if (restored.ccMapTarget(74) != (int)ProphecyAudioProcessor::CcTarget::PadX)
+	{
+		std::fprintf(stderr, "PRP3 CC mapping did not round-trip\n");
+		return 1;
+	}
+	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
+		if (dynamic_cast<juce::AudioParameterInt *>(restored.getParameters()[i])->get() != i * 19 + 7)
+		{
+			std::fprintf(stderr, "PRP3 parameter %d did not round-trip\n", i);
+			return 1;
+		}
+	juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Standalone);
+	ProphecyAudioProcessor standaloneRestore;
+	juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Undefined);
+	standaloneRestore.setStateInformation(state.getData(), (int)state.getSize());
+	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
+	{
+		const int expected = i == 7 ? 7 * 19 + 7 : expectedDefaults[(std::size_t)i];
+		if (dynamic_cast<juce::AudioParameterInt *>(standaloneRestore.getParameters()[i])->get() != expected)
+		{
+			std::fprintf(stderr, "standalone persistence policy failed at parameter %d\n", i);
+			return 1;
+		}
+	}
+	const std::uint8_t prp2State[] = {'P','R','P','2',0,211};
+	restored.setStateInformation(prp2State, (int)sizeof(prp2State));
+	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
+	{
+		const int expected = i == 7 ? 211 : expectedDefaults[(std::size_t)i];
+		if (dynamic_cast<juce::AudioParameterInt *>(restored.getParameters()[i])->get() != expected)
+		{
+			std::fprintf(stderr, "PRP2 migration failed at parameter %d\n", i);
+			return 1;
+		}
+	}
+	const std::uint8_t prp1State[] = {'P','R','P','1',0};
+	restored.setStateInformation(prp1State, (int)sizeof(prp1State));
+	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
+		if (dynamic_cast<juce::AudioParameterInt *>(restored.getParameters()[i])->get()
+				!= expectedDefaults[(std::size_t)i])
+		{
+			std::fprintf(stderr, "PRP1 migration failed at parameter %d\n", i);
+			return 1;
+		}
+	dynamic_cast<juce::RangedAudioParameter *>(restored.getParameters()[0])->setValue(1.0f);
+	const std::uint8_t bareState[] = {0xf0, 0x7d, 0xf7};
+	restored.setStateInformation(bareState, (int)sizeof(bareState));
+	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
+		if (dynamic_cast<juce::AudioParameterInt *>(restored.getParameters()[i])->get()
+				!= expectedDefaults[(std::size_t)i])
+		{
+			std::fprintf(stderr, "legacy state defaults failed at parameter %d\n", i);
+			return 1;
+		}
 
 	constexpr double rates[] = { 44100.0, 48000.0, 96000.0 };
 	constexpr int legalBlockSizes[] = { 1, 17, 64, 511, 512, 1024, 4096, 16384 };
