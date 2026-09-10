@@ -115,17 +115,18 @@ void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 // editor shows the first-run ROM picker; the pick then boots via setRomDirFromUser().
 bool ProphecyAudioProcessor::maybeBootEngine()
 {
-	if (m_started.load())
+	if (m_bootClaimed.load())
 		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active;
 	const juce::File romDir = romloc::locateRomDir();
 	if (romDir == juce::File())
 		return false;
-	if (m_started.exchange(true))
+	if (m_bootClaimed.exchange(true))
 		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active;
-	// A ROM chosen after callbacks have already begun starts a fresh audible epoch;
-	// ordinary asynchronous startup retains the host frames elapsed during boot so
-	// later MIDI still shares the same absolute project timeline.
-	m_resetTimelineOnAttach.store(m_audioCallbacks.load(std::memory_order_acquire) != 0,
+	// A ROM chosen after callbacks have already begun starts a fresh audible epoch.
+	// Ordinary startup instead retains project frames elapsed during initialization:
+	// the completed firmware state represents project frame zero, so realtime and
+	// offline initialization reach the same post-boot synth time at a later host frame.
+	m_lateBootStartsFreshEpoch.store(m_audioCallbacks.load(std::memory_order_acquire) != 0,
 		std::memory_order_release);
 	m_romPath   = romDir.getFullPathName();
 	m_nvramPath = romloc::nvramDirFor(romDir).getFullPathName();
@@ -214,7 +215,7 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 		// A ROM may be selected long after the DAW started calling processBlock.
 		// Adopt its completed initialization epoch, with the same fixed delay.
 		m_timeline.reset(m_hostSampleRate, m_engine.playbackOrigin());
-		if (m_resetTimelineOnAttach.exchange(false, std::memory_order_acq_rel))
+		if (m_lateBootStartsFreshEpoch.exchange(false, std::memory_order_acq_rel))
 			m_timelineHostFrame = 0;
 		m_timelineAttached = true;
 	}

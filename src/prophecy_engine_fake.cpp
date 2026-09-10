@@ -29,6 +29,8 @@ struct ProphecyEngine::Impl
 	std::atomic<std::uint64_t> dropped_audio_adin{0};
 	std::atomic<std::uint64_t> dropped_scheduled_panel{0};
 	std::atomic<std::uint64_t> dropped_scheduled_adin{0};
+	std::atomic<std::size_t> immediate_midi_bytes{0};
+	std::atomic<std::size_t> audio_adin_events{0};
 	std::atomic<std::uint32_t> lcd_version{0};
 };
 
@@ -115,7 +117,18 @@ std::size_t ProphecyEngine::pull(float *left, float *right, std::size_t frames)
 	return frames;
 }
 
-bool ProphecyEngine::pushMidi(const std::uint8_t *, std::size_t n) { if (!running()) { m_impl->dropped_immediate.fetch_add(n); return false; } return true; }
+bool ProphecyEngine::pushMidi(const std::uint8_t *, std::size_t n)
+{
+	if (n == 0) return true;
+	auto used = m_impl->immediate_midi_bytes.load();
+	if (!running() || n > 4096 - std::min<std::size_t>(used, 4096)
+			|| !m_impl->immediate_midi_bytes.compare_exchange_strong(used, used + n))
+	{
+		m_impl->dropped_immediate.fetch_add(n);
+		return false;
+	}
+	return true;
+}
 bool ProphecyEngine::pushMidiAtFrame(const std::uint8_t *bytes, std::size_t n, std::uint64_t frame)
 {
 	if (!running()) { m_impl->dropped_scheduled.fetch_add(n); return false; }
@@ -133,7 +146,17 @@ std::uint64_t ProphecyEngine::droppedMidiTxByteEvents() const { return 0; }
 void ProphecyEngine::pushPanelPulse(int, int, int) { }
 bool ProphecyEngine::pushPanelPulseAtFrame(int, int, int, std::uint64_t) { return running(); }
 bool ProphecyEngine::pushAdin(int, int) { if (!running()) m_impl->dropped_ui_adin.fetch_add(1); return running(); }
-bool ProphecyEngine::pushAdinFromAudio(int, int) { if (!running()) m_impl->dropped_audio_adin.fetch_add(1); return running(); }
+bool ProphecyEngine::pushAdinFromAudio(int, int)
+{
+	auto used = m_impl->audio_adin_events.load();
+	if (!running() || used >= 2048
+			|| !m_impl->audio_adin_events.compare_exchange_strong(used, used + 1))
+	{
+		m_impl->dropped_audio_adin.fetch_add(1);
+		return false;
+	}
+	return true;
+}
 bool ProphecyEngine::pushAdinAtFrame(int, int, std::uint64_t) { if (!running()) m_impl->dropped_scheduled_adin.fetch_add(1); return running(); }
 std::uint64_t ProphecyEngine::droppedUiAdinEvents() const { return m_impl->dropped_ui_adin.load(); }
 std::uint64_t ProphecyEngine::droppedAudioAdinEvents() const { return m_impl->dropped_audio_adin.load(); }

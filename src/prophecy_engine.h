@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+class ProphecyEngineLifecycleTestAccess;
+
 class ProphecyEngine
 {
 public:
@@ -189,5 +191,7 @@ public:
 	std::uint64_t producedFrames() const; // total frames MAME has emitted
 
 private:
+	friend class ProphecyEngineLifecycleTestAccess;
+	void setWorkerExitDelayForTesting(std::uint32_t milliseconds);
 	std::shared_ptr<Impl> m_impl;
 };

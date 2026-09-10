@@ -546,14 +546,16 @@ private:
 	}
 
 	ProphecyEngine     m_engine;
-	std::atomic<bool>  m_started { false };
+	// Serializes ROM-path setup and creation of the one processor-owned
+	// initialization thread. Engine lifecycle state remains in ProphecyEngine.
+	std::atomic<bool>  m_bootClaimed { false };
 	juce::String       m_romPath;             // resolved ROM dir once booted
 	juce::String       m_nvramPath;           // resolved NVRAM dir once booted
 	double             m_hostSampleRate = 48000.0;
 	prophecy::SampleTimeline m_timeline;
 	std::uint64_t      m_timelineHostFrame = 0;
 	bool               m_timelineAttached = false;
-	std::atomic<bool>  m_resetTimelineOnAttach { false };
+	std::atomic<bool>  m_lateBootStartsFreshEpoch { false };
 	int                m_preparedMaxBlock = 0;
 	int                m_maxExpectedBlock = 1;
 	enum class InitializationState : std::uint8_t { Idle, Running, Ready, Failed };

@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -723,7 +724,8 @@ struct ProphecyEngine::Impl
 	std::uint64_t                    completed_horizon = 0; // protected by output_mutex
 	std::uint64_t                    output_wait_horizon = 0; // protected by output_mutex
 	std::thread                      thread;
-	void*                            retained_module = nullptr;
+	std::unique_ptr<void, void(*)(void*)> retained_module{nullptr, release_current_module};
+	std::uint32_t                    worker_exit_delay_for_testing = 0;
 	std::atomic<bool>                started{false};
 	std::atomic<bool>                finished{false};
 	std::atomic<uint64_t>            produced{0};
@@ -911,6 +913,12 @@ ProphecyEngine::ProphecyEngine() : m_impl(std::make_shared<Impl>()) { }
 
 ProphecyEngine::~ProphecyEngine() { stop(); }
 
+void ProphecyEngine::setWorkerExitDelayForTesting(std::uint32_t milliseconds)
+{
+	if (!m_impl->started.load(std::memory_order_acquire))
+		m_impl->worker_exit_delay_for_testing = milliseconds;
+}
+
 namespace {
 // The audio-config knobs the shipping GUI sets before booting korgprop. Without these,
 // the dsp-dynarec branch's bare default wires DSP2's input to a dsp3_so1_to_si0 feedback
@@ -961,8 +969,8 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 		m_impl->status.store(InstanceStatus::Unavailable, std::memory_order_release);
 		return false;
 	}
-	m_impl->retained_module = retain_current_module();
-	if (m_impl->retained_module == nullptr)
+	m_impl->retained_module.reset(retain_current_module());
+	if (!m_impl->retained_module)
 	{
 		std::fprintf(stderr, "Profligacy startup: could not retain engine module for bounded shutdown\n");
 		m_impl->finished.store(true, std::memory_order_release);
@@ -1009,32 +1017,48 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 	m_impl->status.store(InstanceStatus::Active, std::memory_order_release);
 	m_impl->playback_ready.store(!m_impl->host_timeline, std::memory_order_release);
 	auto impl = m_impl;
-	m_impl->thread = std::thread([impl, args]() {
+	try
+	{
+		m_impl->thread = std::thread([impl, args]() {
 #if defined(__APPLE__)
-		impl->applied_period = impl->host_timeline ? impl->worker_period.load() : 960;
-		configure_audio_producer_scheduling(impl->applied_period);
+			impl->applied_period = impl->host_timeline ? impl->worker_period.load() : 960;
+			configure_audio_producer_scheduling(impl->applied_period);
 #endif
-		std::vector<std::string> a = args; // start_frontend wants a non-const ref
+			std::vector<std::string> a = args; // start_frontend wants a non-const ref
 		#if defined(SDLMAME_WIN32)
-		windows_options options;
+			windows_options options;
 		#else
-		sdl_options options;
+			sdl_options options;
 		#endif
-		prophecy_osd osd(options, impl.get());
-		osd.register_options();
-		impl->exitCode = emulator_info::start_frontend(options, osd, a);
-		if (const char* delay = std::getenv("PROFLIGACY_TEST_SHUTDOWN_STALL_MS"))
-			std::this_thread::sleep_for(std::chrono::milliseconds(std::max(std::atoi(delay), 0)));
-		{
-			std::lock_guard lock(impl->output_mutex);
-			impl->finished.store(true);
-			impl->owns_singleton.store(false, std::memory_order_release);
-			impl->status.store(InstanceStatus::Stopped, std::memory_order_release);
-			g_engine_active.store(false, std::memory_order_release);
-		}
-		impl->output_ready.notify_all();
-		impl->ring.set_done();
-	});
+			prophecy_osd osd(options, impl.get());
+			osd.register_options();
+			impl->exitCode = emulator_info::start_frontend(options, osd, a);
+			if (impl->worker_exit_delay_for_testing != 0)
+				std::this_thread::sleep_for(
+					std::chrono::milliseconds(impl->worker_exit_delay_for_testing));
+			{
+				std::lock_guard lock(impl->output_mutex);
+				impl->finished.store(true);
+				impl->owns_singleton.store(false, std::memory_order_release);
+				impl->status.store(InstanceStatus::Stopped, std::memory_order_release);
+				g_engine_active.store(false, std::memory_order_release);
+			}
+			impl->output_ready.notify_all();
+			impl->ring.set_done();
+		});
+	}
+	catch (const std::exception& error)
+	{
+		std::fprintf(stderr, "Profligacy startup: could not create worker thread: %s\n", error.what());
+		m_impl->owns_singleton.store(false, std::memory_order_release);
+		m_impl->status.store(InstanceStatus::Stopped, std::memory_order_release);
+		m_impl->finished.store(true, std::memory_order_release);
+		g_engine_active.store(false, std::memory_order_release);
+		m_impl->retained_module.reset();
+		m_impl->output_ready.notify_all();
+		m_impl->ring.set_done();
+		return false;
+	}
 	return true;
 }
 
@@ -1075,8 +1099,7 @@ void ProphecyEngine::stop()
 	if (finished)
 	{
 		m_impl->thread.join();
-		release_current_module(m_impl->retained_module);
-		m_impl->retained_module = nullptr;
+		m_impl->retained_module.reset();
 		return;
 	}
 	// Do not repeat the old unsafe detach: retain the worker's Impl through its
@@ -1086,7 +1109,7 @@ void ProphecyEngine::stop()
 	// Deliberately leak the startup-time module reference. The shared worker capture
 	// retains Impl; clearing this field prevents any later owner from releasing the
 	// image while the detached worker might still be running.
-	m_impl->retained_module = nullptr;
+	(void) m_impl->retained_module.release();
 	m_impl->thread.detach();
 }
 

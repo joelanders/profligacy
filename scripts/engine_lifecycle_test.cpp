@@ -12,6 +12,15 @@ static void require(bool ok, const char* message)
 	if (!ok) { std::fprintf(stderr, "FAIL engine lifecycle: %s\n", message); std::exit(1); }
 }
 
+class ProphecyEngineLifecycleTestAccess
+{
+public:
+	static void setWorkerExitDelay(ProphecyEngine& engine, std::uint32_t milliseconds)
+	{
+		engine.setWorkerExitDelayForTesting(milliseconds);
+	}
+};
+
 template<class Predicate> static void until(Predicate predicate)
 {
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -89,13 +98,9 @@ int main()
 	// Force the final worker to retain ownership just beyond the shutdown deadline.
 	// stop() must return at the deadline without exposing the detached worker to
 	// freed state or unloadable code, and the worker must release the singleton later.
-#if defined(_WIN32)
-	_putenv_s("PROFLIGACY_TEST_SHUTDOWN_STALL_MS", "5000");
-#else
-	setenv("PROFLIGACY_TEST_SHUTDOWN_STALL_MS", "5000", 1);
-#endif
 	{
 		ProphecyEngine engine;
+		ProphecyEngineLifecycleTestAccess::setWorkerExitDelay(engine, 5000);
 		require(engine.enableHostTimeline(), "enable timeout timeline");
 		require(engine.start(args), "timeout machine could not claim the slot");
 		until([&] { return engine.waitingForInput(); });
@@ -107,10 +112,5 @@ int main()
 		require(!engine.finished() && engine.ownsMachineSlot(), "timeout path abandoned worker ownership");
 		until([&] { return engine.finished() && !engine.ownsMachineSlot(); });
 	}
-#if defined(_WIN32)
-	_putenv_s("PROFLIGACY_TEST_SHUTDOWN_STALL_MS", "");
-#else
-	unsetenv("PROFLIGACY_TEST_SHUTDOWN_STALL_MS");
-#endif
 	std::puts("PASS engine lifecycle bounded timeout");
 }

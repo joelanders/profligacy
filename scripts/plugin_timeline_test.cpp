@@ -25,6 +25,7 @@ struct Render
 	juce::AudioBuffer<float> audio;
 	int latency;
 	std::uint64_t missing;
+	std::uint64_t produced;
 };
 
 static Render render(double rate, bool variable, bool offline, bool mono, bool reprepare, bool lateBoot = false)
@@ -61,7 +62,8 @@ static Render render(double rate, bool variable, bool offline, bool mono, bool r
 		processor.releaseResources();
 		processor.prepareToPlay(rate, 512);
 	}
-	Render result{juce::AudioBuffer<float>(mono ? 1 : 2, (int) (rate * 2)), processor.getLatencySamples(), 0};
+	Render result{juce::AudioBuffer<float>(mono ? 1 : 2, (int) (rate * 2)),
+		processor.getLatencySamples(), 0, 0};
 	const auto initialMissing = processor.diagnosticSnapshot().audioUnderrunFrames;
 	result.audio.clear();
 	const int events[] = { 17, (int) (rate * 0.371), (int) (rate * 1.803) };
@@ -88,7 +90,9 @@ static Render render(double rate, bool variable, bool offline, bool mono, bool r
 		processor.processBlock(block, midi);
 		require(processor.getLatencySamples() == result.latency, "latency changed within prepare epoch");
 	}
-	result.missing = processor.diagnosticSnapshot().audioUnderrunFrames - initialMissing;
+	const auto final = processor.diagnosticSnapshot();
+	result.missing = final.audioUnderrunFrames - initialMissing;
+	result.produced = final.producedFrames;
 	return result;
 }
 
@@ -159,6 +163,32 @@ int main()
 			"processor destruction did not cancel background initialization");
 	}
 	environment("PROPHECY_FAKE_INITIALIZATION_MS", "0");
+	// The completed firmware state is project frame zero. Realtime callbacks that
+	// occur while ordinary startup is pending must therefore advance the later
+	// post-boot render horizon exactly as callbacks in an immediately-ready render do.
+	const auto startupProgress = [](bool delayed) {
+		environment("PROPHECY_FAKE_INITIALIZATION_MS", delayed ? "500" : "0");
+		ProphecyAudioProcessor processor;
+		processor.prepareToPlay(48000, 64);
+		juce::AudioBuffer<float> audio(2, 64);
+		juce::MidiBuffer midi;
+		if (delayed)
+		{
+			require(!processor.playbackReady(), "delayed epoch test initialized synchronously");
+			processor.processBlock(audio, midi);
+		}
+		for (int i = 0; !processor.playbackReady() && i < 1000; ++i)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		require(processor.playbackReady(), "epoch-policy initialization did not finish");
+		for (int i = delayed ? 1 : 0; i < 5; ++i)
+			processor.processBlock(audio, midi);
+		return processor.diagnosticSnapshot().producedFrames;
+	};
+	const auto immediateStartup = startupProgress(false);
+	const auto asynchronousStartup = startupProgress(true);
+	require(asynchronousStartup == immediateStartup,
+		"ordinary asynchronous startup did not preserve the project epoch");
+	environment("PROPHECY_FAKE_INITIALIZATION_MS", "0");
 
 	// A realtime callback larger than the host's declared maximum has no matching
 	// latency allowance. Reject it deterministically instead of emitting a partial,
@@ -193,6 +223,8 @@ int main()
 		const auto late = render(rate, true, true, false, false, true);
 		require(reference.missing == 0 && varied.missing == 0 && offline.missing == 0
 			&& prepared.missing == 0 && mono.missing == 0 && late.missing == 0, "processor requested audio beyond known input");
+		require(late.produced == reference.produced,
+			"late ROM selection did not start a fresh playback epoch");
 		require(reference.audio.getMagnitude(0, reference.audio.getNumSamples()) > 0.4f, "probe failed to emit audio");
 		for (int i = 0; i < reference.audio.getNumSamples(); ++i)
 		{
