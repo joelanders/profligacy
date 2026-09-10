@@ -34,7 +34,7 @@ static Render render(double rate, bool variable, bool offline, bool mono, bool r
 	ProphecyAudioProcessor processor;
 	processor.setNonRealtime(offline);
 	processor.prepareToPlay(reprepare ? 48000 : rate, 512);
-	for (int i = 0; !processor.playbackReady() && i < 1000; ++i)
+	for (int i = 0; !lateBoot && !processor.playbackReady() && i < 1000; ++i)
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	require(processor.playbackReady() || lateBoot, "asynchronous initialization did not finish");
 	juce::MidiBuffer midi;
