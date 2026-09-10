@@ -11,6 +11,10 @@ driven UI states. No DAW, no window server, no MAME boot needed.
   python3 scripts/editor_harness.py --states program,eg,lfoview --font-sizes 100,145
   python3 scripts/editor_harness.py --states program,big --sizes 740x360,1184x576,1560x900
   SYSRAM=/path/to/sysram python3 scripts/editor_harness.py
+  python3 scripts/editor_harness.py --interactive --out ./slider-preview
+
+--interactive writes a self-contained index.html that opens in the Mixer view,
+with editable mock program data and no firmware requirement or audio output.
 
 Each capture also audits visible deep-editor geometry and text scaling, and exits
 nonzero if a control escapes its row, grid items overlap, a non-scrollable row
@@ -35,12 +39,15 @@ LCD = {
 }
 
 SHIM = """<script>
-// headless test shim: emulates the JUCE WebView backend with real machine data
+// Browser test/preview shim: emulates the JUCE WebView backend with real machine data.
 const MOCK = __HARNESS_MOCK__;
+const INTERACTIVE_PREVIEW = __HARNESS_PREVIEW__;
 (function(){
+  const initialState=()=>new URLSearchParams(location.search).get("do") ||
+    (INTERACTIVE_PREVIEW ? "mixer" : null);
   // Set state flags SYNCHRONOUSLY (before the editor scripts run checkRom), so no-ROM /
   // no-names states are in effect for the editor's very first getRomStatus/getPatchNames.
-  const q0 = new URLSearchParams(location.search).get("do");
+  const q0 = initialState();
   try { localStorage.removeItem("prophecy.editor.appearance.v2"); } catch (_) {}
   if (q0 === "norom") MOCK.norom = true;
   if (q0 === "nonames") MOCK.nonames = true;
@@ -89,7 +96,15 @@ const MOCK = __HARNESS_MOCK__;
     },
   }};
   window.addEventListener("load", () => setTimeout(() => {
-    const q = new URLSearchParams(location.search).get("do");
+    const q = initialState();
+    if(INTERACTIVE_PREVIEW){
+      document.title="Profligacy — Slider Preview";
+      const notice=document.createElement("div");
+      notice.textContent="Slider preview · no audio";
+      notice.style.cssText="position:fixed;top:20px;left:18px;z-index:20;pointer-events:none;"+
+        "font:600 12px system-ui;color:#d1ffb8";
+      document.body.appendChild(notice);
+    }
     if (["program","oscillator","brass","reed","wave","amplifier","ampvelocity","eg","lfoview","lfotiming","name","mixer","big","bigwave","appearance"].includes(q))
       document.getElementById("chip_program")?.click();
     if (q === "arp" || q === "arpedit") document.getElementById("chip_arp")?.click();
@@ -128,8 +143,9 @@ const MOCK = __HARNESS_MOCK__;
       heading?.scrollIntoView({block:"center"});
     }, 400);
     if (q === "appearance") document.getElementById("editlooktoggle")?.click();
-    const requestedFont=Number(new URLSearchParams(location.search).get("font"));
-    if (Number.isFinite(requestedFont)) {
+    const fontParam=new URLSearchParams(location.search).get("font");
+    const requestedFont=fontParam===null ? (INTERACTIVE_PREVIEW ? 100 : null) : Number(fontParam);
+    if (requestedFont!==null && Number.isFinite(requestedFont)) {
       const f=document.getElementById("editfont");
       if(f){f.value=Math.max(50,Math.min(200,requestedFont));f.dispatchEvent(new Event("input",{bubbles:true}));}
     }
@@ -355,13 +371,13 @@ STATES = {"default": "", "norom": "?do=norom", "nonames": "?do=nonames", "matrix
           "browser": "?do=browser", "b52": "?do=b52"}
 
 
-def build_mock() -> dict:
+def build_mock(*, all_programs: bool = False) -> dict:
     data = SYSRAM.read_bytes()
     names, records = [], {}
     for i in range(128):
         rec = data[BASE + i * REC : BASE + (i + 1) * REC]
         names.append("".join(chr(b) if 32 <= b < 127 else " " for b in rec[:16]).rstrip())
-    for i in (0, 116):
+    for i in (range(128) if all_programs else (0, 116)):
         records[str(i)] = list(data[BASE + i * REC : BASE + (i + 1) * REC])
     arp = [0] * 128
     arp[17] = 2      # eighth-note step base
@@ -386,6 +402,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--states", default=",".join(STATES), help="comma list: " + " ".join(STATES))
     ap.add_argument("--out", type=pathlib.Path, default=REPO / "editor_shots")
+    ap.add_argument("--interactive", action="store_true",
+                    help="write a self-contained, interactive index.html with mock data; no Chrome capture")
     ap.add_argument("--sizes", default="900x560",
                     help="comma list of viewport sizes, e.g. 740x560,1184x576,1560x900")
     ap.add_argument("--font-sizes", default="100",
@@ -420,7 +438,7 @@ def main() -> int:
     if not SYSRAM.exists():
         print(f"error: sysram not found at {SYSRAM} (set SYSRAM=)", file=sys.stderr)
         return 1
-    if not pathlib.Path(CHROME).exists():
+    if not args.interactive and not pathlib.Path(CHROME).exists():
         print(f"error: Chrome not found at {CHROME} (set CHROME=)", file=sys.stderr)
         return 1
 
@@ -435,11 +453,16 @@ def main() -> int:
     if font.exists():
         html = html.replace("url('/assets/NotoSans-Bold.ttf')",
                             "url('data:font/ttf;base64," + base64.b64encode(font.read_bytes()).decode() + "')")
-    shim = SHIM.replace("__HARNESS_MOCK__", json.dumps(build_mock()))
+    shim = SHIM.replace("__HARNESS_MOCK__", json.dumps(build_mock(all_programs=args.interactive)))
+    shim = shim.replace("__HARNESS_PREVIEW__", json.dumps(args.interactive))
     harness = html.replace("<script>", shim + "<script>", 1)
     args.out.mkdir(parents=True, exist_ok=True)
-    hpath = args.out / "harness.html"
+    hpath = args.out / ("index.html" if args.interactive else "harness.html")
     hpath.write_text(harness)
+    if args.interactive:
+        print(f"Interactive slider preview: {hpath.resolve()}")
+        print("Open index.html in a browser. Mock program data; no firmware required, no audio output.")
+        return 0
     # Never attach headless runs to the user's live Chrome profile. Modern Chrome
     # aborts a second process before loading the page when the default profile is
     # already owned by the interactive browser.

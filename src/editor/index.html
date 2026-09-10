@@ -10,6 +10,7 @@
     /* Prophecy faceplate family: recessed greige plastics and the LCD phosphor. */
     --bg:#2e2e2b; --panel:#383b36; --panel2:#454941; --line:#70736b;
     --ink:#e2e7dd; --dim:#aeb5aa; --accent:#d1ffb8; --accent2:#e2a75f; --red:#e37b73;
+    --canvas-bg:#1F1F1F; --canvas-ink:#e2e7dd; --canvas-dim:#aeb5aa; --canvas-accent:#d1ffb8;
     --on-ink:#182014;
     --knob-a:#454941; --knob-b:#21211f;
     --editor-row:rgba(255,255,255,.05); --editor-row-hover:rgba(255,255,255,.09);
@@ -102,7 +103,7 @@
   .body::-webkit-scrollbar{width:8px}
   .body::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px}
 
-  /* Shared software-editor surface: neutral warm greige, never the old green-gray. */
+  /* Shared software-editor surfaces: greige panels on the hardware's dark gray canvas. */
   body.softwareview,#editview,#matrixview{
     --work-surface:#A1A396;
     --surface-base:var(--work-surface);
@@ -119,15 +120,16 @@
     --accent2:#80501d; --red:#842d26; --on-ink:#f5f2eb;
     --editor-row:transparent; --editor-row-hover:var(--surface-hover);
     --editor-cluster:var(--surface-inset);
-    background-color:var(--bg);
-    background-image:linear-gradient(145deg,rgba(255,255,245,.11),rgba(255,255,245,0) 45%,rgba(0,0,0,.075)),
-      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='128' height='128'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.78' numOctaves='2' seed='5369694' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.18'/%3E%3C/svg%3E");
-    background-size:100% 100%,128px 128px; background-blend-mode:normal,soft-light}
+    background:var(--canvas-bg)}
 
   /* EDIT view: curated performance controls plus the manifest-driven deep editor. */
   /* extra top padding keeps the fixed view chips clear of the header row */
   #editview{--editor-font-scale:1; color:var(--ink); padding-top:44px;
     font-size:calc(13px * var(--editor-font-scale))}
+  /* Labels directly on the canvas use light ink, independently of panel text. */
+  #editview .pname,#editview .deepcheck,#editview .deepcount,#editview .flowintro{color:var(--canvas-dim)}
+  #editview .patchno{color:var(--canvas-accent)}
+  #editview .flowintro strong{color:var(--canvas-ink)}
   .editmodes{position:relative; display:flex; gap:5px; align-items:center; margin-bottom:9px; padding-bottom:9px;
     border-bottom:1px solid var(--line)}
   .editmode{font:600 12px/1 var(--mono); color:var(--dim); padding:7px 10px;
@@ -236,7 +238,47 @@
   .deepmeta .warn{color:var(--accent2)}
   .deepctl{display:grid; grid-template-columns:1fr 55px; align-items:center; gap:6px; min-width:0}
   .deepctl.only{display:block}
-  .deepctl input[type=range]{width:100%; max-width:100%; min-width:70px; accent-color:var(--accent)}
+  .deepslider{--slider-thumb:10px; --slider-gutter:1px; position:relative;
+    width:100%; min-width:70px; height:24px}
+  .deepslider-slot{position:absolute; inset:3px 0; border:1px solid var(--surface-edge); border-radius:0;
+    background:color-mix(in srgb,var(--surface-base) 78%,#000);
+    box-shadow:inset 0 1px 3px rgba(0,0,0,.23),0 1px rgba(255,255,255,.24)}
+  /* Match the fill endpoints to the native thumb's center at either end of its travel. */
+  .deepslider-meter{position:absolute; inset:4px calc(var(--slider-gutter) + var(--slider-thumb)/2);
+    pointer-events:none}
+  .deepslider-fill{position:absolute; top:0; bottom:0; left:var(--slider-fill-start);
+    width:var(--slider-fill-size); background:var(--accent);
+    box-shadow:inset 0 1px rgba(255,255,255,.14)}
+  .deepslider.fromminimum .deepslider-fill{left:calc(var(--slider-fill-start) - var(--slider-thumb)/2);
+    width:calc(var(--slider-fill-size) + var(--slider-thumb)/2)}
+  .deepslider-origin{display:none; position:absolute; top:0; bottom:0;
+    left:var(--slider-origin); width:1px; transform:translateX(-.5px); background:var(--line)}
+  .deepslider.hasorigin .deepslider-origin{display:block}
+  .deepctl .deepslider input[type=range]{-webkit-appearance:none; appearance:none;
+    position:absolute; top:0; left:var(--slider-gutter); width:calc(100% - 2*var(--slider-gutter));
+    min-width:0; height:24px; margin:0; padding:0; border:0; border-radius:0;
+    background:transparent; cursor:ew-resize}
+  .deepslider input::-webkit-slider-runnable-track{height:16px; background:transparent; border:0}
+  .deepslider input::-moz-range-track{height:16px; background:transparent; border:0}
+  .deepslider input::-moz-range-progress{background:transparent}
+  .deepslider input::-webkit-slider-thumb{-webkit-appearance:none; appearance:none;
+    width:var(--slider-thumb); height:16px; margin-top:0; box-sizing:border-box;
+    border:1px solid var(--accent); border-radius:0;
+    background:linear-gradient(to right,rgba(255,255,255,.20),transparent 55%),
+      color-mix(in srgb,var(--accent) 60%,#fff);
+    box-shadow:0 1px 2px rgba(0,0,0,.24),inset 0 1px rgba(255,255,255,.25)}
+  .deepslider input::-moz-range-thumb{width:var(--slider-thumb); height:16px; box-sizing:border-box;
+    border:1px solid var(--accent); border-radius:0;
+    background:linear-gradient(to right,rgba(255,255,255,.20),transparent 55%),
+      color-mix(in srgb,var(--accent) 60%,#fff);
+    box-shadow:0 1px 2px rgba(0,0,0,.24),inset 0 1px rgba(255,255,255,.25)}
+  .deepslider:hover .deepslider-slot{border-color:var(--accent)}
+  .deepslider input:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+  .deepslider.unavailable{opacity:.45}
+  .deepctl .deepslider input:disabled{opacity:1; cursor:default}
+  .deepslider.unavailable .deepslider-meter{visibility:hidden}
+  .deepslider.unavailable input::-webkit-slider-thumb{visibility:hidden}
+  .deepslider.unavailable input::-moz-range-thumb{visibility:hidden}
   .deepctl input[type=number],.deepctl input[type=text],.deepctl select{width:100%; min-width:0;
     border:1px solid var(--line); border-radius:4px; background-color:var(--surface-control); color:var(--ink);
     padding:4px 5px; font:10px var(--mono)}
@@ -294,7 +336,6 @@
   .flowdiagram .feedback.self{stroke-width:1.6}
   .flowdiagram .feedback.cross{stroke-width:1.5}
   .flowdiagram .feedback.return{stroke-width:2.2}
-  .flowdiagram .feedbacktap{fill:var(--surface-base); stroke:var(--accent); stroke-width:2}
   .flowdiagram .modrail,.flowdiagram .modtap{fill:none; stroke:var(--dim); stroke-width:2;
     stroke-linecap:round; stroke-linejoin:round; opacity:.55; transition:stroke .15s,opacity .15s}
   .flowdiagram.mod-active .modrail,.flowdiagram.mod-active .modtap{stroke:var(--accent); opacity:1}
@@ -455,7 +496,7 @@
   /* hardware-faithful faceplate geometry and controls (canvas) */
   @font-face{font-family:'NotoSansBold'; src:url('/assets/NotoSans-Bold.ttf') format('truetype');
     font-weight:700; font-display:block}
-  #panelview{position:fixed; inset:0; background:#1F1F1F}
+  #panelview{position:fixed; inset:0; background:var(--canvas-bg)}
   #panelview canvas{width:100%; height:100%; display:block; touch-action:none}
   .viewchips{position:fixed; top:6px; right:10px; z-index:30; display:flex; gap:4px; padding:3px;
     border:1px solid #4D4F47; border-radius:5px; background:rgba(31,31,31,.84);
@@ -498,19 +539,20 @@
   .layoutlab.minimal .llreadout{display:none}
 
   /* mod matrix view */
-  #matrixview{position:fixed; inset:0; background:var(--bg); display:flex; flex-direction:column;
+  #matrixview{position:fixed; inset:0; display:flex; flex-direction:column;
     padding:40px 16px 12px}
   #matrixview[hidden]{display:none}
   .mmhead{display:flex; align-items:center; gap:14px; padding:2px 4px 10px}
-  .mmtitle{font:12px var(--mono); letter-spacing:.16em; color:var(--ink)}
-  .mmhint{font-size:11px; color:var(--dim); flex:1}
+  .mmtitle{font:12px var(--mono); letter-spacing:.16em; color:var(--canvas-ink)}
+  .mmhint{font-size:11px; color:var(--canvas-dim); flex:1}
   .mmsync{font:600 10px var(--mono); padding:6px 10px; border-radius:4px;
     border:1px solid var(--line); color:var(--ink); background:var(--surface-control); cursor:pointer}
   .mmsync:hover{background:var(--panel2)}
-  .mmstatus{font:10px var(--mono); color:var(--dim)}
+  .mmstatus{font:10px var(--mono); color:var(--canvas-dim)}
   .mmworkspace{display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:10px;
     flex:1; min-height:0}
-  .mmscroll{overflow:auto; border:1px solid var(--line); border-radius:8px}
+  .mmscroll{overflow:auto; border:1px solid var(--line); border-radius:8px;
+    background:var(--surface-base); color:var(--ink)}
   .mmworkspace>.mmscroll{min-height:0}
   .mmtab{border-collapse:separate; border-spacing:0; font-size:11px; min-width:100%}
   .mmtab th{position:sticky; top:0; background:var(--panel2); color:var(--ink);
@@ -577,10 +619,10 @@
   .mmiadd button:disabled{border-color:var(--line); background:var(--panel); color:var(--dim); cursor:default}
   .mminote{grid-column:1/-1; color:var(--dim); font:9px/1.35 var(--mono)}
   .fxhead{display:flex; align-items:center; gap:8px; padding:12px 4px 8px;
-    font:11px var(--mono); letter-spacing:.1em; color:var(--ink); cursor:pointer}
+    font:11px var(--mono); letter-spacing:.1em; color:var(--canvas-ink); cursor:pointer}
   .fxcaret{display:inline-block; transition:transform .12s}
   .fxcaret.open{transform:rotate(90deg)}
-  .fxsub{font-family:var(--sans, inherit); letter-spacing:0; color:var(--dim); font-size:11px}
+  .fxsub{font-family:var(--sans, inherit); letter-spacing:0; color:var(--canvas-dim); font-size:11px}
   .fxwrap{max-height:38vh}
   .fxwrap[hidden]{display:none}
   .fxtab td:first-child{min-width:270px}
@@ -1407,6 +1449,33 @@
     if(redrawViz) redrawViz();
     if(deepMode==="changes") setTimeout(renderDeep,0);
   }
+  function deepSliderOrigin(row){
+    // Display origins are separate from firmware-init/reset values (e.g. pitch bend +/-2).
+    if(row.kind==="program" && row.group===1 && row.param===382) return 64;
+    return row.value_type==="bipolar" && row.min<=0 && row.max>=0 ? 0 : row.min;
+  }
+  function makeDeepSlider(row,range){
+    const element=document.createElement("div"); element.className="deepslider";
+    const origin=Math.max(row.min,Math.min(row.max,deepSliderOrigin(row)));
+    const percent=value=>100*(Math.max(row.min,Math.min(row.max,value))-row.min)/(row.max-row.min||1);
+    const originPercent=percent(origin);
+    element.classList.toggle("hasorigin",origin>row.min && origin<row.max);
+    element.classList.toggle("fromminimum",origin===row.min);
+    element.style.setProperty("--slider-origin",originPercent+"%");
+    element.innerHTML='<div class="deepslider-slot" aria-hidden="true"></div>'+
+      '<div class="deepslider-meter" aria-hidden="true"><div class="deepslider-fill"></div>'+
+      '<div class="deepslider-origin"></div></div>';
+    range.setAttribute("aria-label",row.name);
+    element.appendChild(range);
+    const update=()=>{
+      const currentPercent=percent(Number(range.value));
+      element.style.setProperty("--slider-fill-start",Math.min(originPercent,currentPercent)+"%");
+      element.style.setProperty("--slider-fill-size",Math.abs(currentPercent-originPercent)+"%");
+      element.classList.toggle("unavailable",range.disabled);
+    };
+    update();
+    return {element,update};
+  }
   function makeDeepRow(row, slot, model, displayName){
     const activeOsc=row.section!=="OSC-Specific Blocks" ||
       (!!slot && OSC_SETS[currentOscSet()][slot-1]===model);
@@ -1474,6 +1543,8 @@
       number.min=row.min; number.max=row.max; number.step=1;
       if (value==null){ range.disabled=true; range.value=row.min; number.placeholder=row.min+"…"+row.max; }
       else { range.value=value; number.value=value; }
+      const slider=makeDeepSlider(row,range);
+      number.setAttribute("aria-label",row.name+" value");
       // The hardware control path is a 31.25-kbaud MIDI UART, so browser-frame-rate
       // parameter traffic is both wasteful and unlike the real editor. Send the first
       // movement immediately, then at most every 100 ms while dragging, and always flush
@@ -1494,7 +1565,7 @@
         if(liveWriteTimer){clearTimeout(liveWriteTimer);liveWriteTimer=0;}
         writeRangeValue();
       };
-      range.oninput=()=>{ number.value=range.value;
+      range.oninput=()=>{ number.value=range.value; slider.update();
         const redrawViz=vizRegistry.get(row.subsection);   // live EG/LFO preview while dragging
         if(redrawViz){ deepValues.set(deepKey(row,slot),Number(range.value)); redrawViz(); }
         scheduleLiveWrite(); };
@@ -1508,9 +1579,9 @@
       number.onchange=()=>{
         if(number.value==="") return;
         const v=Math.max(row.min,Math.min(row.max,Number(number.value)));
-        range.disabled=false; range.value=v; number.value=v; commitDeep(row,v,slot);
+        range.disabled=false; range.value=v; number.value=v; slider.update(); commitDeep(row,v,slot);
       };
-      ctl.append(range,number);
+      ctl.append(slider.element,number);
     }
     el.appendChild(ctl);
     return el;
@@ -2104,7 +2175,6 @@
         <path class="audio" d="M855 280H880"/><path class="audio" d="M1180 280H1220"/>
         <!-- The manual's MIX-9/10 descriptions specify feedback from the amp section:
              this tap is therefore after Amplifier and before Effects. -->
-        <circle class="feedbacktap" cx="868" cy="280" r="4"/>
         <path class="feedback return postamp" d="M868 280 V445 H460 V385"/>
       </svg>`;
     programFlow.querySelectorAll(".flowblock").forEach(block=>{
