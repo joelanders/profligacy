@@ -17,12 +17,13 @@
   ],
   "dependencies": {
     "extern/JUCE": "2cdfca8feb300fb424002ba2c2751569e5bacb64",
-    "extern/mame": "f558ea734930284de1e1326cb0033ce16832940c"
+    "extern/mame": "eb19791d0286f5de5492ac0303b776af475e2e29"
   },
   "dependency_trees": {
-    "extern/mame": "074790ea0648e0f50527c7c621b37a9fd55e77f9"
+    "extern/mame": "cd0c0d5b7bf7f14decec74dc45caaf1b517fc6b9"
   },
   "mandatory_ctests": [
+    "audio_timeline",
     "alpha_release_policy",
     "correctness_checkpoint",
     "multi_instance_contract",
