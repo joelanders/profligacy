@@ -26,6 +26,7 @@ class ProphecyAudioProcessor : public juce::AudioProcessor
 {
 public:
 	static constexpr int kPerformanceParameterCount = 11;
+	static constexpr int kProgramCount = 128;
 
 	ProphecyAudioProcessor();
 	~ProphecyAudioProcessor() override;
@@ -76,6 +77,9 @@ public:
 		std::uint64_t oversizedBlocks = 0;
 		std::uint64_t editorPatchIntents = 0;
 		std::uint64_t editorPatchSends = 0;
+		std::uint64_t hostProgramIntents = 0;
+		std::uint64_t hostProgramSends = 0;
+		int currentProgram = 0;
 		std::uint64_t editorDumpRequests = 0;
 		std::uint64_t editorDumpSends = 0;
 		std::uint64_t editorCommandsSent = 0;
@@ -95,10 +99,11 @@ public:
 	bool isMidiEffect() const override { return false; }
 	double getTailLengthSeconds() const override { return 0.0; }
 
-	int getNumPrograms() override { return 1; }
-	int getCurrentProgram() override { return 0; }
-	void setCurrentProgram(int) override {}
-	const juce::String getProgramName(int) override { return "Default"; }
+	int getNumPrograms() override { return kProgramCount; }
+	int getCurrentProgram() override
+	{ return m_currentProgram.load(std::memory_order_acquire); }
+	void setCurrentProgram(int) override;
+	const juce::String getProgramName(int) override;
 	void changeProgramName(int, const juce::String &) override {}
 
 	void getStateInformation(juce::MemoryBlock &) override;
@@ -118,6 +123,8 @@ public:
 	bool setRomDirFromUser(const juce::File &dir); // validate + persist + boot; false if invalid
 	bool maybeBootEngine();                        // boot once iff a valid ROM set is locatable
 	void selectPatch(int program);       // bank-select + program change (0..127 = A00..B63)
+	std::uint64_t currentProgramVersion() const
+	{ return m_currentProgramVersion.load(std::memory_order_acquire); }
 	// Raw MIDI from the editor (faceplate keybed note on/off etc.) into the emulated UART.
 	void sendMidi(const std::uint8_t *bytes, std::size_t n);
 	// Faceplate front-panel controls, through the engine's host seams (drained on the
@@ -395,6 +402,10 @@ private:
 	// control link. Hold editor commands and dump requests for a bounded interval after
 	// editor or DAW Program Change, but never discard the host's MIDI stream.
 	void holdEditorCommandsForPatchLoad(double seconds);
+	void publishCurrentProgram(int program, bool notifyHost);
+	bool collectHostBankSelect(const juce::MidiBuffer &midi);
+	void dispatchPendingProgram(std::uint64_t eventFrame, std::uint64_t hostFrame,
+		bool rawProgramChangeInBlock);
 	bool patchLoadBarrierActive() const
 	{
 		return m_audioHostFrames.load(std::memory_order_relaxed)
@@ -402,28 +413,6 @@ private:
 	}
 	static constexpr double kPatchLoadSettleSeconds = 2.0;
 	static constexpr double kPatchSelectMinIntervalMs = 2500.0;
-	bool sendPatchNow(int program);
-	class PatchSelectDelay : private juce::Timer
-	{
-	public:
-		explicit PatchSelectDelay(ProphecyAudioProcessor &p) : m_proc(p) {}
-		~PatchSelectDelay() override { stopTimer(); }
-		bool pending() const { return isTimerRunning(); }
-		void schedule(int program)
-		{
-			m_program = program;
-			startTimer(500);
-		}
-	private:
-		void timerCallback() override
-		{
-			stopTimer();
-			if (!m_proc.sendPatchNow(m_program)) startTimer(25);
-		}
-		ProphecyAudioProcessor &m_proc;
-		int m_program = 0;
-	};
-	PatchSelectDelay   m_patchSelectDelay { *this };
 
 	// Current-program dumps share the firmware MIDI task with Program Change. Keep one
 	// editor request in flight, wait for a recently selected patch to finish loading,
@@ -519,7 +508,30 @@ private:
 	};
 	ProgramDumpSync    m_programDumpSync { *this };
 	bool sendProgramDumpNow();
-	double             m_lastPatchSendMs = -1.0e9;
+	// JUCE exposes AudioProcessor's program list as the VST3 kIsProgramChange
+	// parameter. Hosts may call setCurrentProgram from their controller thread, so
+	// host automation and editor clicks publish tagged atomic intents. processBlock
+	// resolves a same-clip Bank/Sub-Bank pair, debounces/coalesces requests from both
+	// sources, and schedules every generated bank/program transaction through one
+	// firmware-safe gate on the existing host-timed MIDI queue.
+	static constexpr std::uint64_t kNoPendingProgram = ~std::uint64_t{0};
+	static constexpr std::uint64_t kEditorProgramBit = std::uint64_t{1} << 8;
+	std::atomic<int> m_currentProgram { 0 };
+	std::atomic<std::uint64_t> m_currentProgramVersion { 1 };
+	std::atomic<std::uint64_t> m_stateRestoreEpoch { 0 };
+	std::atomic<std::uint64_t> m_pendingProgram { kNoPendingProgram };
+	std::atomic<bool> m_deferredProgramPending { false };
+	std::atomic<bool> m_cancelDeferredProgram { false };
+	int m_deferredProgram = -1; // audio thread only
+	bool m_deferredProgramFromEditor = false; // audio thread only
+	std::uint64_t m_deferredProgramEarliestFrame = 0; // audio thread only
+	std::atomic<std::uint64_t> m_nextGeneratedProgramFrame { 0 }; // cumulative host-frame clock
+	std::array<std::uint8_t, 16> m_hostBankMsb {};
+	std::array<std::uint8_t, 16> m_hostBankLsb {};
+	std::array<std::uint64_t, 16> m_hostBankGeneration {};
+	std::array<std::uint64_t, 16> m_consumedHostBankGeneration {};
+	std::atomic<std::uint64_t> m_hostProgramIntents { 0 };
+	std::atomic<std::uint64_t> m_hostProgramSends { 0 };
 
 	// CC->ADIN remap table (target per CC number; 0 = Off = pass through raw). Written on
 	// the message thread, read on the audio thread. m_padXHeld/m_padYHeld gate ADIN14

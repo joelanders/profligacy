@@ -66,6 +66,16 @@ static int activeAudioTest()
 {
 	juce::ScopedJuceInitialiser_GUI juceInitialiser;
 	ProphecyAudioProcessor processor;
+	if (processor.getNumPrograms() != ProphecyAudioProcessor::kProgramCount
+			|| processor.getCurrentProgram() != 0
+			|| processor.getProgramName(0) != "A00"
+			|| processor.getProgramName(63) != "A63"
+			|| processor.getProgramName(64) != "B00"
+			|| processor.getProgramName(127) != "B63")
+	{
+		std::fprintf(stderr, "host program-list identity failed\n");
+		return 1;
+	}
 	processor.setCcMap(1, (int) ProphecyAudioProcessor::CcTarget::Wheel1);
 	juce::MidiBuffer empty, midi;
 	midi.ensureSize(4096);
@@ -183,38 +193,49 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	// PRP3 round-trips all host controls. PRP1, PRP2 and bare SysEx retain their old layouts
-	// and supply exact hardware defaults for values those formats did not store.
+	// PRP4 round-trips all host controls plus the selected program. PRP1/2/3 and bare
+	// SysEx retain their old layouts and defaults without scheduling a factory-program
+	// load that could overwrite their authoritative edit-buffer dump.
 	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
 	{
 		auto *ranged = dynamic_cast<juce::RangedAudioParameter *>(parameters[i]);
 		ranged->setValue(ranged->getNormalisableRange().convertTo0to1((float)(i * 19 + 7)));
 	}
 	processor.setCcMap(74, (int)ProphecyAudioProcessor::CcTarget::PadX);
+	processor.selectPatch(116);
 	juce::MemoryBlock state;
 	processor.getStateInformation(state);
-	if (state.getSize() < 5 || std::memcmp(state.getData(), "PRP3", 4) != 0)
+	if (state.getSize() < 5 || std::memcmp(state.getData(), "PRP4", 4) != 0)
 	{
-		std::fprintf(stderr, "state writer did not emit PRP3\n");
+		std::fprintf(stderr, "state writer did not emit PRP4\n");
 		return 1;
 	}
 	ProphecyAudioProcessor restored;
+	// A host is allowed to publish its default program before component state.
+	// The state load must cancel that stale intent and restore the saved selection.
+	restored.setCurrentProgram(17);
 	restored.setStateInformation(state.getData(), (int)state.getSize());
-	if (restored.ccMapTarget(74) != (int)ProphecyAudioProcessor::CcTarget::PadX)
+	if (restored.ccMapTarget(74) != (int)ProphecyAudioProcessor::CcTarget::PadX
+			|| restored.getCurrentProgram() != 116)
 	{
-		std::fprintf(stderr, "PRP3 CC mapping did not round-trip\n");
+		std::fprintf(stderr, "PRP4 CC mapping/program did not round-trip\n");
 		return 1;
 	}
 	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
 		if (dynamic_cast<juce::AudioParameterInt *>(restored.getParameters()[i])->get() != i * 19 + 7)
 		{
-			std::fprintf(stderr, "PRP3 parameter %d did not round-trip\n", i);
+			std::fprintf(stderr, "PRP4 parameter %d did not round-trip\n", i);
 			return 1;
 		}
 	juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Standalone);
 	ProphecyAudioProcessor standaloneRestore;
 	juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Undefined);
 	standaloneRestore.setStateInformation(state.getData(), (int)state.getSize());
+	if (standaloneRestore.getCurrentProgram() != 0)
+	{
+		std::fprintf(stderr, "standalone incorrectly restored DAW program selection\n");
+		return 1;
+	}
 	for (int i = 0; i < ProphecyAudioProcessor::kPerformanceParameterCount; ++i)
 	{
 		const int expected = i == 7 ? 7 * 19 + 7 : expectedDefaults[(std::size_t)i];
@@ -234,6 +255,13 @@ int main(int argc, char** argv)
 			std::fprintf(stderr, "PRP2 migration failed at parameter %d\n", i);
 			return 1;
 		}
+	}
+	const std::uint8_t prp3State[] = {'P','R','P','3',0,0};
+	restored.setStateInformation(prp3State, (int)sizeof(prp3State));
+	if (restored.getCurrentProgram() != 116)
+	{
+		std::fprintf(stderr, "PRP3 migration changed the selected program\n");
+		return 1;
 	}
 	const std::uint8_t prp1State[] = {'P','R','P','1',0};
 	restored.setStateInformation(prp1State, (int)sizeof(prp1State));

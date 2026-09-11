@@ -2683,6 +2683,22 @@
     highlightBrowser();
     clearTimeout(syncTimer);
     syncTimer = setTimeout(syncPatch, 350); }  // C++ defers/retries until the settled patch is readable
+
+  // AU MIDI Program Change and the VST3 host-program parameter bypass setPatch().
+  // Follow the processor's accepted/intended program without echoing another change
+  // back to the firmware, then use the normal delayed dump path to refresh the editor.
+  let patchStateVersion = 0;
+  pollNativeLatest('getCurrentPatch',100,r => {
+    if(!r)return;
+    const version=Number(r.version)||0, next=Number(r.program);
+    if(!version || version===patchStateVersion || next<0 || next>=128)return;
+    patchStateVersion=version;
+    if(next===patch)return;
+    patch=next;
+    document.getElementById("pno").textContent=bankName(patch);
+    updatePatchName();highlightBrowser();
+    clearTimeout(syncTimer);syncTimer=setTimeout(syncPatch,350);
+  });
   document.getElementById("prev").onclick = () => setPatch(patch-1);
   document.getElementById("next").onclick = () => setPatch(patch+1);
 
@@ -3330,6 +3346,10 @@
          controllers && ('values=' + controllers.values.length));
       const names = await nativeAsync('getPatchNames');
       ok('getPatchNames 128', Array.isArray(names) && names.length === 128, names && names[0]);
+      const currentPatch = await nativeAsync('getCurrentPatch');
+      ok('getCurrentPatch tracked', currentPatch && currentPatch.program>=0
+         && currentPatch.program<128 && Number(currentPatch.version)>0,
+         currentPatch && JSON.stringify(currentPatch));
       native('requestDump');
       const dump = await until(async () => { const r = await nativeAsync('getProgramData'); return r && (r.version|0) > 0 && r.bytes.length >= 535 ? r : null; }, 30, 400);
       ok('program dump 535B', !!dump, dump && ('n=' + dump.bytes.length));
