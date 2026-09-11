@@ -26,6 +26,8 @@ struct Options
 	double seconds = 18.0;
 	double editorTimeoutSeconds = 15.0;
 	int blockSize = 256;
+	int expectProgramCount = -1;
+	int selectProgram = -1;
 	bool requireAudio = false;
 	bool requireEditor = false;
 	bool realtime = false;
@@ -45,6 +47,8 @@ bool parseOptions(int argc, char **argv, Options &o)
 		else if (arg == "--block" && i + 1 < argc) o.blockSize = std::atoi(argv[++i]);
 		else if (arg == "--seconds" && i + 1 < argc) o.seconds = std::atof(argv[++i]);
 		else if (arg == "--editor-timeout" && i + 1 < argc) o.editorTimeoutSeconds = std::atof(argv[++i]);
+		else if (arg == "--expect-program-count" && i + 1 < argc) o.expectProgramCount = std::atoi(argv[++i]);
+		else if (arg == "--select-program" && i + 1 < argc) o.selectProgram = std::atoi(argv[++i]);
 		else if (arg == "--require-audio") o.requireAudio = true;
 		else if (arg == "--require-editor") o.requireEditor = true;
 		else if (arg == "--realtime") o.realtime = true;
@@ -52,7 +56,8 @@ bool parseOptions(int argc, char **argv, Options &o)
 	}
 	return o.plugin.isNotEmpty() && o.receipt.isNotEmpty() && o.wav.isNotEmpty()
 		&& o.sampleRate >= 8000.0 && o.blockSize > 0 && o.seconds >= 1.0
-		&& o.editorTimeoutSeconds >= 1.0;
+		&& o.editorTimeoutSeconds >= 1.0 && o.expectProgramCount >= -1
+		&& o.selectProgram >= -1;
 }
 
 int fail(const juce::String &message)
@@ -74,6 +79,20 @@ juce::MemoryBlock unwrapVst3ComponentState(const juce::MemoryBlock &hostState)
 		}
 	}
 	return hostState;
+}
+
+int readPrp4SelectedProgram(const juce::MemoryBlock &state)
+{
+	const auto *bytes = static_cast<const std::uint8_t *>(state.getData());
+	const auto size = state.getSize();
+	if (size < 6 || std::memcmp(bytes, "PRP4", 4) != 0)
+		return -1;
+
+	std::size_t position = 5 + (std::size_t)bytes[4] * 2;
+	if (position >= size)
+		return -1;
+	position += 1 + (std::size_t)bytes[position];
+	return position < size ? (int)bytes[position] : -1;
 }
 
 class EditorReadinessWaiter final : private juce::Timer
@@ -119,7 +138,8 @@ int main(int argc, char **argv)
 		return fail("usage: --plugin PATH --receipt FILE --wav FILE [--rate HZ] "
 			"[--block N] [--seconds N] [--require-audio] [--require-editor] "
 			"[--editor-timeout N] [--realtime] "
-			"[--expect-state-marker TEXT] [--state-out FILE]");
+			"[--expect-state-marker TEXT] [--state-out FILE] "
+			"[--expect-program-count N] [--select-program N]");
 	const juce::File editorReadyMarker(options.receipt + ".editor-ready");
 	if (options.requireEditor)
 	{
@@ -164,6 +184,15 @@ int main(int argc, char **argv)
 			+ " outputs=" + juce::String(outputChannels));
 	if (!instance->acceptsMidi())
 		return fail("plug-in instance does not accept MIDI");
+	const int programCount = instance->getNumPrograms();
+	const bool programCountOk = options.expectProgramCount < 0
+		|| programCount == options.expectProgramCount;
+	if (!programCountOk)
+		return fail("expected " + juce::String(options.expectProgramCount)
+			+ " programs, found " + juce::String(programCount));
+	if (options.selectProgram >= programCount)
+		return fail("requested program " + juce::String(options.selectProgram)
+			+ " is outside the advertised range");
 
 	bool editorReady = false;
 	if (options.requireEditor)
@@ -199,6 +228,8 @@ int main(int argc, char **argv)
 
 	instance->setPlayConfigDetails(0, 2, options.sampleRate, options.blockSize);
 	instance->prepareToPlay(options.sampleRate, options.blockSize);
+	if (options.selectProgram >= 0)
+		instance->setCurrentProgram(options.selectProgram);
 
 	juce::File wavFile(options.wav);
 	wavFile.deleteFile();
@@ -266,6 +297,9 @@ int main(int argc, char **argv)
 		&& !juce::File(options.stateOut).replaceWithData(finalState.getData(), finalState.getSize()))
 		return fail("could not write final state capture");
 	const auto componentState = unwrapVst3ComponentState(finalState);
+	const int observedProgram = readPrp4SelectedProgram(componentState);
+	const bool programSelectionOk = options.selectProgram < 0
+		|| observedProgram == options.selectProgram;
 	const std::string finalStateBytes(
 		static_cast<const char *>(componentState.getData()), componentState.getSize());
 	std::string observedStateMarker;
@@ -303,6 +337,7 @@ int main(int argc, char **argv)
 	juce::DynamicObject::Ptr receiptObject = new juce::DynamicObject();
 	receiptObject->setProperty("schema", "profligacy-artifact-host-v1");
 	receiptObject->setProperty("success", identityOk && audioOk && stateMarkerOk
+		&& programCountOk && programSelectionOk
 		&& (!options.requireEditor || editorReady));
 	receiptObject->setProperty("plugin_path", options.plugin);
 	receiptObject->setProperty("name", description.name);
@@ -316,6 +351,12 @@ int main(int argc, char **argv)
 	receiptObject->setProperty("state_bytes", (juce::int64)state.getSize());
 	receiptObject->setProperty("parameter_count", automatableParameterCount);
 	receiptObject->setProperty("parameters", std::move(parameterInventory));
+	receiptObject->setProperty("program_count", programCount);
+	receiptObject->setProperty("expected_program_count", options.expectProgramCount);
+	receiptObject->setProperty("program_count_ok", programCountOk);
+	receiptObject->setProperty("selected_program", options.selectProgram);
+	receiptObject->setProperty("observed_component_program", observedProgram);
+	receiptObject->setProperty("program_selection_ok", programSelectionOk);
 	receiptObject->setProperty("sample_rate", options.sampleRate);
 	receiptObject->setProperty("block_size", options.blockSize);
 	receiptObject->setProperty("duration_seconds", options.seconds);
@@ -344,6 +385,9 @@ int main(int argc, char **argv)
 	if (!stateMarkerOk)
 		std::fprintf(stderr, "artifact host: expected state marker '%s' was absent\n",
 			options.expectStateMarker.toRawUTF8());
-	return identityOk && audioOk && stateMarkerOk
+	if (!programSelectionOk)
+		std::fprintf(stderr, "artifact host: selected program %d, component state reported %d\n",
+			options.selectProgram, observedProgram);
+	return identityOk && audioOk && stateMarkerOk && programCountOk && programSelectionOk
 		&& (!options.requireEditor || editorReady) ? 0 : 1;
 }

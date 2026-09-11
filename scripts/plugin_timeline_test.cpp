@@ -213,6 +213,137 @@ int main()
 		require(processor.diagnosticSnapshot().hostMidiEventsForwarded == forwarded,
 			"MIDI from a rejected realtime block was delivered");
 	}
+	// VST3 exposes clip Program Change as its kIsProgramChange parameter while
+	// Ableton sends Bank/Sub-Bank as ordinary CC0/CC32. Resolve the same-block pair
+	// to the flat A00..B63 program list, rate-limit firmware loads, and retain only
+	// the latest request without allocating or disturbing real MIDI Program Change.
+	{
+		ProphecyAudioProcessor processor;
+		require(processor.getNumPrograms() == 128
+			&& processor.getProgramName(0) == "A00"
+			&& processor.getProgramName(116) == "B52",
+			"host program list is not A00..B63");
+		processor.prepareToPlay(48000, 512);
+		for (int i = 0; !processor.playbackReady() && i < 1000; ++i)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		require(processor.playbackReady(), "program-change processor did not initialize");
+		juce::AudioBuffer<float> audio(2, 512);
+		juce::MidiBuffer midi;
+		processor.setCurrentProgram(52);
+		processor.processBlock(audio, midi);
+		for (int i = 0; i < 240; ++i)
+			processor.processBlock(audio, midi);
+		midi.addEvent(juce::MidiMessage::controllerEvent(1, 0, 0), 0);
+		midi.addEvent(juce::MidiMessage::controllerEvent(1, 32, 1), 0);
+		processor.setCurrentProgram(52);
+		processor.processBlock(audio, midi);
+		auto diagnostic = processor.diagnosticSnapshot();
+		require(diagnostic.currentProgram == 116 && diagnostic.hostProgramSends == 2,
+			"same-number A52 to B52 Program Change was suppressed");
+
+		midi.clear();
+		for (int i = 0; i < 240; ++i)
+			processor.processBlock(audio, midi);
+		midi.addEvent(juce::MidiMessage::controllerEvent(1, 0, 0), 0);
+		midi.addEvent(juce::MidiMessage::controllerEvent(1, 32, 1), 0);
+		processor.setCurrentProgram(52);
+		processor.processBlock(audio, midi);
+		diagnostic = processor.diagnosticSnapshot();
+		require(diagnostic.currentProgram == 116 && diagnostic.hostProgramSends == 3,
+			"Bank 1/Sub 2/Program 53 did not select B52");
+
+		processor.setCurrentProgram(5);
+		processor.setCurrentProgram(6);
+		processor.setCurrentProgram(7);
+		midi.clear();
+		processor.processBlock(audio, midi);
+		diagnostic = processor.diagnosticSnapshot();
+		require(diagnostic.currentProgram == 116 && diagnostic.hostProgramSends == 3,
+			"rapid Program Change bypassed firmware pacing");
+		for (int i = 0; i < 240; ++i)
+			processor.processBlock(audio, midi);
+		diagnostic = processor.diagnosticSnapshot();
+		require(diagnostic.currentProgram == 7 && diagnostic.hostProgramSends == 4,
+			"latest coalesced Program Change was not delivered after pacing");
+
+		// A real AU/legacy MIDI Program Change is already sample-positioned and owns
+		// the transaction if a host redundantly publishes both representations.
+		processor.setCurrentProgram(8);
+		midi.addEvent(juce::MidiMessage::controllerEvent(1, 0, 0), 0);
+		midi.addEvent(juce::MidiMessage::controllerEvent(1, 32, 1), 0);
+		midi.addEvent(juce::MidiMessage::programChange(1, 9), 0);
+		processor.processBlock(audio, midi);
+		diagnostic = processor.diagnosticSnapshot();
+		require(diagnostic.currentProgram == 73 && diagnostic.hostProgramSends == 4,
+			"raw MIDI Program Change was duplicated or not reflected");
+
+		// Restored edit-buffer state is authoritative. It cancels a deferred factory
+		// selection, records its matching program identity, and permits later user input.
+		processor.setCurrentProgram(10);
+		midi.clear();
+		processor.processBlock(audio, midi);
+		const std::uint8_t restoredState[] = {'P','R','P','4',0,0,73};
+		processor.setStateInformation(restoredState, (int)sizeof(restoredState));
+		processor.setCurrentProgram(73); // VST3 controller state may replay after component state.
+		for (int i = 0; i < 240; ++i)
+			processor.processBlock(audio, midi);
+		diagnostic = processor.diagnosticSnapshot();
+		require(diagnostic.currentProgram == 73 && diagnostic.hostProgramSends == 4,
+			"state restore did not cancel a deferred factory-program load");
+
+		// Editor and DAW selections share one latest-wins dispatcher. A later host
+		// automation point must cancel an editor debounce, rather than loading both.
+		processor.selectPatch(30);
+		processor.processBlock(audio, midi);
+		processor.setCurrentProgram(31);
+		processor.processBlock(audio, midi);
+		diagnostic = processor.diagnosticSnapshot();
+		require(diagnostic.currentProgram == 31 && diagnostic.hostProgramSends == 5
+			&& diagnostic.editorPatchSends == 0,
+			"host automation did not supersede a pending editor patch selection");
+
+		// The inverse ordering is also latest-wins, while retaining the editor's
+		// deliberate debounce and the shared firmware-safe interval.
+		processor.setCurrentProgram(40);
+		processor.selectPatch(41);
+		processor.processBlock(audio, midi);
+		for (int i = 0; i < 240; ++i)
+			processor.processBlock(audio, midi);
+		diagnostic = processor.diagnosticSnapshot();
+		require(diagnostic.currentProgram == 41 && diagnostic.hostProgramSends == 5
+			&& diagnostic.editorPatchSends == 1,
+			"editor patch selection did not supersede pending host automation");
+	}
+	// Program intent may arrive before prepare, and a host can reprepare while an
+	// editor selection is in its debounce/gate interval (including a sample-rate
+	// change). Preserve the latest request and its remaining real-time delay.
+	{
+		ProphecyAudioProcessor processor;
+		processor.setCurrentProgram(12);
+		processor.prepareToPlay(48000, 512);
+		for (int i = 0; !processor.playbackReady() && i < 1000; ++i)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		require(processor.playbackReady(), "program lifecycle processor did not initialize");
+		juce::AudioBuffer<float> audio(2, 512);
+		juce::MidiBuffer midi;
+		processor.processBlock(audio, midi);
+		require(processor.diagnosticSnapshot().currentProgram == 12,
+			"pre-prepare host Program Change was lost");
+
+		processor.selectPatch(20);
+		processor.processBlock(audio, midi); // transfer the intent to the audio-thread debounce.
+		processor.releaseResources();
+		processor.prepareToPlay(96000, 512);
+		for (int i = 0; i < 47; ++i)
+			processor.processBlock(audio, midi);
+		require(processor.diagnosticSnapshot().editorPatchSends == 0,
+			"reprepare/sample-rate transition shortened Program Change safety interval");
+		for (int i = 47; i < 480; ++i)
+			processor.processBlock(audio, midi);
+		const auto diagnostic = processor.diagnosticSnapshot();
+		require(diagnostic.currentProgram == 20 && diagnostic.editorPatchSends == 1,
+			"reprepare/sample-rate transition lost or prematurely sent Program Change");
+	}
 	for (double rate : { 44100.0, 48000.0, 88200.0, 96000.0, 192000.0 })
 	{
 		const auto reference = render(rate, false, false, false, false);

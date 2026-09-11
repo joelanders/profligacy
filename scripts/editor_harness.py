@@ -62,7 +62,7 @@ const INTERACTIVE_PREVIEW = __HARNESS_PREVIEW__;
       rec[base+6]=offset&255; rec[base+9]=delay; rec[base+10]=fade&255;
     });
   }
-  let patch = 0, dumpVer = 1, arpPattern = 5, arpVer = 1;
+  let patch = 0, patchVer = 1, dumpVer = 1, arpPattern = 5, arpVer = 1;
   const listeners = {};
   window.__JUCE__ = { backend: {
     addEventListener(name, fn){ (listeners[name] = listeners[name] || []).push(fn); },
@@ -72,13 +72,14 @@ const INTERACTIVE_PREVIEW = __HARNESS_PREVIEW__;
       let result = null;
       if (fn === "getLcd") { const l = MOCK.lcd[String(patch)] || MOCK.lcd["0"]; result = {line1:l[0], line2:l[1]}; }
       else if (fn === "getPatchNames") result = MOCK.nonames ? [] : MOCK.names;
+      else if (fn === "getCurrentPatch") result = {program:patch, version:patchVer};
       else if (fn === "getProgramData") { const r = MOCK.records[String(patch)] || MOCK.records["0"]; result = {version: dumpVer, bytes: r}; }
       else if (fn === "getArpPatternData") result = {version:arpVer, pattern:arpPattern, bytes:MOCK.arp};
       else if (fn === "getRomStatus") result = {ok: MOCK.norom ? false : true, path:"(headless harness)"};
       else if (fn === "requestDump") { dumpVer++; }
       else if (fn === "requestArpPatternDump") { arpVer++; }
       else if (fn === "selectArpPattern") { arpPattern = params[0]|0; }
-      else if (fn === "selectPatch") { patch = params[0]|0; }
+      else if (fn === "selectPatch") { patch = params[0]|0; patchVer++; }
       else if (fn === "panelPulse") { console.log("panelPulse", JSON.stringify(params)); }
       else if (fn === "getLcdRaw") result = {version: 0};       // text-fallback LCD in harness
       else if (fn === "getLeds") result = {version: 0, banks: []};

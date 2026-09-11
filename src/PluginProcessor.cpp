@@ -157,6 +157,142 @@ ProphecyAudioProcessor::~ProphecyAudioProcessor()
 	m_engine.stop();
 }
 
+void ProphecyAudioProcessor::setCurrentProgram(int program)
+{
+	if (program < 0 || program >= kProgramCount) return;
+	// VST3 represents MIDI Program Change as a host parameter. The controller may
+	// call this from a non-message thread and supplies no sample offset, so publish
+	// only the latest intent here. The audio callback resolves Live's accompanying
+	// bank-select CCs and schedules the firmware transaction at a block boundary.
+	const auto epoch = m_stateRestoreEpoch.load(std::memory_order_acquire);
+	m_pendingProgram.store((epoch << 9) | (std::uint64_t)program,
+		std::memory_order_release);
+	m_hostProgramIntents.fetch_add(1, std::memory_order_relaxed);
+}
+
+const juce::String ProphecyAudioProcessor::getProgramName(int program)
+{
+	if (program < 0 || program >= kProgramCount) return {};
+	return juce::String(program < 64 ? "A" : "B")
+		+ juce::String(program % 64).paddedLeft('0', 2);
+}
+
+void ProphecyAudioProcessor::publishCurrentProgram(int program, bool notifyHost)
+{
+	if (program < 0 || program >= kProgramCount) return;
+	const int previous = m_currentProgram.exchange(program, std::memory_order_acq_rel);
+	if (previous == program) return;
+	m_currentProgramVersion.fetch_add(1, std::memory_order_release);
+	// Editor patch selection runs on the message thread. Raw AU MIDI and VST3
+	// parameter dispatch run on the audio thread and deliberately avoid host calls.
+	if (notifyHost)
+		updateHostDisplay(juce::AudioProcessorListener::ChangeDetails().withProgramChanged(true));
+}
+
+bool ProphecyAudioProcessor::collectHostBankSelect(const juce::MidiBuffer &midi)
+{
+	bool rawProgramChange = false;
+	for (const auto meta : midi)
+	{
+		const auto *data = meta.data;
+		const int bytes = meta.numBytes;
+		if (bytes == 2 && (data[0] & 0xf0) == 0xc0)
+			rawProgramChange = true;
+		if (bytes != 3 || (data[0] & 0xf0) != 0xb0) continue;
+		const int cc = data[1] & 0x7f;
+		if ((cc != 0 && cc != 32)
+				|| (CcTarget)m_ccMap[(std::size_t)cc].load(std::memory_order_relaxed)
+					!= CcTarget::Off)
+			continue;
+		const std::size_t channel = (std::size_t)(data[0] & 0x0f);
+		if (cc == 0) m_hostBankMsb[channel] = data[2] & 0x7f;
+		else m_hostBankLsb[channel] = data[2] & 0x7f;
+		++m_hostBankGeneration[channel];
+	}
+	return rawProgramChange;
+}
+
+void ProphecyAudioProcessor::dispatchPendingProgram(std::uint64_t eventFrame,
+	std::uint64_t hostFrame, bool rawProgramChangeInBlock)
+{
+	if (m_cancelDeferredProgram.exchange(false, std::memory_order_acq_rel))
+	{
+		m_deferredProgram = -1;
+		m_deferredProgramPending.store(false, std::memory_order_release);
+	}
+
+	const auto request = m_pendingProgram.exchange(kNoPendingProgram,
+		std::memory_order_acq_rel);
+	if (request != kNoPendingProgram
+			&& (request >> 9) == m_stateRestoreEpoch.load(std::memory_order_acquire))
+	{
+		int program = (int)(request & 0xff);
+		const bool fromEditor = (request & kEditorProgramBit) != 0;
+		// Ableton emits Bank/Sub-Bank as CC0/CC32 and the VST3 Program value as
+		// a separate kIsProgramChange parameter. A fresh channel-1 bank pair makes
+		// Program 1..64 address A00..B63; otherwise the VST3 factory-program list
+		// remains a direct flat A00..B63 selector.
+		constexpr std::size_t channel = 0;
+		const bool freshBank = m_hostBankGeneration[channel]
+			!= m_consumedHostBankGeneration[channel];
+		if (!fromEditor && program < 64 && freshBank
+				&& m_hostBankMsb[channel] == 0 && m_hostBankLsb[channel] < 2)
+			program += (int)m_hostBankLsb[channel] * 64;
+		m_consumedHostBankGeneration[channel] = m_hostBankGeneration[channel];
+		// VST3 may replay its matching Program parameter after component state.
+		// Without fresh Bank/Sub-Bank input that is an identity update, not a request
+		// to replace the authoritative restored edit buffer with a factory patch.
+		if (!fromEditor && !freshBank
+				&& program == m_currentProgram.load(std::memory_order_acquire))
+		{
+			m_deferredProgram = -1;
+			m_deferredProgramPending.store(false, std::memory_order_release);
+		}
+		else
+		{
+			m_deferredProgram = program;
+			m_deferredProgramFromEditor = fromEditor;
+			m_deferredProgramEarliestFrame = hostFrame + (fromEditor
+				? (std::uint64_t)std::ceil(m_hostSampleRate * 0.5) : 0);
+			m_deferredProgramPending.store(true, std::memory_order_release);
+		}
+	}
+
+	// Some hosts deliver a real legacy MIDI Program Change as well as updating
+	// their program parameter. The raw event below is already sample-positioned;
+	// never duplicate it with the offset-less VST3 compatibility path.
+	if (rawProgramChangeInBlock)
+	{
+		m_deferredProgram = -1;
+		m_deferredProgramPending.store(false, std::memory_order_release);
+		return;
+	}
+	const auto nextGenerated = m_nextGeneratedProgramFrame.load(std::memory_order_acquire);
+	if (m_deferredProgram < 0 || hostFrame < nextGenerated
+			|| hostFrame < m_deferredProgramEarliestFrame) return;
+	const int program = m_deferredProgram;
+	const std::uint8_t message[8] = {
+		0xB0, 0x00, 0x00,
+		0xB0, 0x20, (std::uint8_t)(program / 64),
+		0xC0, (std::uint8_t)(program % 64) };
+	if (!m_engine.pushMidiAtFrame(message, sizeof(message), eventFrame)) return;
+
+	m_deferredProgram = -1;
+	m_nextGeneratedProgramFrame.store(hostFrame + (std::uint64_t)std::ceil(
+		m_hostSampleRate * (kPatchSelectMinIntervalMs / 1000.0)), std::memory_order_release);
+	publishCurrentProgram(program, false);
+	if (m_deferredProgramFromEditor)
+		m_editorPatchSends.fetch_add(1, std::memory_order_relaxed);
+	else
+		m_hostProgramSends.fetch_add(1, std::memory_order_relaxed);
+	m_deferredProgramPending.store(false, std::memory_order_release);
+	const std::uint64_t wanted = hostFrame + (std::uint64_t)std::ceil(
+		m_hostSampleRate * kPatchLoadSettleSeconds);
+	std::uint64_t previous = m_patchLoadBarrierUntilFrame.load(std::memory_order_relaxed);
+	while (previous < wanted && !m_patchLoadBarrierUntilFrame.compare_exchange_weak(
+		previous, wanted, std::memory_order_release, std::memory_order_relaxed)) {}
+}
+
 bool ProphecyAudioProcessor::isBusesLayoutSupported(const BusesLayout &layouts) const
 {
 	const auto &out = layouts.getMainOutputChannelSet();
@@ -165,17 +301,37 @@ bool ProphecyAudioProcessor::isBusesLayoutSupported(const BusesLayout &layouts) 
 
 void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-	m_hostSampleRate = std::isfinite(sampleRate) && sampleRate > 0.0
+	const double previousSampleRate = m_hostSampleRate;
+	const double nextSampleRate = std::isfinite(sampleRate) && sampleRate > 0.0
 		? sampleRate : (double) ProphecyEngine::kSampleRate;
+	// Generated Program Change pacing uses the monotonic callback-frame counter so
+	// transport seeks cannot bypass it. If a host reprepares at another rate, retain
+	// the remaining wall-clock duration by rescaling deadlines into the new frame unit.
+	const auto currentHostFrame = m_audioHostFrames.load(std::memory_order_acquire);
+	const auto rescaleDeadline = [currentHostFrame, previousSampleRate, nextSampleRate]
+		(std::uint64_t deadline)
+	{
+		if (deadline <= currentHostFrame) return std::uint64_t{0};
+		return currentHostFrame + (std::uint64_t)std::ceil(
+			(double)(deadline - currentHostFrame) * nextSampleRate / previousSampleRate);
+	};
+	m_nextGeneratedProgramFrame.store(rescaleDeadline(
+		m_nextGeneratedProgramFrame.load(std::memory_order_acquire)), std::memory_order_release);
+	m_patchLoadBarrierUntilFrame.store(rescaleDeadline(
+		m_patchLoadBarrierUntilFrame.load(std::memory_order_acquire)), std::memory_order_release);
+	if (m_deferredProgramPending.load(std::memory_order_acquire))
+		m_deferredProgramEarliestFrame = rescaleDeadline(m_deferredProgramEarliestFrame);
+	m_hostSampleRate = nextSampleRate;
 	const auto quantum = ProphecyEngine::kAudioQuantum;
 	m_timelineHostFrame = 0;
 	m_oversizedAudioBlocks.store(0, std::memory_order_relaxed);
 	m_editorPatchIntents.store(0, std::memory_order_relaxed);
 	m_editorPatchSends.store(0, std::memory_order_relaxed);
+	m_hostProgramIntents.store(0, std::memory_order_relaxed);
+	m_hostProgramSends.store(0, std::memory_order_relaxed);
 	m_editorDumpRequests.store(0, std::memory_order_relaxed);
 	m_editorDumpSends.store(0, std::memory_order_relaxed);
 	m_hostMidiEventsForwarded.store(0, std::memory_order_relaxed);
-	m_patchLoadBarrierUntilFrame.store(0, std::memory_order_relaxed);
 	// samplesPerBlock is only a host hint in JUCE. Reserve a generous fixed floor so
 	// ordinary offline/host block-size changes stay allocation-free; a still-larger block
 	// is explicitly silenced and counted in processBlock rather than resizing there.
@@ -337,12 +493,15 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 	// the worker. Hardware serial and scan/voice-allocation latency stays intact.
 	const auto timelineBlockStart = m_timelineHostFrame;
 	const auto midiFrameBase = m_timeline.event(timelineBlockStart);
+	const std::uint64_t hostBlockEnd = m_audioHostFrames.load(std::memory_order_relaxed);
+	const std::uint64_t hostBlockStart = hostBlockEnd - (std::uint64_t)numSamples;
+	const bool rawProgramChangeInBlock = collectHostBankSelect(midi);
+	if (engineActive)
+		dispatchPendingProgram(midiFrameBase, hostBlockStart, rawProgramChangeInBlock);
 	// Parameter callbacks only publish a fixed atomic bitset. Deliver the latest value for
 	// each changed control at this block's exact engine-frame boundary, on the same bounded
 	// audio-thread queue used by sample-positioned mapped CC input.
 	if (engineActive) applyPendingPerformanceParameters(midiFrameBase);
-	const std::uint64_t hostBlockEnd = m_audioHostFrames.load(std::memory_order_relaxed);
-	const std::uint64_t hostBlockStart = hostBlockEnd - (std::uint64_t)numSamples;
 	for (const auto meta : midi)
 	{
 		const auto eventFrame = m_timeline.event(timelineBlockStart
@@ -361,6 +520,16 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 			+ (std::uint64_t)std::max(meta.samplePosition, 0);
 		if (numBytes == 2 && (data[0] & 0xf0) == 0xc0)
 		{
+			const std::size_t channel = (std::size_t)(data[0] & 0x0f);
+			int program = data[1] & 0x7f;
+			if (program < 64 && m_hostBankMsb[channel] == 0 && m_hostBankLsb[channel] < 2)
+				program += (int)m_hostBankLsb[channel] * 64;
+			m_consumedHostBankGeneration[channel] = m_hostBankGeneration[channel];
+			publishCurrentProgram(program, false);
+			m_nextGeneratedProgramFrame.store(hostBlockStart
+				+ (std::uint64_t)std::max(meta.samplePosition, 0)
+				+ (std::uint64_t)std::ceil(m_hostSampleRate
+					* (kPatchSelectMinIntervalMs / 1000.0)), std::memory_order_release);
 			const std::uint64_t settleFrames = (std::uint64_t)std::ceil(
 				m_hostSampleRate * kPatchLoadSettleSeconds);
 			const std::uint64_t wanted = hostEventFrame + settleFrames;
@@ -505,6 +674,9 @@ ProphecyAudioProcessor::DiagnosticSnapshot ProphecyAudioProcessor::diagnosticSna
 	s.oversizedBlocks = oversizedAudioBlocks();
 	s.editorPatchIntents = m_editorPatchIntents.load(std::memory_order_relaxed);
 	s.editorPatchSends = m_editorPatchSends.load(std::memory_order_relaxed);
+	s.hostProgramIntents = m_hostProgramIntents.load(std::memory_order_relaxed);
+	s.hostProgramSends = m_hostProgramSends.load(std::memory_order_relaxed);
+	s.currentProgram = m_currentProgram.load(std::memory_order_acquire);
 	s.editorDumpRequests = m_editorDumpRequests.load(std::memory_order_relaxed);
 	s.editorDumpSends = m_editorDumpSends.load(std::memory_order_relaxed);
 	s.editorCommandsSent = m_editorCommandPacer.sent();
@@ -521,9 +693,11 @@ ProphecyAudioProcessor::DiagnosticSnapshot ProphecyAudioProcessor::diagnosticSna
 //  patch-save operation, and the emulated synth should boot from its explicitly written NVRAM.
 //============================================================
 // State container (backward compatible): a legacy state is the bare SysEx program dump.
-// PRP1 adds the CC->ADIN map; PRP2 adds Wheel 2. PRP3 stores the complete stable host
-// performance-parameter bank. Layout:
-// "PRP3" | u8 mapCount | map pairs | u8 parameterCount | parameter bytes | dump...
+// PRP1 adds the CC->ADIN map; PRP2 adds Wheel 2; PRP3 stores the stable performance
+// parameters; PRP4 also identifies the selected factory program so the VST3 program
+// parameter cannot overwrite an edited-buffer dump during project restore. Layout:
+// "PRP4" | u8 mapCount | map pairs | u8 parameterCount | parameter bytes
+//        | u8 selectedProgram | dump...
 void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 {
 	dest.reset();
@@ -558,7 +732,7 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 	}
 
 	// Header + mapping (non-Off CC entries) + the stable performance-parameter bank.
-	dest.append("PRP3", 4);
+	dest.append("PRP4", 4);
 	std::vector<std::uint8_t> map;
 	for (int cc = 0; cc < 128; ++cc)
 	{
@@ -574,6 +748,8 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 	for (int i = 0; i < kPerformanceParameterCount; ++i)
 		parameterValues[(std::size_t)i] = (std::uint8_t)m_performanceParameters[(std::size_t)i]->get();
 	dest.append(parameterValues.data(), parameterValues.size());
+	const std::uint8_t selectedProgram = (std::uint8_t)getCurrentProgram();
+	dest.append(&selectedProgram, 1);
 	if (!dump.empty()) dest.append(dump.data(), dump.size());
 
 	// Opt-in packaged-product CI marker carried through the standard VST3 state
@@ -599,27 +775,35 @@ void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 {
 	if (data == nullptr || size <= 0) return;
 	const auto *p = static_cast<const std::uint8_t *>(data);
+	// A state load is authoritative over any host-program callback that raced ahead
+	// of it. Tag future callbacks with the new epoch and ask the audio thread to
+	// discard an already-resolved but not-yet-delivered request.
+	m_stateRestoreEpoch.fetch_add(1, std::memory_order_acq_rel);
+	m_pendingProgram.store(kNoPendingProgram, std::memory_order_release);
+	m_cancelDeferredProgram.store(true, std::memory_order_release);
 
 	const std::uint8_t *dump = p;
 	int dumpLen = size;
+	const bool prp4 = (size >= 5 && std::memcmp(p, "PRP4", 4) == 0);
 	const bool prp3 = (size >= 5 && std::memcmp(p, "PRP3", 4) == 0);
 	const bool prp2 = (size >= 5 && std::memcmp(p, "PRP2", 4) == 0);
 	const bool prp1 = (size >= 5 && std::memcmp(p, "PRP1", 4) == 0);
-	if (prp1 || prp2 || prp3)
+	if (prp1 || prp2 || prp3 || prp4)
 	{
 		const int n = p[4];
 		int mapEnd = 5 + n * 2;
 		// A blob whose declared map (+ its controller payload) overruns the buffer is corrupt —
 		// bail entirely rather than feeding the magic bytes to the firmware as a dump.
-		if (mapEnd + (prp2 || prp3 ? 1 : 0) > size) return;
-		const int prp3Count = prp3 ? p[mapEnd] : 0;
-		if (prp3 && mapEnd + 1 + prp3Count > size) return;
+		if (mapEnd + (prp2 || prp3 || prp4 ? 1 : 0) > size) return;
+		const int parameterCount = (prp3 || prp4) ? p[mapEnd] : 0;
+		if ((prp3 || prp4)
+				&& mapEnd + 1 + parameterCount + (prp4 ? 1 : 0) > size) return;
 		for (int cc = 0; cc < 128; ++cc) setCcMap(cc, 0);
 		for (int i = 0; i < n; ++i) setCcMap(p[5 + i * 2], p[5 + i * 2 + 1]);
 		// Reset parameters absent from legacy states to the exact modeled hardware defaults.
 		for (int i = 0; i < kPerformanceParameterCount; ++i)
 			setPerformanceValue(i, kPerformanceParameters[(std::size_t)i].defaultValue, false);
-		if (prp3)
+		if (prp3 || prp4)
 		{
 			++mapEnd;
 			if (wrapperType == juce::AudioProcessor::wrapperType_Standalone)
@@ -628,15 +812,21 @@ void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 				// friction-held state, while sprung/touch controls and PE knobs restart at
 				// their modeled defaults. AU/VST3 projects restore the complete bank below.
 				constexpr int wheel2Index = 7;
-				if (prp3Count > wheel2Index)
+				if (parameterCount > wheel2Index)
 					setPerformanceValue(wheel2Index, p[mapEnd + wheel2Index], false);
 			}
 			else
 			{
-				for (int i = 0; i < std::min(prp3Count, kPerformanceParameterCount); ++i)
+				for (int i = 0; i < std::min(parameterCount, kPerformanceParameterCount); ++i)
 					setPerformanceValue(i, p[mapEnd + i], false);
 			}
-			mapEnd += prp3Count;
+			mapEnd += parameterCount;
+			if (prp4)
+			{
+				const int restoredProgram = p[mapEnd++];
+				if (wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+					publishCurrentProgram(restoredProgram, false);
+			}
 		}
 		else if (prp2)
 		{
@@ -675,6 +865,7 @@ void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 void ProphecyAudioProcessor::selectPatch(int program)
 {
 	if (program < 0 || program > 127) return;
+	publishCurrentProgram(program, true);
 	m_editorPatchIntents.fetch_add(1, std::memory_order_relaxed);
 	// A patch change discards the current edit buffer, so cancel work belonging to the old
 	// buffer and any obsolete read-back. Program loading costs roughly half a second inside
@@ -689,40 +880,9 @@ void ProphecyAudioProcessor::selectPatch(int program)
 	// Start the editor-command barrier at intent time. An accepted send refreshes
 	// it to cover the complete firmware load; host and editor-play MIDI still pass.
 	holdEditorCommandsForPatchLoad(2.5);
-	m_patchSelectDelay.schedule(program);
-}
-
-bool ProphecyAudioProcessor::sendPatchNow(int program)
-{
-	// A quiet-click debounce is not enough: two individually valid Program
-	// Changes can still overlap the firmware's long inter-board load transaction.
-	// PatchSelectDelay will retry, retaining only its latest program, until the
-	// prior load has completed.
-	const double now = juce::Time::getMillisecondCounterHiRes();
-	if (now - m_lastPatchSendMs < kPatchSelectMinIntervalMs)
-	{
-		// Keep both barriers closed while PatchSelectDelay retains the latest
-		// requested program and waits for the previous transaction to settle.
-		holdEditorCommandsForPatchLoad(0.2);
-		m_editorCommandPacer.extendPatchLoad(200);
-		return false;
-	}
-	// Bank select then program change (verified on the emulated firmware via the LCD:
-	// a bare 0xC0 only ever reaches bank A; CC0=0 + CC32=bank + 0xC0 lands "B52:...").
-	const std::uint8_t msg[8] = {
-		0xB0, 0x00, 0x00,                          // bank select MSB
-		0xB0, 0x20, (std::uint8_t) (program / 64), // bank select LSB: 0=A, 1=B
-		0xC0, (std::uint8_t) (program % 64) };     // program within the bank
-	const bool accepted = pushImmediateMidi(msg, sizeof(msg));
-	if (accepted)
-	{
-		holdEditorCommandsForPatchLoad(kPatchLoadSettleSeconds);
-		m_editorCommandPacer.extendPatchLoad(
-			(int)std::lround(kPatchLoadSettleSeconds * 1000.0));
-		m_lastPatchSendMs = now;
-		m_editorPatchSends.fetch_add(1, std::memory_order_relaxed);
-	}
-	return accepted;
+	const auto epoch = m_stateRestoreEpoch.load(std::memory_order_acquire);
+	m_pendingProgram.store((epoch << 9) | kEditorProgramBit | (std::uint64_t)program,
+		std::memory_order_release);
 }
 
 void ProphecyAudioProcessor::holdEditorCommandsForPatchLoad(double seconds)
@@ -785,13 +945,18 @@ std::uint64_t ProphecyAudioProcessor::requestProgramDump()
 	// Program Change and current-program dump assembly share the firmware MIDI task. A dump
 	// sent during the patch-load transaction is silently discarded, so wait out any pending/recent
 	// selection and let ProgramDumpSync retry the one in-flight editor transaction if needed.
-	constexpr double patchSettleMs = kPatchLoadSettleSeconds * 1000.0;
-	const double now = juce::Time::getMillisecondCounterHiRes();
 	int delayMs = 0;
-	if (m_patchSelectDelay.pending())
+	if (m_pendingProgram.load(std::memory_order_acquire) != kNoPendingProgram
+			|| m_deferredProgramPending.load(std::memory_order_acquire))
 		delayMs = 800; // debounce checkpoint; the shared pacer remains held through the load
 	else
-		delayMs = std::max(0, (int)std::ceil(patchSettleMs - (now - m_lastPatchSendMs)));
+	{
+		const auto now = m_audioHostFrames.load(std::memory_order_acquire);
+		const auto barrier = m_patchLoadBarrierUntilFrame.load(std::memory_order_acquire);
+		if (barrier > now && m_hostSampleRate > 0.0)
+			delayMs = std::max(0, (int)std::ceil((double)(barrier - now)
+				* 1000.0 / m_hostSampleRate));
+	}
 	return m_programDumpSync.request(delayMs);
 }
 
@@ -1219,6 +1384,9 @@ private:
 			<< " midi_events=" << (juce::int64) s.hostMidiEvents
 			<< " last_midi=" << hex8(midi) << ":" << hex8(midi >> 8) << ":" << hex8(midi >> 16)
 			<< "/" << (int) ((midi >> 24) & 0xff)
+			<< " program=" << s.currentProgram
+			<< " host_program=" << (juce::int64)s.hostProgramIntents
+			<< "/" << (juce::int64)s.hostProgramSends
 			<< " active_notes=" << hex64(s.activeNotesHigh) << hex64(s.activeNotesLow)
 			<< " drops=imm:" << (juce::int64) s.droppedImmediateMidiBytes
 			<< ",sched:" << (juce::int64) s.droppedScheduledMidiBytes
@@ -1315,6 +1483,15 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 				{
 					if (! args.isEmpty()) { diag("UI selectPatch program=" + juce::String((int) args[0])); m_proc.selectPatch((int) args[0]); }
 					complete(juce::var{});
+				})
+			.withNativeFunction("getCurrentPatch",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					juce::ignoreUnused(args);
+					auto *obj = new juce::DynamicObject();
+					obj->setProperty("program", m_proc.getCurrentProgram());
+					obj->setProperty("version", (juce::int64)m_proc.currentProgramVersion());
+					complete(juce::var(obj));
 				})
 			.withNativeFunction("setParam",
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
