@@ -5,6 +5,17 @@ This is a low-level emulation of the hardware in the Korg Prophecy.
 
 You bring your own ROM dumps of the original firmware (2 chips), and this thing runs it.
 
+Link to a demo on Youtube:
+
+<a href="https://www.youtube.com/watch?v=TnSvMZZmUsw"><img width="800" alt="youtube" src="https://i3.ytimg.com/vi/TnSvMZZmUsw/maxresdefault.jpg" /></a>
+
+Probing the signals between chips:
+<img width="800" alt="in-situ" src="https://github.com/user-attachments/assets/7412f9e5-cb1f-4e83-b6c1-228d2ad26698" />
+
+Custom PCBs for driving the DSP chip:
+<img width="800" alt="standalone" src="https://github.com/user-attachments/assets/ebbb2abe-6e05-4805-b692-a29e6d012b30" />
+
+
 I spent some months probing the NEC V55PI, Hitachi H8/3003, and (3x) TI TMS57002 chips. I got all the inter-chip UART and DSP host interface signals (that I observed) matching in time and content exactly.
 
 For example, the end-to-end signals are like: MIDI -> UART -> DSP host interface -> digital audio.
