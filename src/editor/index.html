@@ -542,6 +542,18 @@
   #matrixview{position:fixed; inset:0; display:flex; flex-direction:column;
     padding:40px 16px 12px}
   #matrixview[hidden]{display:none}
+
+  /* settings view: plugin options for this computer, never saved in projects */
+  #settingsview{position:fixed; inset:0; display:flex; flex-direction:column;
+    padding:40px 16px 12px; overflow-y:auto}
+  #settingsview[hidden]{display:none}
+  .setcard{max-width:560px}
+  .setcheck{display:flex; align-items:center; gap:8px; font-weight:600; cursor:pointer}
+  .setcheck input{accent-color:var(--accent); width:15px; height:15px; margin:0}
+  .setcheck:has(input:disabled){cursor:default; opacity:.6}
+  .setnote{margin:7px 0 0 23px; font-size:11.5px; line-height:1.5; color:var(--dim)}
+  .setstatus{margin:7px 0 0 23px; font:10px var(--mono); color:var(--dim)}
+  .setstatus.warn{color:var(--red)}
   .mmhead{display:flex; align-items:center; gap:14px; padding:2px 4px 10px}
   .mmtitle{font:12px var(--mono); letter-spacing:.16em; color:var(--canvas-ink)}
   .mmhint{font-size:11px; color:var(--canvas-dim); flex:1}
@@ -687,6 +699,7 @@
   <span class="vchip" id="chip_program">Program</span>
   <span class="vchip" id="chip_arp">Arp</span>
   <span class="vchip" id="chip_global">Global</span>
+  <span class="vchip" id="chip_settings">Settings</span>
   <span class="vchip" id="chip_layout" hidden>Layout</span>
   <span class="vchip" id="chip_material" hidden>Material</span>
   <span class="vchip" id="chip_dev" title="developer panel tools">Dev</span>
@@ -741,6 +754,21 @@
   <div class="fxhead" id="fxtoggle"><span class="fxcaret" id="fxcaret">&#9656;</span>
     Fixed Routes <span class="fxsub">hard-wired sources: velocity, aftertouch, CC#1, keyboard tracking</span></div>
   <div class="mmscroll fxwrap" id="fxwrap" hidden><table class="mmtab fxtab" id="fxtab"></table></div>
+</div>
+
+<div id="settingsview" hidden>
+  <div class="mmhead">
+    <span class="mmtitle">Settings</span>
+    <span class="mmhint">options for this computer &bull; not saved with projects</span>
+  </div>
+  <section class="sect setcard">
+    <h2>Performance</h2>
+    <label class="setcheck"><input id="setmulticore" type="checkbox"> Multi-core DSP</label>
+    <p class="setnote">Runs the three sound DSPs on a second CPU core, alongside the rest of the
+      synth. This gives more headroom and helps slower computers avoid dropouts. The sound is
+      identical either way, and the change applies immediately.</p>
+    <p class="setstatus" id="setmulticorestatus"></p>
+  </section>
 </div>
 
 <div class="wrap" id="editview" hidden>
@@ -3632,7 +3660,7 @@
       const navNames=[...document.querySelectorAll('.viewchips>.vchip:not([hidden])')]
         .map(el=>el.id.replace(/^chip_/,''));
       ok('editor navigation is flat',
-         navNames.join(',')==='panel,matrix,program,arp,global,dev' &&
+         navNames.join(',')==='panel,matrix,program,arp,global,settings,dev' &&
          !document.getElementById('chip_edit') && !document.getElementById('flowindex'),
          navNames.join(','));
       const devChip=document.getElementById('chip_dev');
@@ -5568,16 +5596,43 @@
   const panelview  = document.getElementById('panelview');
   const editview   = document.getElementById('editview');
   const matrixview = document.getElementById('matrixview');
+  const settingsview = document.getElementById('settingsview');
+  const setMultiCore = document.getElementById('setmulticore');
+  const setMultiCoreStatus = document.getElementById('setmulticorestatus');
+  let settingsPoll = null;
+  function showMultiCore(r){
+    if (!r) return;
+    setMultiCore.checked = !!r.multiCore;
+    setMultiCore.disabled = !!r.overridden;
+    let text = 'Off: all emulation runs on one thread.';
+    if (r.status === 'active') text = 'Active: the DSPs run on their own thread.';
+    else if (r.status === 'unavailable') text = 'The extra thread could not be started; running on one thread.';
+    else if (r.multiCore) text = 'Waiting for the synth engine to start.';
+    if (r.overridden) text += ' Set by PROPHECY_MULTICORE_DSP.';
+    setMultiCoreStatus.textContent = text;
+    setMultiCoreStatus.classList.toggle('warn', r.status === 'unavailable');
+  }
+  function refreshMultiCore(){ nativeAsync("getMultiCoreDsp").then(showMultiCore); }
+  setMultiCore.addEventListener('change', () => {
+    nativeAsync("setMultiCoreDsp", setMultiCore.checked).then(r => {
+      showMultiCore(r);
+      setTimeout(refreshMultiCore, 250); // the engine applies it at its next slice
+    });
+  });
   const chips = { panel: document.getElementById('chip_panel'),
                   matrix: document.getElementById('chip_matrix'),
                   program: document.getElementById('chip_program'),
                   arp: document.getElementById('chip_arp'),
-                  global: document.getElementById('chip_global') };
+                  global: document.getElementById('chip_global'),
+                  settings: document.getElementById('chip_settings') };
   function setView(v){
     const editorMode=v==='program'||v==='arp'||v==='global';
     document.body.classList.toggle('softwareview',v!=='panel');
     panelview.style.display = v==='panel' ? '' : 'none';
     matrixview.hidden = v!=='matrix';
+    settingsview.hidden = v!=='settings';
+    if (v==='settings' && !settingsPoll) { refreshMultiCore(); settingsPoll = pollNativeLatest("getMultiCoreDsp", 1000, showMultiCore); }
+    if (v!=='settings' && settingsPoll) { clearInterval(settingsPoll); settingsPoll = null; }
     editview.hidden = !editorMode;
     for (const k in chips) chips[k].classList.toggle('on', v===k);
     if(editorMode) selectEditorMode(v);
@@ -5589,6 +5644,7 @@
   chips.program.onclick = () => { setLayoutLabOpen(false); setMaterialLabOpen(false); setView('program'); };
   chips.arp.onclick     = () => { setLayoutLabOpen(false); setMaterialLabOpen(false); setView('arp'); };
   chips.global.onclick  = () => { setLayoutLabOpen(false); setMaterialLabOpen(false); setView('global'); };
+  chips.settings.onclick = () => { setLayoutLabOpen(false); setMaterialLabOpen(false); setView('settings'); };
   document.getElementById('chip_layout').onclick = () => {
     setView('panel');
     setMaterialLabOpen(false);

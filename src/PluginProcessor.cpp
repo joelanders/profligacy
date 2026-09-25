@@ -59,6 +59,34 @@ static int prophecy_setenv(const char *name, const char *value, int overwrite)
 
 #include "rom_locator.h"
 
+namespace {
+// Multi-core DSP is a property of this computer, not of a project: it is kept in
+// the user's Profligacy settings next to the firmware folder, defaulting to on.
+// The engine applies PROPHECY_MULTICORE_DSP=0|1 over it when it starts; while
+// that troubleshooting override is set, the editor shows it and saves nothing.
+bool multiCoreDspOverridden()
+{
+	const char *value = std::getenv("PROPHECY_MULTICORE_DSP");
+	return value && (std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0);
+}
+
+void applyMultiCoreDspPreference()
+{
+	ProphecyEngine::setMultiCoreDsp(juce::PropertiesFile(romloc::settingsOptions()).getBoolValue("multiCoreDsp", true));
+}
+
+juce::var multiCoreDspSettings()
+{
+	auto *obj = new juce::DynamicObject();
+	obj->setProperty("multiCore", ProphecyEngine::multiCoreDsp());
+	const auto status = ProphecyEngine::multiCoreDspStatus();
+	obj->setProperty("status", status == ProphecyEngine::MultiCoreDspStatus::Active ? "active"
+		: status == ProphecyEngine::MultiCoreDspStatus::Unavailable ? "unavailable" : "off");
+	obj->setProperty("overridden", multiCoreDspOverridden());
+	return juce::var(obj);
+}
+}
+
 ProphecyAudioProcessor::ProphecyAudioProcessor()
 	: AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
@@ -409,6 +437,7 @@ bool ProphecyAudioProcessor::maybeBootEngine()
 		for (std::string tok; ss >> tok; )
 			args.push_back(tok);
 	}
+	applyMultiCoreDspPreference();
 	const bool started = m_engine.start(args);
 	if (started)
 	{
@@ -1735,6 +1764,26 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 					// (real WKWebView + real bridge + real engine) and report via selfTestReport.
 					obj->setProperty("selftest", std::getenv("PROPHECY_EDITOR_SELFTEST") != nullptr);
 					complete(juce::var(obj));
+				})
+			.withNativeFunction("getMultiCoreDsp",
+				[](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					juce::ignoreUnused(args);
+					complete(multiCoreDspSettings());
+				})
+			.withNativeFunction("setMultiCoreDsp",
+				[](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					// Takes effect between emulation slices, without restarting the engine.
+					if (!args.isEmpty() && !multiCoreDspOverridden())
+					{
+						const bool enabled = (bool) args[0];
+						juce::PropertiesFile props(romloc::settingsOptions());
+						props.setValue("multiCoreDsp", enabled);
+						props.saveIfNeeded();
+						ProphecyEngine::setMultiCoreDsp(enabled);
+					}
+					complete(multiCoreDspSettings());
 				})
 			.withNativeFunction("renamePatch",
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)

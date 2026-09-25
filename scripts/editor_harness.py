@@ -23,7 +23,7 @@ overflows, or visible Edit-view text ignores the requested scale.
 States: default (hardware panel, A00) / browser (patch list open) / b52
 (scripted drive: open browser, click B52, resync) / norom / nonames / matrix /
 route / fixed / material / program / oscillator / wave / amplifier /
-arp / arpedit / global
+arp / arpedit / global / settings
 (see STATES below for each).
 """
 import argparse, base64, html as html_lib, json, os, pathlib, re, subprocess, sys
@@ -62,7 +62,7 @@ const INTERACTIVE_PREVIEW = __HARNESS_PREVIEW__;
       rec[base+6]=offset&255; rec[base+9]=delay; rec[base+10]=fade&255;
     });
   }
-  let patch = 0, patchVer = 1, dumpVer = 1, arpPattern = 5, arpVer = 1;
+  let patch = 0, patchVer = 1, dumpVer = 1, arpPattern = 5, arpVer = 1, multiCore = true;
   const listeners = {};
   window.__JUCE__ = { backend: {
     addEventListener(name, fn){ (listeners[name] = listeners[name] || []).push(fn); },
@@ -76,6 +76,10 @@ const INTERACTIVE_PREVIEW = __HARNESS_PREVIEW__;
       else if (fn === "getProgramData") { const r = MOCK.records[String(patch)] || MOCK.records["0"]; result = {version: dumpVer, bytes: r}; }
       else if (fn === "getArpPatternData") result = {version:arpVer, pattern:arpPattern, bytes:MOCK.arp};
       else if (fn === "getRomStatus") result = {ok: MOCK.norom ? false : true, path:"(headless harness)"};
+      else if (fn === "getMultiCoreDsp" || fn === "setMultiCoreDsp") {
+        if (fn === "setMultiCoreDsp") multiCore = !!params[0];
+        result = {multiCore, status: multiCore ? "active" : "off", overridden: false};
+      }
       else if (fn === "requestDump") { dumpVer++; }
       else if (fn === "requestArpPatternDump") { arpVer++; }
       else if (fn === "selectArpPattern") { arpPattern = params[0]|0; }
@@ -110,6 +114,7 @@ const INTERACTIVE_PREVIEW = __HARNESS_PREVIEW__;
       document.getElementById("chip_program")?.click();
     if (q === "arp" || q === "arpedit") document.getElementById("chip_arp")?.click();
     if (q === "global") document.getElementById("chip_global")?.click();
+    if (q === "settings") document.getElementById("chip_settings")?.click();
     if (q === "arpedit") {
       setTimeout(()=>document.getElementById("arpunlock")?.click(),900);
     }
@@ -366,7 +371,7 @@ STATES = {"default": "", "norom": "?do=norom", "nonames": "?do=nonames", "matrix
           "brass": "?do=brass", "reed": "?do=reed",
           "wave": "?do=wave", "amplifier": "?do=amplifier", "ampvelocity": "?do=ampvelocity",
           "big": "?do=big", "bigwave": "?do=bigwave", "appearance": "?do=appearance",
-          "arp": "?do=arp", "arpedit": "?do=arpedit", "global": "?do=global",
+          "arp": "?do=arp", "arpedit": "?do=arpedit", "global": "?do=global", "settings": "?do=settings",
           "eg": "?do=eg", "lfoview": "?do=lfoview", "lfotiming": "?do=lfotiming",
           "name": "?do=name", "mixer": "?do=mixer",
           "browser": "?do=browser", "b52": "?do=b52"}

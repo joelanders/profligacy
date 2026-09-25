@@ -67,6 +67,8 @@ Once I had an accurate emulation, I had to make it faster. The original interpre
 
 It uses about half a core on my Apple M2 chip, and 80% on my intel iMac last time I checked. Probably room to improve.
 
+The DSPs can also run on a second core. One worker thread owns all three DSPs and the sound mixing, while the V55 and H8 keep running on the main emulation thread. Commands to the DSPs are queued in their original order, and anything that reads DSP state waits for the queue to drain, so the output is bit-identical either way. That renders about a third faster, which was enough for my Intel iMac to go from falling behind in real time to playing cleanly. It's on by default; you can turn it off under Settings → Multi-core DSP, and `PROPHECY_MULTICORE_DSP=0` or `1` overrides it for troubleshooting.
+
 ## Making it pretty
 
 The original panel is quite button-driven. It's a bit nicer in the real hardware when you can use two hands at once, but pecking around with a mouse isn't fun. I started out with a very auto-generated sysex editor kind of UI with hundreds of sliders for all of the exposed parameters. I got sucked into improving this somewhat.
