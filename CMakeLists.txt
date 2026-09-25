@@ -259,6 +259,13 @@ target_link_libraries(ProphecyLifecycleHost PRIVATE prophecy_engine)
 add_executable(ProphecyConsoleHost EXCLUDE_FROM_ALL src/console_main.cpp)
 target_link_libraries(ProphecyConsoleHost PRIVATE prophecy_engine)
 
+# Real-engine timeline probe at the plug-in's latency: exact serial vs multi-core
+# DSP output, deadline misses and CPU. It currently uses POSIX CPU accounting.
+if(UNIX AND NOT PROPHECY_USE_FAKE_ENGINE)
+	add_executable(ProphecyDspThreadingHost EXCLUDE_FROM_ALL scripts/dsp_threading_host.cpp)
+	target_link_libraries(ProphecyDspThreadingHost PRIVATE prophecy_engine)
+endif()
+
 # Fast no-ROM statement of the v1 instance contract. This distinguishes "a host can
 # construct/tear down two plugin objects" from independent simultaneous synthesis.
 add_executable(ProphecyMultiInstanceContractTest scripts/multi_instance_contract_test.cpp)

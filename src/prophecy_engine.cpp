@@ -21,6 +21,7 @@
 #include "emuopts.h"
 #include "main.h"
 #include "osdepend.h"
+#include "dspcluster.h"
 #include "render.h"
 #include "video/hd44780.h"
 
@@ -752,6 +753,8 @@ struct ProphecyEngine::Impl
 		if (host_timeline && period != applied_period)
 		{
 			configure_audio_producer_scheduling(period);
+			// A DSP cluster worker inherits the producer's new real-time policy.
+			cluster_refresh_policy();
 			applied_period = period;
 		}
 #endif
@@ -937,6 +940,11 @@ void apply_audio_config()
 	setenv("KPROP_DSP2_INPUT_ROUTE", "normal", 1);
 	setenv("KPROP_TXSM_FALLBACK_FIX", "1", 0);
 	setenv("KPROP_DSP_SERIAL_FRAME_MODEL", "0", 1);
+	// PROPHECY_MULTICORE_DSP=0|1 overrides the host's multi-core choice for
+	// troubleshooting and tests; the plug-in reports the override in Settings.
+	if (const char *multicore = std::getenv("PROPHECY_MULTICORE_DSP");
+			multicore && (std::string(multicore) == "0" || std::string(multicore) == "1"))
+		ProphecyEngine::setMultiCoreDsp(multicore[0] == '1');
 	// Enable the TMS57002 pooled dynarec. The
 	// default patch's DSP programs compile during the ~2 s boot, before the host pulls at
 	// real-time, so there's no first-note stall; a patch change compiles a new program on
@@ -1123,6 +1131,18 @@ bool ProphecyEngine::ownsMachineSlot() const
 ProphecyEngine::InstanceStatus ProphecyEngine::instanceStatus() const
 {
 	return m_impl->status.load(std::memory_order_acquire);
+}
+
+void ProphecyEngine::setMultiCoreDsp(bool enabled) { set_dsp_cluster_enabled(enabled); }
+bool ProphecyEngine::multiCoreDsp() { return dsp_cluster_enabled(); }
+ProphecyEngine::MultiCoreDspStatus ProphecyEngine::multiCoreDspStatus()
+{
+	switch (get_dsp_cluster_status())
+	{
+	case dsp_cluster_status::active:      return MultiCoreDspStatus::Active;
+	case dsp_cluster_status::unavailable: return MultiCoreDspStatus::Unavailable;
+	default:                              return MultiCoreDspStatus::Off;
+	}
 }
 
 std::size_t ProphecyEngine::pull(float *left, float *right, std::size_t frames)

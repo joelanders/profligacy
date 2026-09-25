@@ -108,6 +108,15 @@ ProphecyEngine::InstanceStatus ProphecyEngine::instanceStatus() const
 	return InstanceStatus::NotStarted;
 }
 
+// The fake engine has no DSP threads; it records the preference only.
+static std::atomic<bool> g_fakeMultiCoreDsp{false};
+void ProphecyEngine::setMultiCoreDsp(bool enabled) { g_fakeMultiCoreDsp.store(enabled); }
+bool ProphecyEngine::multiCoreDsp() { return g_fakeMultiCoreDsp.load(); }
+ProphecyEngine::MultiCoreDspStatus ProphecyEngine::multiCoreDspStatus()
+{
+	return g_fakeMultiCoreDsp.load() ? MultiCoreDspStatus::Active : MultiCoreDspStatus::Off;
+}
+
 std::size_t ProphecyEngine::pull(float *left, float *right, std::size_t frames)
 {
 	if (!running()) return 0;
