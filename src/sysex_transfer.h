@@ -22,8 +22,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -44,6 +46,26 @@ constexpr std::size_t kGlobalSysexOffset = 178;   // bit0 transmit, bit1 receive
 constexpr double kUartBytesPerMs = 3.125;         // 31250 baud, 10 bits per byte
 
 enum class Unit { CurrentProgram, Program, Bank, AllPrograms, Pattern, AllPatterns, Global, AllData };
+
+// The names the editor uses for each unit.
+inline constexpr std::pair<Unit, const char *> kUnitKeys[] = {
+	{Unit::CurrentProgram, "current"}, {Unit::Program, "program"}, {Unit::Bank, "bank"},
+	{Unit::AllPrograms, "allPrograms"}, {Unit::Pattern, "pattern"}, {Unit::AllPatterns, "allPatterns"},
+	{Unit::Global, "global"}, {Unit::AllData, "allData"}};
+
+inline const char *unitKey(Unit unit)
+{
+	for (const auto &[u, key] : kUnitKeys)
+		if (u == unit) return key;
+	return "";
+}
+
+inline std::optional<Unit> unitFromKey(std::string_view key)
+{
+	for (const auto &[u, k] : kUnitKeys)
+		if (key == k) return u;
+	return std::nullopt;
+}
 
 inline std::size_t rawBytes(Unit unit)
 {
@@ -342,10 +364,11 @@ struct SysexPort
 	virtual void clearReplies() = 0;
 };
 
-// One export or import at a time, advanced by tick() every few milliseconds. Every byte
-// goes through the exclusive stream so nothing else reaches the UART mid-dump. Loads to
-// program or pattern memory are bracketed by unprotect/re-protect, matching WRITE; the
-// re-protect runs on failure and cancel too.
+// One export or import at a time, advanced by tick() every few milliseconds. A transfer
+// is a fixed list of steps; every byte goes through the exclusive stream so nothing else
+// reaches the UART mid-dump. Loads to program or pattern memory are bracketed by
+// unprotect/re-protect, matching WRITE. The re-protect steps sit after `cleanupFrom`
+// and also run after a failure or cancel, which jump straight to them.
 class Transfer
 {
 public:
@@ -368,27 +391,20 @@ public:
 	bool startExport(Unit unit, int index)
 	{
 		if (busy()) return false;
-		reset("Requesting " + label(Dump{unit, index, {}}));
-		Step req;
-		req.kind = Step::Kind::Request;
-		req.unit = unit;
-		req.index = index;
-		m_steps.push_back(req);
-		Step await;
-		await.kind = Step::Kind::AwaitDump;
-		await.unit = unit;
-		await.index = index;
-		await.timeoutMs = 3000.0 + double(messageBytes(unit)) / kUartBytesPerMs * 1.5;
-		await.weight = double(messageBytes(unit));
-		m_steps.push_back(await);
-		m_totalWeight = await.weight;
+		reset();
+		const double wireMs = double(messageBytes(unit)) / kUartBytesPerMs;
+		m_steps.push_back(send([unit, index](int ch) { return request(unit, index, ch); },
+			"Receiving " + label(Dump{unit, index, {}})));
+		m_steps.push_back(await(Step::Kind::AwaitDump, 3000.0 + wireMs * 1.5, unit, index));
+		m_cleanupFrom = m_steps.size();
+		m_estimateMs = wireMs + 300.0;
 		return true;
 	}
 
 	bool startImport(std::vector<Dump> dumps)
 	{
 		if (busy() || dumps.empty()) return false;
-		reset("Preparing import");
+		reset();
 		m_dumps = std::move(dumps);
 		bool memory = false, global = false;
 		for (const Dump &d : m_dumps)
@@ -396,59 +412,45 @@ public:
 			memory = memory || storesToMemory(d.unit);
 			global = global || carriesGlobal(d.unit);
 		}
-		if (memory)
-		{
-			m_steps.push_back(protectStep(false, 170));
-			m_steps.push_back(waitStep(150));
-			m_steps.push_back(protectStep(false, 171));
-			m_steps.push_back(waitStep(150));
-		}
+		auto protect = [this](int value, const std::string &phase) {
+			for (int param : {170, 171})
+			{
+				m_steps.push_back(send([param, value](int ch) { return globalParameter(param, value, ch); },
+					param == 170 ? phase : std::string()));
+				m_steps.push_back(pause(150.0));
+			}
+			m_estimateMs += 300.0;
+		};
+		if (memory) protect(0, "Preparing import");
 		if (global)
 		{
-			Step req;
-			req.kind = Step::Kind::Request;
-			req.unit = Unit::Global;
-			m_steps.push_back(req);
-			Step await;
-			await.kind = Step::Kind::AwaitGlobal;
-			await.unit = Unit::Global;
-			await.timeoutMs = 3000.0;
-			m_steps.push_back(await);
+			m_steps.push_back(send([](int ch) { return request(Unit::Global, 0, ch); },
+				"Reading current global settings"));
+			m_steps.push_back(await(Step::Kind::AwaitGlobal, 3000.0, Unit::Global, -1));
+			m_estimateMs += double(messageBytes(Unit::Global)) / kUartBytesPerMs;
 		}
 		for (std::size_t i = 0; i < m_dumps.size(); ++i)
 		{
-			Step send;
-			send.kind = Step::Kind::SendDump;
-			send.dump = i;
-			send.weight = double(messageBytes(m_dumps[i].unit));
-			m_totalWeight += send.weight;
-			m_steps.push_back(send);
-			Step ack;
-			ack.kind = Step::Kind::AwaitAck;
-			ack.dump = i;
-			ack.timeoutMs = 4000.0 + double(messageBytes(m_dumps[i].unit)) / kUartBytesPerMs * 0.5;
-			m_steps.push_back(ack);
-			m_steps.push_back(waitStep(200));
+			const double wireMs = double(messageBytes(m_dumps[i].unit)) / kUartBytesPerMs;
+			m_steps.push_back(send([this, i](int ch) {
+				preserveGlobalMidi(m_dumps[i], m_currentGlobal);
+				return build(m_dumps[i], ch);
+			}, "Sending " + label(m_dumps[i])));
+			m_steps.push_back(await(Step::Kind::AwaitAck, 4000.0 + wireMs, m_dumps[i].unit, -1));
+			m_steps.push_back(pause(200.0));
+			m_estimateMs += wireMs + 200.0;
 		}
-		if (memory)
-		{
-			m_cleanup.push_back(protectStep(true, 170));
-			m_cleanup.push_back(waitStep(150));
-			m_cleanup.push_back(protectStep(true, 171));
-			m_cleanup.push_back(waitStep(150));
-		}
+		m_cleanupFrom = m_steps.size();
+		if (memory) protect(1, "Restoring memory protect");
 		return true;
 	}
 
-	void cancel()
-	{
-		if (busy() && !m_cancelRequested) m_cancelRequested = true;
-	}
+	void cancel() { if (busy()) m_cancelRequested = true; }
 
 	void tick(SysexPort &port, double nowMs)
 	{
 		if (!busy()) return;
-		if (!m_started)
+		if (m_startMs < 0)
 		{
 			// Wait for any editor command or patch load before taking the UART.
 			if (m_cancelRequested) { finish(State::Cancelled, "Cancelled"); return; }
@@ -459,106 +461,77 @@ public:
 					finish(State::Failed, "The synth is busy or not running. Try again in a moment.");
 				return;
 			}
-			m_started = true;
+			m_startMs = nowMs;
 			port.clearReplies();
 		}
-		// Cancel between dumps: one already sent is acknowledged first, because the
-		// firmware drops SysEx (including the re-protect) while it stores a dump.
-		if (m_cancelRequested && !m_streaming && !m_onWire && !m_inCleanup)
-		{
-			m_failure = State::Cancelled;
-			m_failureMessage = "Cancelled";
-			enterCleanup();
-		}
-		for (int guard = 0; guard < 8 && busy(); ++guard)
-			if (!advance(port, nowMs)) break;
+		// Never cancel mid-stream or while the firmware stores a dump: it drops SysEx
+		// (including the re-protect) until it has acknowledged the load.
+		const bool storing = m_next < m_steps.size() && m_steps[m_next].kind == Step::Kind::AwaitAck;
+		if (m_cancelRequested && !m_streaming && !storing) stop(State::Cancelled, "Cancelled");
+		while (busy() && advance(port, nowMs)) {}
+		if (busy()) m_status.progress = std::clamp((nowMs - m_startMs) / m_estimateMs, 0.0, 0.99);
 	}
 
 private:
 	struct Step
 	{
-		enum class Kind { Request, AwaitDump, AwaitGlobal, SendDump, AwaitAck, Send, Wait } kind = Kind::Wait;
+		enum class Kind { Send, AwaitDump, AwaitGlobal, AwaitAck, Pause } kind = Kind::Pause;
+		std::function<std::vector<std::uint8_t>(int channel)> message; // Send
+		std::string phase;    // shown while this step runs, if set
 		Unit unit = Unit::CurrentProgram;
-		int index = -1;
-		std::size_t dump = 0;
-		int value = 0;                   // Send: global parameter `index` = value
-		double timeoutMs = 0.0;          // Await*, or the Wait duration
-		double weight = 0.0;             // share of the progress bar
+		int index = -1;       // AwaitDump: the reply to match
+		double ms = 0.0;      // Await timeout, or Pause length
 	};
+	enum class Reply { Waiting, Arrived, Stopped };
 
-	static Step waitStep(double ms) { Step s; s.kind = Step::Kind::Wait; s.timeoutMs = ms; return s; }
-	static Step protectStep(bool on, int param)
+	static Step send(std::function<std::vector<std::uint8_t>(int)> message, std::string phase)
 	{
 		Step s;
 		s.kind = Step::Kind::Send;
-		s.index = param;
-		s.value = on ? 1 : 0;
+		s.message = std::move(message);
+		s.phase = std::move(phase);
 		return s;
 	}
-
-	void reset(const std::string &phase)
+	static Step await(Step::Kind kind, double timeoutMs, Unit unit, int index)
 	{
-		m_status = Status{State::Running, phase, 0.0, {}};
+		Step s;
+		s.kind = kind;
+		s.ms = timeoutMs;
+		s.unit = unit;
+		s.index = index;
+		return s;
+	}
+	static Step pause(double ms) { Step s; s.ms = ms; return s; }
+
+	void reset()
+	{
+		m_status = Status{State::Running, "Waiting for the synth", 0.0, {}};
 		m_steps.clear();
-		m_cleanup.clear();
 		m_dumps.clear();
 		m_exported.clear();
 		m_currentGlobal.clear();
-		m_next = 0;
-		m_stepStartMs = -1.0;
-		m_firstTickMs = -1.0;
-		m_doneWeight = 0.0;
-		m_totalWeight = 0.0;
-		m_started = false;
-		m_streaming = false;
-		m_onWire = false;
-		m_inCleanup = false;
-		m_cancelRequested = false;
-		m_failure = State::Succeeded;
-		m_failureMessage.clear();
+		m_next = m_cleanupFrom = 0;
 		m_out.clear();
 		m_outPos = 0;
+		m_stepStartMs = m_startMs = m_firstTickMs = -1.0;
+		m_estimateMs = 0.0;
+		m_streaming = m_cancelRequested = false;
+		m_result = State::Succeeded;
+		m_message.clear();
 	}
 
 	void finish(State state, const std::string &message)
 	{
 		m_status.state = state;
 		m_status.message = message;
-		m_status.progress = state == State::Succeeded ? 1.0 : m_status.progress;
-		m_steps.clear();
-		m_cleanup.clear();
+		if (state == State::Succeeded) m_status.progress = 1.0;
 	}
 
-	void fail(const std::string &message)
+	// Record the outcome (the first failure wins) and skip to the cleanup steps.
+	void stop(State state, const std::string &message)
 	{
-		if (m_inCleanup) return; // keep the first failure
-		m_onWire = false;
-		m_failure = State::Failed;
-		m_failureMessage = message;
-		enterCleanup();
-	}
-
-	void enterCleanup()
-	{
-		m_inCleanup = true;
-		m_steps = std::move(m_cleanup);
-		m_cleanup.clear();
-		m_next = 0;
-		m_stepStartMs = -1.0;
-		if (!m_steps.empty()) m_status.phase = "Restoring memory protect";
-	}
-
-	void stepDone(double weight)
-	{
-		m_doneWeight += weight;
-		++m_next;
-		m_stepStartMs = -1.0;
-	}
-
-	void setProgress(double partial)
-	{
-		if (m_totalWeight > 0.0)
-			m_status.progress = std::clamp((m_doneWeight + partial) / m_totalWeight, 0.0, 0.99);
+		if (m_result == State::Succeeded) { m_result = state; m_message = message; }
+		if (m_next < m_cleanupFrom) { m_next = m_cleanupFrom; m_stepStartMs = -1.0; }
 	}
 
 	// Stream m_out to the synth. Returns true once it has drained into the UART.
@@ -577,13 +550,49 @@ private:
 		return true;
 	}
 
-	// Run the current step; false when it must wait for a later tick.
+	Reply awaitReply(SysexPort &port, const Step &step)
+	{
+		std::vector<std::uint8_t> reply;
+		while (port.popReply(reply))
+		{
+			if (step.kind == Step::Kind::AwaitAck)
+			{
+				switch (reply[4])
+				{
+					case 0x23: return Reply::Arrived;
+					case 0x24:
+					{
+						const int code = reply.size() > 6 ? reply[5] & 7 : 0;
+						stop(State::Failed, code == 1 ? "The synth refused the data: program memory is protected."
+							: code == 2 ? "The synth refused the data: pattern memory is protected."
+							: "The synth reported a data load error.");
+						return Reply::Stopped;
+					}
+					case 0x26:
+						stop(State::Failed, "The synth rejected the data as badly formatted.");
+						return Reply::Stopped;
+					default: continue;
+				}
+			}
+			if (!matches(reply, step)) continue;
+			if (step.kind == Step::Kind::AwaitGlobal)
+			{
+				std::optional<Dump> current = parse(reply);
+				if (!current) { stop(State::Failed, "The synth sent an unreadable global dump."); return Reply::Stopped; }
+				m_currentGlobal = std::move(current->raw);
+			}
+			else m_exported = std::move(reply);
+			return Reply::Arrived;
+		}
+		return Reply::Waiting;
+	}
+
+	// Run the current step; true when it finished (or the transfer jumped to cleanup).
 	bool advance(SysexPort &port, double nowMs)
 	{
 		if (m_next >= m_steps.size())
 		{
-			if (!m_inCleanup && !m_cleanup.empty()) { enterCleanup(); return true; }
-			if (m_failure != State::Succeeded) finish(m_failure, m_failureMessage);
+			if (m_result != State::Succeeded) finish(m_result, m_message);
 			else finish(State::Succeeded, m_exported.empty() ? "Import complete" : "Export complete");
 			return false;
 		}
@@ -591,106 +600,36 @@ private:
 		if (m_stepStartMs < 0)
 		{
 			m_stepStartMs = nowMs;
-			m_out.clear();
-			m_outPos = 0;
-			switch (step.kind)
-			{
-				case Step::Kind::Request: m_out = request(step.unit, step.index, port.channel()); break;
-				case Step::Kind::Send:
-					m_out = globalParameter(step.index, step.value, port.channel());
-					break;
-				case Step::Kind::SendDump:
-				{
-					Dump &dump = m_dumps[step.dump];
-					preserveGlobalMidi(dump, m_currentGlobal);
-					m_out = build(dump, port.channel());
-					m_status.phase = "Sending " + label(dump);
-					break;
-				}
-				case Step::Kind::AwaitDump: m_status.phase = "Receiving " + label(Dump{step.unit, step.index, {}}); break;
-				case Step::Kind::AwaitAck: break;
-				case Step::Kind::AwaitGlobal: m_status.phase = "Reading current global settings"; break;
-				case Step::Kind::Wait: break;
-			}
+			if (!step.phase.empty()) m_status.phase = step.phase;
+			if (step.kind == Step::Kind::Send) { m_out = step.message(port.channel()); m_outPos = 0; }
 		}
-		const double elapsed = nowMs - m_stepStartMs;
 		switch (step.kind)
 		{
-			case Step::Kind::Request:
 			case Step::Kind::Send:
 				if (!stream(port)) return false;
-				stepDone(0.0);
-				return true;
-			case Step::Kind::SendDump:
-				setProgress(std::min(step.weight, elapsed * kUartBytesPerMs));
-				if (!stream(port)) return false;
-				// The stream has handed the dump to the UART queue; it is still on the wire.
-				m_sendRemainingMs = std::max(0.0, double(m_out.size()) / kUartBytesPerMs - elapsed);
-				stepDone(0.0);
-				m_onWire = true;
-				m_wireStartMs = nowMs;
-				m_wireWeight = step.weight;
-				m_wireStartedWeight = std::min(step.weight, elapsed * kUartBytesPerMs);
-				return true;
+				break;
+			case Step::Kind::Pause:
+				if (nowMs - m_stepStartMs < step.ms) return false;
+				break;
 			case Step::Kind::AwaitDump:
 			case Step::Kind::AwaitGlobal:
-			{
-				std::vector<std::uint8_t> reply;
-				while (port.popReply(reply))
-				{
-					if (!matches(reply, step)) continue;
-					if (step.kind == Step::Kind::AwaitGlobal)
-					{
-						std::optional<Dump> current = parse(reply);
-						if (!current) { fail("The synth sent an unreadable global dump."); return true; }
-						m_currentGlobal = current->raw;
-					}
-					else m_exported = std::move(reply);
-					stepDone(step.weight);
-					return true;
-				}
-				if (step.kind == Step::Kind::AwaitDump)
-					setProgress(std::min(step.weight * 0.99, elapsed * kUartBytesPerMs));
-				if (elapsed > step.timeoutMs)
-				{
-					fail("The synth did not send the requested data.");
-					return true;
-				}
-				return false;
-			}
 			case Step::Kind::AwaitAck:
 			{
-				const double wire = m_wireStartedWeight + (nowMs - m_wireStartMs) * kUartBytesPerMs;
-				setProgress(std::min(m_wireWeight * 0.99, wire));
-				std::vector<std::uint8_t> reply;
-				while (port.popReply(reply))
+				const Reply r = awaitReply(port, step);
+				if (r == Reply::Stopped) return true;
+				if (r == Reply::Waiting)
 				{
-					if (reply.size() < 6) continue;
-					const std::uint8_t f = reply[4];
-					if (f == 0x23) { m_onWire = false; m_doneWeight += m_wireWeight; stepDone(0.0); return true; }
-					if (f == 0x24)
-					{
-						const int code = reply.size() > 6 ? reply[5] & 7 : 0;
-						fail(code == 1 ? "The synth refused the data: program memory is protected."
-							: code == 2 ? "The synth refused the data: pattern memory is protected."
-							: "The synth reported a data load error.");
-						return true;
-					}
-					if (f == 0x26) { fail("The synth rejected the data as badly formatted."); return true; }
-				}
-				if (elapsed > step.timeoutMs + m_sendRemainingMs)
-				{
-					fail("The synth did not confirm the load.");
+					if (nowMs - m_stepStartMs <= step.ms) return false;
+					stop(State::Failed, step.kind == Step::Kind::AwaitAck ? "The synth did not confirm the load."
+						: "The synth did not send the requested data.");
 					return true;
 				}
-				return false;
+				break;
 			}
-			case Step::Kind::Wait:
-				if (elapsed < step.timeoutMs) return false;
-				stepDone(0.0);
-				return true;
 		}
-		return false;
+		++m_next;
+		m_stepStartMs = -1.0;
+		return true;
 	}
 
 	static bool matches(const std::vector<std::uint8_t> &reply, const Step &step)
@@ -712,17 +651,14 @@ private:
 	}
 
 	Status m_status;
-	std::vector<Step> m_steps, m_cleanup;
+	std::vector<Step> m_steps;
 	std::vector<Dump> m_dumps;
 	std::vector<std::uint8_t> m_exported, m_currentGlobal, m_out;
-	std::size_t m_next = 0, m_outPos = 0;
-	double m_stepStartMs = -1.0, m_firstTickMs = -1.0;
-	double m_doneWeight = 0.0, m_totalWeight = 0.0;
-	double m_sendRemainingMs = 0.0, m_wireStartMs = 0.0, m_wireWeight = 0.0, m_wireStartedWeight = 0.0;
-	bool m_started = false, m_streaming = false, m_onWire = false, m_inCleanup = false;
-	bool m_cancelRequested = false;
-	State m_failure = State::Succeeded;
-	std::string m_failureMessage;
+	std::size_t m_next = 0, m_cleanupFrom = 0, m_outPos = 0;
+	double m_stepStartMs = -1.0, m_startMs = -1.0, m_firstTickMs = -1.0, m_estimateMs = 0.0;
+	bool m_streaming = false, m_cancelRequested = false;
+	State m_result = State::Succeeded; // outcome so far; cleanup still runs after a failure
+	std::string m_message;
 };
 
 } // namespace prophecy::sysex

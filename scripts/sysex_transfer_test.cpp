@@ -245,6 +245,9 @@ int main()
 		check(all.raw[kGlobalChannelOffset] == 9 && all.raw[kGlobalSysexOffset] == 0x02
 			&& all.raw[kGlobalProtectOffset] == 0 && all.raw[0] == samples[7].raw[0], "preserve global MIDI");
 		check(programSlot(0) == "A00" && programSlot(127) == "B63", "slot names");
+		for (const auto &[unit, key] : kUnitKeys)
+			check(unitFromKey(unitKey(unit)) == unit, "unit key round trip");
+		check(!unitFromKey("bogus"), "unknown unit key");
 	}
 
 	// Export every unit from the simulated synth.

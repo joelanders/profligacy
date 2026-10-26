@@ -1047,23 +1047,6 @@ void ProphecyAudioProcessor::sendArpeggioPatternData(int pattern, const std::vec
 //============================================================
 //  SysEx file transfer
 //============================================================
-static juce::String unitKey(prophecy::sysex::Unit unit)
-{
-	using prophecy::sysex::Unit;
-	switch (unit)
-	{
-		case Unit::CurrentProgram: return "current";
-		case Unit::Program:        return "program";
-		case Unit::Bank:           return "bank";
-		case Unit::AllPrograms:    return "allPrograms";
-		case Unit::Pattern:        return "pattern";
-		case Unit::AllPatterns:    return "allPatterns";
-		case Unit::Global:         return "global";
-		case Unit::AllData:        return "allData";
-	}
-	return {};
-}
-
 bool ProphecyAudioProcessor::startSysexExport(prophecy::sysex::Unit unit, int index, const juce::File &dest)
 {
 	return m_sysexTransfer.startExport(unit, index, dest);
@@ -1098,7 +1081,7 @@ juce::var ProphecyAudioProcessor::prepareSysexImport(const juce::File &file)
 			continue;
 		}
 		auto *item = new juce::DynamicObject();
-		item->setProperty("unit", unitKey(dump->unit));
+		item->setProperty("unit", juce::String(prophecy::sysex::unitKey(dump->unit)));
 		item->setProperty("index", dump->index);
 		item->setProperty("label", juce::String(prophecy::sysex::label(*dump)));
 		items.add(juce::var(item));
@@ -2022,17 +2005,10 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 			.withNativeFunction("sysexExport",
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
 				{
-					using prophecy::sysex::Unit;
-					const juce::String key = args.size() > 0 ? args[0].toString() : juce::String();
+					const auto chosen = prophecy::sysex::unitFromKey(
+						(args.size() > 0 ? args[0].toString() : juce::String()).toStdString());
 					const int index = args.size() > 1 ? (int) args[1] : 0;
 					const juce::String suggested = args.size() > 2 ? args[2].toString() : juce::String("Prophecy");
-					const std::pair<const char *, Unit> units[] = {
-						{"current", Unit::CurrentProgram}, {"program", Unit::Program}, {"bank", Unit::Bank},
-						{"allPrograms", Unit::AllPrograms}, {"pattern", Unit::Pattern},
-						{"allPatterns", Unit::AllPatterns}, {"global", Unit::Global}, {"allData", Unit::AllData}};
-					std::optional<Unit> chosen;
-					for (const auto &[name, u] : units)
-						if (key == name) chosen = u;
 					if (!chosen) { complete(juce::var(false)); return; }
 					const juce::File start = m_proc.sysexDirectory()
 						.getChildFile(juce::File::createLegalFileName(suggested) + ".syx");
