@@ -25,6 +25,14 @@ if(WIN32)
 		OUTPUT_VARIABLE _global_symbols
 		ERROR_VARIABLE _nm_error
 		RESULT_VARIABLE _nm_rc)
+elseif(NOT APPLE)
+	# GNU nm: -U is not "defined only" in older binutils (2.40 lists no kprop_*
+	# symbols with it), so spell it out.
+	execute_process(
+		COMMAND nm -g --defined-only "${_driver_archive}"
+		OUTPUT_VARIABLE _global_symbols
+		ERROR_VARIABLE _nm_error
+		RESULT_VARIABLE _nm_rc)
 else()
 	execute_process(
 		COMMAND nm -gU "${_driver_archive}"

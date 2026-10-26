@@ -17,6 +17,7 @@ MAME_DIR="${MAME_DIR:-$ROOT_DIR/extern/mame}"
 # MAME names its output directory after the host toolchain. On Linux the
 # archives are linked into the VST3 shared object, so they must be PIC.
 EXTRA_MAKE_ARGS=()
+DEFAULT_JOBS=16
 case "$(uname -s)" in
 	Darwin)
 		MAME_TOOLCHAIN_DIR=osx_clang ;;
@@ -28,7 +29,15 @@ case "$(uname -s)" in
 			exit 1
 		fi
 		MAME_TOOLCHAIN_DIR=linux_gcc
-		EXTRA_MAKE_ARGS+=("ARCHOPTS=-fPIC") ;;
+		EXTRA_MAKE_ARGS+=("ARCHOPTS=-fPIC")
+		# MAME's emumem_* files need ~1.5 GB per cc1plus, and an OOM-killed compile
+		# can leave an empty .o that make later treats as up to date. Default to
+		# one job per 2 GB of RAM, capped at the CPU count.
+		mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+		DEFAULT_JOBS=$(( mem_kb / (2 * 1024 * 1024) ))
+		cpus="$(nproc)"
+		if (( DEFAULT_JOBS > cpus )); then DEFAULT_JOBS=$cpus; fi
+		if (( DEFAULT_JOBS < 1 )); then DEFAULT_JOBS=1; fi ;;
 	*)
 		echo "error: unsupported host $(uname -s); use the Windows build docs" >&2
 		exit 1 ;;
@@ -50,7 +59,7 @@ export PATH="$SHIMDIR:$PATH"
 
 # korgprophecy_build.sh recognizes --regen only as its first argument. Preserve
 # the caller's option ordering; make variable assignments remain valid after it.
-(cd "$MAME_DIR" && JOBS="${JOBS:-16}" ./scripts/korgprophecy_build.sh "$@" ${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"} PYTHON_EXECUTABLE="$PYBIN")
+(cd "$MAME_DIR" && JOBS="${JOBS:-$DEFAULT_JOBS}" ./scripts/korgprophecy_build.sh "$@" ${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"} PYTHON_EXECUTABLE="$PYBIN")
 
 REV="$(git -C "$MAME_DIR" rev-parse HEAD)"
 DIRTY=""
