@@ -186,6 +186,29 @@ public:
 	std::size_t latestArpeggioPatternData(std::uint8_t *out, std::size_t cap,
 		std::uint32_t *version, int *pattern) const;
 
+	// SysEx file transfer, both directions. Message thread only.
+	//
+	// Complete Prophecy dumps and load/write acknowledgements the firmware transmits
+	// (functions 40, 4C, 50, 51, 69, 21-24, 26) are queued whole, independent of
+	// popMidiTx(), whose 4 KB ring cannot hold a bank or all-data dump. The queue keeps
+	// the newest 32 messages. popSysexReply() returns false when it is empty.
+	void clearSysexReplies();
+	bool popSysexReply(std::vector<std::uint8_t> &out);
+	// Exclusive input stream for dumps larger than the immediate MIDI queue. While a
+	// stream is open the UART is fed only from it, so host or editor MIDI cannot land
+	// inside the dump; other input waits and resumes after closeSysexStream(). The
+	// stream engages only between complete messages already queued elsewhere.
+	// pushSysexStream() accepts as many bytes as currently fit and returns that count;
+	// sysexStreamPending() is the number not yet handed to the UART. Close the stream
+	// only once a complete message (through F7) has drained.
+	bool openSysexStream();
+	std::size_t pushSysexStream(const std::uint8_t *bytes, std::size_t n);
+	std::size_t sysexStreamPending() const;
+	void closeSysexStream();
+	// Global MIDI channel (0..15) from the firmware's identity reply during startup;
+	// Korg SysEx headers address the synth as 0x30 | channel. 0 until identified.
+	int firmwareChannel() const;
+
 	std::size_t available() const;       // frames currently buffered
 	std::size_t ringFrames() const;      // ring capacity in frames (~ steady-state latency)
 	std::uint64_t producedFrames() const; // total frames MAME has emitted

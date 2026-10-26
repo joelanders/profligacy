@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <mutex>
 #include <string>
@@ -206,7 +207,7 @@ std::atomic<bool> g_engine_active{false};
 class MidiRing
 {
 public:
-	void push(const uint8_t *p, size_t n)
+	size_t push(const uint8_t *p, size_t n)
 	{
 		const size_t t = m_tail.load(std::memory_order_relaxed);
 		const size_t h = m_head.load(std::memory_order_acquire);
@@ -214,6 +215,11 @@ public:
 		if (n > space) n = space; // drop on overflow (MIDI is low-rate; should not happen)
 		for (size_t i = 0; i < n; i++) m_buf[(t + i) & (CAP - 1)] = p[i];
 		m_tail.store(t + n, std::memory_order_release);
+		return n;
+	}
+	size_t size() const
+	{
+		return m_tail.load(std::memory_order_acquire) - m_head.load(std::memory_order_acquire);
 	}
 	size_t pop(uint8_t *out, size_t cap)
 	{
@@ -259,6 +265,10 @@ MidiRing g_host_midi_ring;     // host -> emulated UART (RX)
 MidiRing g_initialization_midi_ring; // non-realtime initialization -> UART
 std::atomic<bool> g_playback_input_enabled{true};
 MidiRing g_host_midi_tx_ring;  // emulated UART -> host (TX: patch dumps, param echoes)
+// Exclusive SysEx file-import stream (message thread -> UART). The requested flag is
+// the producer's; engagement is decided on the MAME thread in host_midi_pop_impl.
+MidiRing g_host_sysex_stream_ring;
+std::atomic<bool> g_host_sysex_stream_requested{false};
 MidiRing g_host_panel_ring;    // host -> panel scan matrix: (row, bit, len_ms lo, len_ms hi) records
 MidiRing g_host_adin_ui_ring;  // message thread -> ADIN mux: (source, value) records
 MidiRing g_host_adin_rt_ring;  // audio thread -> ADIN mux: (source, value) records
@@ -569,6 +579,53 @@ private:
 
 ArpeggioPatternDumpStore g_arpeggio_pattern_dump_store;
 
+// Complete Prophecy dumps and acknowledgements for SysEx file export/import. Stored
+// whole because a bank or all-data dump (~45-90 KB) cannot pass through the 4 KB TX
+// ring. Bounded: the editor's routine current-program read-back also lands here.
+class SysexReplyQueue
+{
+public:
+	static bool wanted(const std::uint8_t *bytes, std::size_t n)
+	{
+		if (n < 6 || bytes[0] != 0xF0 || bytes[1] != 0x42 || (bytes[2] & 0xF0) != 0x30
+				|| bytes[3] != 0x41 || bytes[n - 1] != 0xF7)
+			return false;
+		switch (bytes[4])
+		{
+			case 0x40: case 0x4C: case 0x50: case 0x51: case 0x69:
+			case 0x21: case 0x22: case 0x23: case 0x24: case 0x26:
+				return true;
+			default:
+				return false;
+		}
+	}
+	void push(const std::uint8_t *bytes, std::size_t n)
+	{
+		std::lock_guard<std::mutex> lk(m_mu);
+		if (m_queue.size() >= kCapacity) m_queue.pop_front();
+		m_queue.emplace_back(bytes, bytes + n);
+	}
+	bool pop(std::vector<std::uint8_t> &out)
+	{
+		std::lock_guard<std::mutex> lk(m_mu);
+		if (m_queue.empty()) return false;
+		out = std::move(m_queue.front());
+		m_queue.pop_front();
+		return true;
+	}
+	void reset()
+	{
+		std::lock_guard<std::mutex> lk(m_mu);
+		m_queue.clear();
+	}
+private:
+	static constexpr std::size_t kCapacity = 32;
+	std::mutex m_mu;
+	std::deque<std::vector<std::uint8_t>> m_queue;
+};
+
+SysexReplyQueue g_sysex_reply_queue;
+
 // Korg 7-in-8 unpack: each group is a high-bits byte followed by up to 7 low-7-bit bytes.
 std::vector<std::uint8_t> korg_unpack(const std::uint8_t *p, std::size_t len)
 {
@@ -643,11 +700,36 @@ static void host_led_impl(uint8_t bank, uint8_t data)
 	g_host_led_store.set(bank, data);
 }
 
+// MAME thread only. The driver drains this in a loop until it returns false, and every
+// message in the host rings is enqueued whole, so at the start of a drain cycle all
+// bytes already handed to the UART form complete messages. The SysEx stream engages
+// only there, which keeps it from splitting a message popped across two calls.
+static bool g_host_midi_cycle_start = true;
+static bool g_host_sysex_stream_engaged = false;
+
 static bool host_midi_pop_impl(uint8_t *out, size_t cap, size_t *n, double emu_seconds)
 {
 	*n = g_initialization_midi_ring.pop(out, cap);
 	if (*n != 0) return true;
-	if (!g_playback_input_enabled.load(std::memory_order_acquire)) return false;
+	if (!g_playback_input_enabled.load(std::memory_order_acquire))
+	{
+		g_host_midi_cycle_start = true;
+		return false;
+	}
+	const bool streamRequested = g_host_sysex_stream_requested.load(std::memory_order_acquire);
+	if (!g_host_sysex_stream_engaged && streamRequested && g_host_midi_cycle_start)
+		g_host_sysex_stream_engaged = true;
+	if (g_host_sysex_stream_engaged)
+	{
+		*n = g_host_sysex_stream_ring.pop(out, cap);
+		if (*n == 0 && !streamRequested)
+			g_host_sysex_stream_engaged = false; // closed and drained: resume other input
+		else
+		{
+			g_host_midi_cycle_start = *n == 0;
+			return *n > 0;
+		}
+	}
 	*n = g_host_midi_ring.pop(out, cap);
 	if (*n == 0)
 	{
@@ -655,12 +737,15 @@ static bool host_midi_pop_impl(uint8_t *out, size_t cap, size_t *n, double emu_s
 			emu_seconds * (double)ProphecyEngine::kSampleRate);
 		*n = g_host_timed_midi_ring.popDue(out, cap, frame);
 	}
+	g_host_midi_cycle_start = *n == 0;
 	return *n > 0;
 }
 
 static void host_midi_tx_impl(const uint8_t *bytes, size_t n)
 {
 	g_host_midi_tx_ring.push(bytes, n);
+	if (SysexReplyQueue::wanted(bytes, n))
+		g_sysex_reply_queue.push(bytes, n);
 	if (n == 15 && bytes[0] == 0xf0 && bytes[1] == 0x7e && bytes[3] == 6
 		&& bytes[4] == 2 && bytes[5] == 0x42 && bytes[6] == 0x41 && bytes[7] == 0
 		&& bytes[8] == 1 && bytes[9] == 0 && bytes[14] == 0xf7)
@@ -995,6 +1080,11 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 	g_initialization_midi_ring.reset();
 	g_playback_input_enabled.store(!m_impl->host_timeline, std::memory_order_release);
 	g_host_midi_tx_ring.reset();
+	g_host_sysex_stream_ring.reset();
+	g_host_sysex_stream_requested.store(false, std::memory_order_release);
+	g_host_sysex_stream_engaged = false; // the new machine's MAME thread has not started
+	g_host_midi_cycle_start = true;
+	g_sysex_reply_queue.reset();
 	g_host_panel_ring.reset();
 	g_host_adin_ui_ring.reset();
 	g_host_adin_rt_ring.reset();
@@ -1436,6 +1526,49 @@ std::size_t ProphecyEngine::popMidiTx(std::uint8_t *out, std::size_t cap)
 {
 	if (!ownsMachineSlot()) return 0;
 	return g_host_midi_tx_ring.pop(out, cap);
+}
+
+void ProphecyEngine::clearSysexReplies()
+{
+	if (ownsMachineSlot()) g_sysex_reply_queue.reset();
+}
+
+bool ProphecyEngine::popSysexReply(std::vector<std::uint8_t> &out)
+{
+	if (!ownsMachineSlot()) return false;
+	return g_sysex_reply_queue.pop(out);
+}
+
+bool ProphecyEngine::openSysexStream()
+{
+	if (!ownsMachineSlot() || g_host_sysex_stream_requested.load(std::memory_order_acquire))
+		return false;
+	// No reset: the MAME thread may still be polling, and a closed stream has drained.
+	g_host_sysex_stream_requested.store(true, std::memory_order_release);
+	return true;
+}
+
+std::size_t ProphecyEngine::pushSysexStream(const std::uint8_t *bytes, std::size_t n)
+{
+	if (!ownsMachineSlot() || !g_host_sysex_stream_requested.load(std::memory_order_acquire)
+			|| bytes == nullptr)
+		return 0;
+	return g_host_sysex_stream_ring.push(bytes, n);
+}
+
+std::size_t ProphecyEngine::sysexStreamPending() const
+{
+	return g_host_sysex_stream_ring.size();
+}
+
+void ProphecyEngine::closeSysexStream()
+{
+	g_host_sysex_stream_requested.store(false, std::memory_order_release);
+}
+
+int ProphecyEngine::firmwareChannel() const
+{
+	return g_firmware_channel.load(std::memory_order_acquire);
 }
 
 std::size_t ProphecyEngine::popMidiTxByteEvents(MidiTxByteEvent *out, std::size_t cap)
