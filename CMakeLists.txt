@@ -83,6 +83,10 @@ endif()
 if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
+if(UNIX AND NOT APPLE)
+	# prophecy_engine (and the MAME archives) end up inside the VST3 shared object.
+	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # ---------------------------------------------------------------------------
 # MAME: the fork submodule, built once (see README). We only link its archives.
@@ -95,8 +99,17 @@ if(WIN32)
 	set(MAME_LIB_SUFFIX ".lib")
 	set(MAME_OSD_LIBS libocore_windows.lib libosd_windows.lib libqtdbg_windows.lib)
 else()
-	set(MAME_BIN "${MAME_DIR}/build/osx_clang/bin/x64/Release")
-	set(MAME_OBJ "${MAME_DIR}/build/osx_clang/obj/x64/Release")
+	# MAME names its build directory after the host toolchain (see
+	# scripts/build_mame_core.sh).
+	if(APPLE)
+		set(_mame_toolchain_default osx_clang)
+	else()
+		set(_mame_toolchain_default linux_gcc)
+	endif()
+	set(MAME_TOOLCHAIN_DIR "${_mame_toolchain_default}" CACHE STRING
+		"MAME build/<dir> holding the archives (osx_clang, linux_gcc)")
+	set(MAME_BIN "${MAME_DIR}/build/${MAME_TOOLCHAIN_DIR}/bin/x64/Release")
+	set(MAME_OBJ "${MAME_DIR}/build/${MAME_TOOLCHAIN_DIR}/obj/x64/Release")
 	set(MAME_LIB_SUFFIX ".a")
 	set(MAME_OSD_LIBS libosd_sdl.a libqtdbg_sdl.a libocore_sdl.a)
 endif()
@@ -139,8 +152,15 @@ add_custom_target(check_mame_host_abi
 	COMMENT "checking MAME archives export the prophecy-plugin host ABI"
 	VERBATIM)
 
-if(NOT WIN32)
+if(APPLE)
 	set(SDL_PREFIX "/opt/homebrew" CACHE PATH "SDL2 static install prefix")
+elseif(NOT WIN32)
+	find_package(PkgConfig REQUIRED)
+	pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+	# The rest of MAME's own Linux propmin link line (the SDL OSD's PulseAudio,
+	# X11 and font code).
+	pkg_check_modules(MAME_OSD_DEPS REQUIRED IMPORTED_TARGET
+		libpulse x11 xinerama xext xi SDL2_ttf fontconfig freetype2)
 endif()
 endif()
 
@@ -167,20 +187,27 @@ target_include_directories(prophecy_engine
 		${MAME_DIR}/src/osd/modules ${MAME_DIR}/src/osd/modules/file)
 if(WIN32)
 	target_include_directories(prophecy_engine PRIVATE ${MAME_DIR}/src/osd/windows)
-else()
+elseif(APPLE)
 	target_include_directories(prophecy_engine PRIVATE
 		${MAME_DIR}/src/osd/sdl ${SDL_PREFIX}/include ${SDL_PREFIX}/include/SDL2)
+else()
+	target_include_directories(prophecy_engine PRIVATE ${MAME_DIR}/src/osd/sdl)
 endif()
 
 target_compile_definitions(prophecy_engine PRIVATE NDEBUG CRLF=2 LSB_FIRST FLAC__NO_DLL
 	PUGIXML_HEADER_ONLY ASMJIT_STATIC LUA_COMPAT_ALL LUA_COMPAT_5_1 LUA_COMPAT_5_2
-	USE_NETWORK OSD_NET_USE_PCAP)
+	USE_NETWORK)
 if(WIN32)
-	target_compile_definitions(prophecy_engine PRIVATE SDLMAME_WIN32 OSD_WINDOWS)
-else()
-	target_compile_definitions(prophecy_engine PRIVATE SDLMAME_NO_X11 USE_XINPUT=0
+	target_compile_definitions(prophecy_engine PRIVATE OSD_NET_USE_PCAP SDLMAME_WIN32 OSD_WINDOWS)
+elseif(APPLE)
+	target_compile_definitions(prophecy_engine PRIVATE OSD_NET_USE_PCAP SDLMAME_NO_X11 USE_XINPUT=0
 		USE_XINPUT_WII_LIGHTGUN_HACK=0 SDLMAME_SDL2=1 OSD_SDL SDLMAME_UNIX
 		MACOSX_USE_LIBSDL SDLMAME_MACOSX SDLMAME_DARWIN _THREAD_SAFE)
+else()
+	# Mirrors the osd_sdl defines MAME's Linux genie project uses.
+	target_compile_definitions(prophecy_engine PRIVATE OSD_NET_USE_TAPTUN SDLMAME_X11 USE_XINPUT=1
+		USE_XINPUT_DEBUG=0 USE_XINPUT_WII_LIGHTGUN_HACK=0 SDLMAME_SDL2=1 OSD_SDL SDLMAME_UNIX
+		USE_OPENGL=0)
 endif()
 
 if(NOT MSVC)
@@ -236,6 +263,11 @@ if(WIN32)
 		user32 advapi32 wsock32 ws2_32 iphlpapi shell32 userenv setupapi opengl32
 		gdi32 dsound dxguid oleaut32 winmm bcrypt comctl32 comdlg32 dinput8 ole32
 		propsys psapi shcore shlwapi uuid kernel32 winspool odbc32 odbccp32)
+elseif(NOT APPLE)
+	# MAME's archives reference each other cyclically; its own link wraps them in a group.
+	target_link_libraries(prophecy_engine PUBLIC
+		${MAME_OBJECTS} "-Wl,--start-group" ${MAME_ARCHIVES} "-Wl,--end-group"
+		PkgConfig::SDL2 PkgConfig::MAME_OSD_DEPS dl rt m pthread util)
 else()
 	target_link_libraries(prophecy_engine PUBLIC
 		${MAME_OBJECTS} ${MAME_ARCHIVES}
@@ -310,9 +342,14 @@ option(PROPHECY_COPY_PLUGIN_AFTER_BUILD
 if(WIN32)
 	set(PROPHECY_PLUGIN_FORMATS VST3 Standalone)
 	set(PROPHECY_WEBVIEW2_TARGET_ARGS NEEDS_WEBVIEW2 TRUE)
-else()
+elseif(APPLE)
 	set(PROPHECY_PLUGIN_FORMATS AU VST3 Standalone)
 	set(PROPHECY_WEBVIEW2_TARGET_ARGS)
+else()
+	set(PROPHECY_PLUGIN_FORMATS VST3 Standalone)
+	# On Linux JUCE only adds the WebKitGTK/GTK flags the editor's web view needs
+	# when the target asks for them; JUCE_WEB_BROWSER=1 alone is not enough.
+	set(PROPHECY_WEBVIEW2_TARGET_ARGS NEEDS_WEB_BROWSER TRUE)
 endif()
 
 juce_add_plugin(ProphecyPlugin

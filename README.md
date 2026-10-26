@@ -75,6 +75,27 @@ The original panel is quite button-driven. It's a bit nicer in the real hardware
 
 I can test macOS on ARM and Intel processors (currently not building a release for macOS/x64; let me know if you want it). A couple alpha testers have it running on Windows/x64.
 
+Linux/x64 builds from source (VST3 and Standalone; there is no Linux release yet). Tested on Ubuntu 25.10 with gcc 15, and by [@eufex](https://github.com/joelanders/profligacy/issues/23) on Debian 12 with gcc 12 (VST3 in Ardour, REAPER, Bespoke Synth and Carla):
+
+```sh
+sudo apt install build-essential cmake git python3 pkg-config \
+  libsdl2-dev libsdl2-ttf-dev libpulse-dev libx11-dev libxext-dev libxi-dev \
+  libxinerama-dev libxrandr-dev libxcursor-dev libxcomposite-dev \
+  libfontconfig1-dev libfreetype-dev libasound2-dev libgl-dev \
+  libgtk-3-dev libwebkit2gtk-4.1-dev
+git clone --recursive https://github.com/joelanders/profligacy && cd profligacy
+scripts/build_mame_core.sh --regen
+cmake -S . -B build && cmake --build build -j"$(nproc)"
+```
+
+The VST3 is copied to `~/.vst3` after the build (pass `-DPROPHECY_COPY_PLUGIN_AFTER_BUILD=OFF` to skip that).
+
+Linux build notes:
+
+- The MAME build needs about 2 GB of RAM per job, so `build_mame_core.sh` picks one job per 2 GB on Linux; override with `JOBS=n`. If a compile was killed for running out of memory (`Killed signal terminated program cc1plus`), it can leave an empty `.o` that `make` considers up to date and the link fails later with undefined references. Delete `extern/mame/build/linux_gcc` and rerun with `--regen`.
+- With gcc 12 (e.g. Debian 12), some MAME warnings are errors; build with `NOWERROR=1 scripts/build_mame_core.sh --regen`.
+- The binary links the system's SDL2, PulseAudio, GTK 3 and WebKitGTK, so run it on the distribution it was built on, or a newer one.
+
 ## License
 
 Profligacy's own source is distributed under the GNU Affero General Public License, version 3 only. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the full license and dependency notices.

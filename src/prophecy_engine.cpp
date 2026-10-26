@@ -60,6 +60,9 @@ static int prophecy_setenv(const char *name, const char *value, int overwrite)
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #endif
+#if defined(__linux__)
+#include <link.h>
+#endif
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -88,6 +91,19 @@ void* retain_current_module()
 			reinterpret_cast<LPCWSTR>(&retain_current_module), &module))
 		return nullptr;
 	return module;
+#elif defined(__linux__)
+	// glibc refuses to dlopen a PIE executable, so when the engine is linked into
+	// the main program (Standalone, test hosts) take the main-program handle; that
+	// image can never be unloaded anyway.
+	Dl_info info{};
+	link_map *map = nullptr;
+	if (!dladdr1(reinterpret_cast<const void*>(&retain_current_module), &info,
+			reinterpret_cast<void**>(&map), RTLD_DL_LINKMAP)
+			|| info.dli_fname == nullptr)
+		return nullptr;
+	if (map != nullptr && map->l_name != nullptr && map->l_name[0] == '\0')
+		return dlopen(nullptr, RTLD_NOW);
+	return dlopen(info.dli_fname, RTLD_NOW | RTLD_LOCAL);
 #else
 	Dl_info info{};
 	if (!dladdr(reinterpret_cast<const void*>(&retain_current_module), &info)
