@@ -18,6 +18,12 @@ if(BUILD_TESTING)
 	add_test(NAME audio_timeline COMMAND $<TARGET_FILE:ProphecyAudioTimelineTest>)
 	set_tests_properties(audio_timeline PROPERTIES TIMEOUT 30)
 
+	add_executable(ProphecySysexTransferTest scripts/sysex_transfer_test.cpp)
+	target_include_directories(ProphecySysexTransferTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+	target_compile_features(ProphecySysexTransferTest PRIVATE cxx_std_20)
+	add_test(NAME sysex_transfer COMMAND $<TARGET_FILE:ProphecySysexTransferTest>)
+	set_tests_properties(sysex_transfer PROPERTIES TIMEOUT 30)
+
 	add_executable(ProphecyLedStoreTest scripts/led_store_test.cpp)
 	target_include_directories(ProphecyLedStoreTest PRIVATE
 		${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -264,6 +270,9 @@ target_link_libraries(ProphecyConsoleHost PRIVATE prophecy_engine)
 add_executable(ProphecyMultiInstanceContractTest scripts/multi_instance_contract_test.cpp)
 target_link_libraries(ProphecyMultiInstanceContractTest PRIVATE prophecy_engine)
 add_executable(ProphecyEngineLifecycleTest scripts/engine_lifecycle_test.cpp)
+# ROM-backed SysEx export/import round trip against the real firmware (skips without ROMs).
+add_executable(ProphecySysexRoundTripTest scripts/sysex_roundtrip_test.cpp)
+target_link_libraries(ProphecySysexRoundTripTest PRIVATE prophecy_engine)
 target_link_libraries(ProphecyEngineLifecycleTest PRIVATE prophecy_engine)
 if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
 	# MAME's Windows OSD expects the Common Controls v6 activation context from
@@ -278,6 +287,8 @@ if(BUILD_TESTING)
 	add_test(NAME multi_instance_contract COMMAND $<TARGET_FILE:ProphecyMultiInstanceContractTest>)
 	add_test(NAME engine_lifecycle COMMAND $<TARGET_FILE:ProphecyEngineLifecycleTest>)
 	set_tests_properties(engine_lifecycle PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+	add_test(NAME sysex_roundtrip COMMAND $<TARGET_FILE:ProphecySysexRoundTripTest>)
+	set_tests_properties(sysex_roundtrip PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
 	set_tests_properties(multi_instance_contract PROPERTIES TIMEOUT 15)
 endif()
 
@@ -471,6 +482,24 @@ endif()
 if(BUILD_TESTING)
 	add_test(NAME plugin_rt_safety COMMAND $<TARGET_FILE:ProphecyPluginRtSafetyTest>)
 	set_tests_properties(plugin_rt_safety PROPERTIES TIMEOUT 10)
+endif()
+
+# ROM-backed SysEx file export/import through the real processor (skips without ROMs).
+add_executable(ProphecyPluginSysexTest scripts/plugin_sysex_test.cpp)
+target_include_directories(ProphecyPluginSysexTest PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/src
+	${JUCE_DIR}/modules)
+target_compile_definitions(ProphecyPluginSysexTest PRIVATE
+	JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
+target_link_libraries(ProphecyPluginSysexTest PRIVATE ProphecyPlugin)
+if(WIN32)
+	target_compile_definitions(ProphecyPluginSysexTest PRIVATE
+		JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
+	target_link_libraries(ProphecyPluginSysexTest PRIVATE juce::juce_webview2)
+endif()
+if(BUILD_TESTING)
+	add_test(NAME plugin_sysex COMMAND $<TARGET_FILE:ProphecyPluginSysexTest>)
+	set_tests_properties(plugin_sysex PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 endif()
 
 if(BUILD_TESTING AND PROPHECY_USE_FAKE_ENGINE)

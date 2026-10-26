@@ -188,6 +188,13 @@ bool ProphecyEngine::latestLcd(char *line1, char *line2, std::size_t cap) const
 }
 std::size_t ProphecyEngine::latestProgramData(std::uint8_t *, std::size_t, std::uint32_t *version) const { if (version) *version = 0; return 0; }
 std::size_t ProphecyEngine::latestArpeggioPatternData(std::uint8_t *, std::size_t, std::uint32_t *version, int *pattern) const { if (version) *version = 0; if (pattern) *pattern = -1; return 0; }
+void ProphecyEngine::clearSysexReplies() {}
+bool ProphecyEngine::popSysexReply(std::vector<std::uint8_t> &) { return false; }
+bool ProphecyEngine::openSysexStream() { return false; }
+std::size_t ProphecyEngine::pushSysexStream(const std::uint8_t *, std::size_t) { return 0; }
+std::size_t ProphecyEngine::sysexStreamPending() const { return 0; }
+void ProphecyEngine::closeSysexStream() {}
+int ProphecyEngine::firmwareChannel() const { return 0; }
 std::size_t ProphecyEngine::available() const { return running() ? ringFrames() : 0; }
 std::size_t ProphecyEngine::ringFrames() const { return 2048; }
 std::uint64_t ProphecyEngine::producedFrames() const { return m_impl->produced.load(); }

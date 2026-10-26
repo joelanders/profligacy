@@ -7,6 +7,7 @@
 #pragma once
 
 #include "audio_timeline.h"
+#include "sysex_transfer.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
@@ -201,6 +202,21 @@ public:
 		std::uint32_t *version, int *pattern) const
 	{ return m_engine.latestArpeggioPatternData(out, cap, version, pattern); }
 
+	// SysEx file transfer: export any documented dump unit to a .syx file, or load one
+	// back. One transfer at a time; progress and the outcome come from sysexStatus().
+	// Message thread only. `index` is the program (0..127), bank (0..1) or pattern (0..9).
+	bool startSysexExport(prophecy::sysex::Unit unit, int index, const juce::File &dest);
+	// Read and validate a .syx file. Returns {ok, items:[{unit, index, label}], ignored}
+	// or {ok:false, error}; the dumps wait for confirmSysexImport().
+	juce::var prepareSysexImport(const juce::File &file);
+	// `target` retargets a file holding one program (-1 = edit buffer, 0..127 = slot),
+	// one bank (0..1) or one pattern (0..9); other files load as they are.
+	bool confirmSysexImport(int target);
+	void cancelSysexTransfer() { m_sysexTransfer.cancel(); }
+	juce::var sysexStatus() const;
+	juce::File sysexDirectory() const;
+	void setSysexDirectory(const juce::File &dir);
+
 private:
 	class PerformanceParameter final : public juce::AudioParameterInt
 	{
@@ -235,6 +251,47 @@ private:
 	WriteSequence      m_writeSeq { *this };
 	std::atomic<bool>  m_writeInProgress { false };
 
+	// Drives prophecy::sysex::Transfer on the message thread and connects it to the
+	// engine's exclusive SysEx stream and reply queue.
+	class SysexFileTransfer : private juce::Timer, public prophecy::sysex::SysexPort
+	{
+	public:
+		explicit SysexFileTransfer(ProphecyAudioProcessor &p) : m_proc(p) {}
+		~SysexFileTransfer() override { stopTimer(); }
+		bool startExport(prophecy::sysex::Unit unit, int index, const juce::File &dest);
+		bool startImport(std::vector<prophecy::sysex::Dump> dumps, const juce::String &what);
+		void cancel() { m_transfer.cancel(); }
+		bool busy() const { return m_transfer.busy(); }
+		juce::var status() const;
+	private:
+		void timerCallback() override;
+		bool ready() override;
+		int channel() override { return m_proc.m_engine.firmwareChannel(); }
+		bool openStream() override { return m_proc.m_engine.openSysexStream(); }
+		std::size_t pushStream(const std::uint8_t *b, std::size_t n) override
+		{ return m_proc.m_engine.pushSysexStream(b, n); }
+		std::size_t streamPending() override { return m_proc.m_engine.sysexStreamPending(); }
+		void closeStream() override { m_proc.m_engine.closeSysexStream(); }
+		bool popReply(std::vector<std::uint8_t> &out) override { return m_proc.m_engine.popSysexReply(out); }
+		void clearReplies() override { m_proc.m_engine.clearSysexReplies(); }
+		ProphecyAudioProcessor &m_proc;
+		prophecy::sysex::Transfer m_transfer;
+		juce::File m_dest;          // export target
+		juce::String m_what;        // label for the final message
+		juce::String m_finalMessage;
+		bool m_finalOk = false;
+		bool m_reported = true;     // final status already settled
+	};
+	SysexFileTransfer  m_sysexTransfer { *this };
+	std::vector<prophecy::sysex::Dump> m_pendingImport;
+	juce::String       m_pendingImportName;
+	// Program names learned from SysEx transfers this session. The sysram file only
+	// changes when MAME exits, so these keep the browser current after an import.
+	std::array<juce::String, kProgramCount> m_programNameOverrides;
+	std::array<bool, kProgramCount> m_hasProgramNameOverride {};
+	void learnProgramNames(const prophecy::sysex::Dump &dump);
+	juce::StringArray sysramPatchNames() const;
+
 	// Paced param-burst sender: the firmware drops sysex messages that arrive
 	// back-to-back at line rate while it is busy (verified: mid-burst rename chars
 	// lost with a Motion patch in the edit buffer). One param per tick, the way a
@@ -259,6 +316,7 @@ private:
 			m_next = 0;
 			return wasRunning;
 		}
+		bool running() const { return isTimerRunning(); }
 	private:
 		void timerCallback() override
 		{

@@ -21,7 +21,9 @@ nonzero if a control escapes its row, grid items overlap, a non-scrollable row
 overflows, or visible Edit-view text ignores the requested scale.
 
 States: default (hardware panel, A00) / browser (patch list open) / b52
-(scripted drive: open browser, click B52, resync) / norom / nonames / matrix /
+(scripted drive: open browser, click B52, resync) / sysexmenu / sysexrow /
+sysexconfirm / sysexprogress (SysEx file menu, import confirmation, transfer
+progress) / norom / nonames / matrix /
 route / fixed / material / program / oscillator / wave / amplifier /
 arp / arpedit / global
 (see STATES below for each).
@@ -93,6 +95,17 @@ const INTERACTIVE_PREVIEW = __HARNESS_PREVIEW__;
       }
       else if (fn === "setPatternParam" || fn === "setArpControl" || fn === "sendArpPatternData") { console.log(fn, JSON.stringify(params)); }
       else if (fn === "setGlobalParam") { console.log("setGlobalParam", JSON.stringify(params)); }
+      // SysEx files: a canned bank-file summary and a transfer that takes six seconds.
+      else if (fn === "sysexExport") { MOCK.sx = {start: Date.now(), phase: "Receiving Bank A", done: "Saved Bank A to Prophecy Bank A.syx"}; result = true; }
+      else if (fn === "sysexImport") result = {ok: true, file: "Prophecy Bank A.syx", ignored: 1,
+        items: [{unit: "bank", index: 0, label: "Bank A"}]};
+      else if (fn === "sysexImportConfirm") { MOCK.sx = {start: Date.now(), phase: "Sending Bank A", done: "Loaded Bank A from Prophecy Bank A.syx"}; result = true; }
+      else if (fn === "sysexStatus") {
+        const sx = MOCK.sx, p = sx ? (Date.now() - sx.start) / 6000 : 0;
+        result = !sx ? {state: "idle"} : p < 1 ? {state: "running", phase: sx.phase, progress: p}
+          : {state: "succeeded", message: sx.done};
+      }
+      else if (fn === "sysexCancel") { MOCK.sx = null; }
       setTimeout(() => (listeners["__juce__complete"]||[]).forEach(f => f({promiseId: resultId, result})), 5);
     },
   }};
@@ -174,6 +187,17 @@ const INTERACTIVE_PREVIEW = __HARNESS_PREVIEW__;
     if (q === "browser" || q === "b52") document.getElementById("pno").click();
     if (q === "b52") setTimeout(() => { document.querySelector('#blist [data-i="116"]')?.click(); }, 400);
     if (q === "nonames") document.getElementById("pno")?.click();
+    const sxItem = label => [...document.querySelectorAll("#sxmenu .sxitem")].find(el => el.textContent.startsWith(label));
+    if (q === "sysexmenu" || q === "sysexconfirm" || q === "sysexprogress") document.getElementById("sysexchip")?.click();
+    if (q === "sysexconfirm") setTimeout(() => sxItem("Import .syx")?.click(), 200);
+    if (q === "sysexprogress") setTimeout(() => sxItem("Export Bank A")?.click(), 200);
+    if (q === "sysexrow") {
+      document.getElementById("pno").click();
+      setTimeout(() => {
+        const row = document.querySelector('#blist [data-i="116"]'), r = row?.getBoundingClientRect();
+        row?.dispatchEvent(new MouseEvent("contextmenu", {bubbles: true, clientX: r.left + 140, clientY: r.top + 8}));
+      }, 400);
+    }
   }, 900));
 
   // Machine-readable geometry audit. Screenshots are useful review artefacts, but a
@@ -369,7 +393,9 @@ STATES = {"default": "", "norom": "?do=norom", "nonames": "?do=nonames", "matrix
           "arp": "?do=arp", "arpedit": "?do=arpedit", "global": "?do=global",
           "eg": "?do=eg", "lfoview": "?do=lfoview", "lfotiming": "?do=lfotiming",
           "name": "?do=name", "mixer": "?do=mixer",
-          "browser": "?do=browser", "b52": "?do=b52"}
+          "browser": "?do=browser", "b52": "?do=b52",
+          "sysexmenu": "?do=sysexmenu", "sysexrow": "?do=sysexrow",
+          "sysexconfirm": "?do=sysexconfirm", "sysexprogress": "?do=sysexprogress"}
 
 
 def build_mock(*, all_programs: bool = False) -> dict:
