@@ -14,7 +14,24 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MAME_DIR="${MAME_DIR:-$ROOT_DIR/extern/mame}"
-MAME_BIN="$MAME_DIR/build/osx_clang/bin/x64/Release"
+# MAME names its output directory after the host toolchain. On Linux the
+# archives are linked into the VST3 shared object, so they must be PIC.
+EXTRA_MAKE_ARGS=()
+case "$(uname -s)" in
+	Darwin)
+		MAME_TOOLCHAIN_DIR=osx_clang ;;
+	Linux)
+		if [[ "${CC:-}" == *clang* ]]; then
+			MAME_TOOLCHAIN_DIR=linux_clang
+		else
+			MAME_TOOLCHAIN_DIR=linux_gcc
+		fi
+		EXTRA_MAKE_ARGS+=("ARCHOPTS=-fPIC") ;;
+	*)
+		echo "error: unsupported host $(uname -s); use the Windows build docs" >&2
+		exit 1 ;;
+esac
+MAME_BIN="$MAME_DIR/build/$MAME_TOOLCHAIN_DIR/bin/x64/Release"
 STAMP="$MAME_BIN/.prophecy_build_rev"
 
 # Make sure a working `python` is first on PATH (MAME's makefile probes for one
@@ -31,7 +48,7 @@ export PATH="$SHIMDIR:$PATH"
 
 # korgprophecy_build.sh recognizes --regen only as its first argument. Preserve
 # the caller's option ordering; make variable assignments remain valid after it.
-(cd "$MAME_DIR" && JOBS="${JOBS:-16}" ./scripts/korgprophecy_build.sh "$@" PYTHON_EXECUTABLE="$PYBIN")
+(cd "$MAME_DIR" && JOBS="${JOBS:-16}" ./scripts/korgprophecy_build.sh "$@" ${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"} PYTHON_EXECUTABLE="$PYBIN")
 
 REV="$(git -C "$MAME_DIR" rev-parse HEAD)"
 DIRTY=""
