@@ -83,6 +83,10 @@ endif()
 if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
+if(UNIX AND NOT APPLE)
+	# prophecy_engine (and the MAME archives) end up inside the VST3 shared object.
+	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # ---------------------------------------------------------------------------
 # MAME: the fork submodule, built once (see README). We only link its archives.
@@ -99,13 +103,11 @@ else()
 	# scripts/build_mame_core.sh).
 	if(APPLE)
 		set(_mame_toolchain_default osx_clang)
-	elseif(NOT EXISTS "${MAME_DIR}/build/linux_gcc" AND EXISTS "${MAME_DIR}/build/linux_clang")
-		set(_mame_toolchain_default linux_clang)
 	else()
 		set(_mame_toolchain_default linux_gcc)
 	endif()
 	set(MAME_TOOLCHAIN_DIR "${_mame_toolchain_default}" CACHE STRING
-		"MAME build/<dir> holding the archives (osx_clang, linux_gcc, linux_clang)")
+		"MAME build/<dir> holding the archives (osx_clang, linux_gcc)")
 	set(MAME_BIN "${MAME_DIR}/build/${MAME_TOOLCHAIN_DIR}/bin/x64/Release")
 	set(MAME_OBJ "${MAME_DIR}/build/${MAME_TOOLCHAIN_DIR}/obj/x64/Release")
 	set(MAME_LIB_SUFFIX ".a")
@@ -159,8 +161,6 @@ elseif(NOT WIN32)
 	# X11 and font code).
 	pkg_check_modules(MAME_OSD_DEPS REQUIRED IMPORTED_TARGET
 		libpulse x11 xinerama xext xi SDL2_ttf fontconfig freetype2)
-	# The MAME archives and prophecy_engine end up inside the VST3 shared object.
-	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 endif()
 

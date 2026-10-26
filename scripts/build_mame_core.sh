@@ -21,11 +21,13 @@ case "$(uname -s)" in
 	Darwin)
 		MAME_TOOLCHAIN_DIR=osx_clang ;;
 	Linux)
-		if [[ "${CC:-}" == *clang* ]]; then
-			MAME_TOOLCHAIN_DIR=linux_clang
-		else
-			MAME_TOOLCHAIN_DIR=linux_gcc
+		# MAME's default Linux goal always builds with gcc into linux_gcc
+		# (its makefile ignores an environment CC).
+		if [[ "$(uname -m)" != x86_64 ]]; then
+			echo "error: only x86_64 Linux is supported (got $(uname -m))" >&2
+			exit 1
 		fi
+		MAME_TOOLCHAIN_DIR=linux_gcc
 		EXTRA_MAKE_ARGS+=("ARCHOPTS=-fPIC") ;;
 	*)
 		echo "error: unsupported host $(uname -s); use the Windows build docs" >&2
