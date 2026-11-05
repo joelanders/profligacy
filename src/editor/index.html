@@ -1369,8 +1369,15 @@
     if(row.section!=="OSC-Specific Blocks") return row.primary_offset;
     return row.primary_offset+(slot===1 ? 172 : 220);
   }
+  // EG / LFO select rows store and transmit mod-source numbers (modSourceNames(): EG1-4, Pitch EG,
+  // Amp EG = 1-6; LFO1-4 = 7-10), not the 0-based index of their enum: every factory program stores
+  // 1-6 / 7-10, and the firmware receives the parameter-change value unchanged.
+  function selectBase(row){
+    const first=row.enum && row.enum[0];
+    return first==="EG1" ? 1 : first==="LFO1" ? 7 : 0;
+  }
   function decodedRawByte(row,rawByte){
-    let value=rawByte|0;
+    let value=(rawByte|0)-selectBase(row);
     if(row.value_type==="bipolar" && value>=128) value-=256;
     if(row.min!=null) value=Math.max(row.min,value);
     if(row.max!=null) value=Math.min(row.max,value);
@@ -1388,7 +1395,7 @@
               (row.bit_width==null && (programOffsetUses.get(off)||0)!==1)) return null;
     if(off<0 || off>=raw.length) return null;
     if(row.bit_width!=null){
-      let v=(raw[off]>>row.bit_shift)&((1<<row.bit_width)-1);
+      let v=((raw[off]>>row.bit_shift)&((1<<row.bit_width)-1))-selectBase(row);
       if(row.value_type==="bipolar" && (v&(1<<(row.bit_width-1)))) v-=1<<row.bit_width;
       if(row.min!=null) v=Math.max(row.min,v);
       if(row.max!=null) v=Math.min(row.max,v);
@@ -1430,6 +1437,8 @@
     value=Math.max(row.min,Math.min(row.max,Math.round(Number(value))));
     if (!Number.isFinite(value)) return;
     deepValues.set(deepKey(row,slot),value);
+    const ui=value;
+    value+=selectBase(row);  // the stored / transmitted value from here on
     if (row.section==="OSC-Specific Blocks")
       native("setParam",(slot<<12)|row.param,value);
     else
@@ -1453,7 +1462,7 @@
     }
     document.getElementById("hint").textContent =
       (row.kind==="global" ? "GLOBAL" : row.section==="OSC-Specific Blocks" ? "OSC"+slot+" EXID" : "PROGRAM")+
-      " p"+row.param+" = "+value+" • sent through the real firmware";
+      " p"+row.param+" = "+ui+(ui!==value ? " (sent "+value+")" : "")+" • sent through the real firmware";
     const redrawViz=vizRegistry.get(row.subsection);
     if(redrawViz) redrawViz();
     if(deepMode==="changes") setTimeout(renderDeep,0);
@@ -1637,7 +1646,7 @@
     for(let off=0;off<raw.length;off++) if((raw[off]|0)!==FIRMWARE_INIT_V17[off]) changed.add(off);
     const fieldDecode=(row,byte)=>{
       if(row.bit_width==null) return decodedRawByte(row,byte);
-      let v=(byte>>row.bit_shift)&((1<<row.bit_width)-1);
+      let v=((byte>>row.bit_shift)&((1<<row.bit_width)-1))-selectBase(row);
       if(row.value_type==="bipolar" && (v&(1<<(row.bit_width-1)))) v-=1<<row.bit_width;
       return v;
     };
@@ -2910,7 +2919,7 @@
       const hi=amt && Number.isFinite(amt.max)?amt.max:127;
       out.push({
         id:"p"+r.param, label:mmStripSuffixes(name), sec:r.section, sub:r.subsection,
-        kind, ampOrder:r.section==="Amplitude" && name.includes("Amplitude Mod.EG"),
+        kind,
         sel:{p:r.param,off:r.primary_offset},
         amt:amt?{p:amt.param,off:amt.primary_offset,min:lo,max:hi}:null,
         w:writable(r) && (!amt || writable(amt))
@@ -2922,11 +2931,11 @@
   const MM_SOURCES = ["EG1","EG2","EG3","EG4","Pitch EG","Amp EG","LFO1","LFO2","LFO3","LFO4",
                       "Portamento","Note No.","Velocity","Pitch Bend","After Touch"];
   const MM_EG   = ["EG1","EG2","EG3","EG4","Pitch EG","Amp EG"];
-  const MM_EG_AMP = ["Amp EG","Pitch EG","EG1","EG2","EG3","EG4"];
   const MM_GENERAL = ["Off",...MM_SOURCES];
   function mmSourceName(r, v){
-    if (r.kind === "eg")  return (r.ampOrder ? MM_EG_AMP : MM_EG)[v] || ("EG sel " + v);
-    if (r.kind === "lfo") return "LFO" + (v + 1);
+    // EG / LFO slots hold mod-source numbers like the general ones (EG1 = 1 ... Amp EG = 6, LFO1-4 = 7-10)
+    if (r.kind === "eg")  return MM_EG[v - 1] || ("EG sel " + v);
+    if (r.kind === "lfo") return v >= 7 && v <= 10 ? "LFO" + (v - 6) : ("LFO sel " + v);
     if (v === 0) return null;                       // Off -> no route
     const gen = ["Off","EG1","EG2","EG3","EG4","Pitch EG","Amp EG","LFO1","LFO2","LFO3","LFO4",
                  "Portamento","Note No.","Velocity","Pitch Bend","After Touch"];
@@ -2958,8 +2967,8 @@
       "OSC-Specific Blocks":"Oscillator-model internals"})[sec] || sec;
   }
   function mmSourceValue(r, col){
-    if (r.kind === 'eg')  return (r.ampOrder ? MM_EG_AMP : MM_EG).indexOf(col);
-    if (r.kind === 'lfo') return ['LFO1','LFO2','LFO3','LFO4'].indexOf(col);
+    if (r.kind === 'eg')  { const i = MM_EG.indexOf(col); return i >= 0 ? i + 1 : -1; }
+    if (r.kind === 'lfo') { const i = ['LFO1','LFO2','LFO3','LFO4'].indexOf(col); return i >= 0 ? i + 7 : -1; }
     const i = MM_GENERAL.indexOf(col);
     if (i >= 0) return i;
     const cc = /^CC#(\d+)$/.exec(col);
@@ -2995,8 +3004,8 @@
   let mmSelectedKey='Filter 1 Cutoff Frequency';
   function mmSelectRow(key){ mmSelectedKey=key; renderMatrixInspector(); }
   function mmChoiceGroups(r){
-    if(r.kind==='eg') return [{label:'Envelopes',items:(r.ampOrder?MM_EG_AMP:MM_EG).map((n,i)=>[i,n])}];
-    if(r.kind==='lfo') return [{label:'LFOs',items:['LFO1','LFO2','LFO3','LFO4'].map((n,i)=>[i,n])}];
+    if(r.kind==='eg') return [{label:'Envelopes',items:MM_EG.map((n,i)=>[i+1,n])}];
+    if(r.kind==='lfo') return [{label:'LFOs',items:['LFO1','LFO2','LFO3','LFO4'].map((n,i)=>[i+7,n])}];
     return [
       {label:'Route',items:[[0,'Off']]},
       {label:'Envelopes',items:MM_EG.map((n,i)=>[i+1,n])},
