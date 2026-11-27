@@ -2845,6 +2845,14 @@
   function closeSysexMenu(){ sxmenu.hidden = true; sxmenu.innerHTML = ''; }
   function openSysexMenu(x, y, slot){
     if (sxBusy) return;
+    if (arpUnlocked){
+      // An import ends by turning Pattern Memory Protect back on, and an export would
+      // capture the audition rather than the stored pattern.
+      showSysexMessage('SysEx files', 'Finish the arpeggio pattern audition first: press Keep or Revert ' +
+        'in the arpeggiator editor. While it is unlocked, a SysEx import would turn Pattern Memory ' +
+        'Protect back on underneath it, and an export would save the audition instead of the stored pattern.', true);
+      return;
+    }
     const items = [];
     const add = (label, fn, cls) => items.push({label, fn, cls});
     if (slot != null){
@@ -2929,13 +2937,23 @@
 
   async function sysexExport(unit, index, name){
     const started = await nativeAsync('sysexExport', unit, index, name);
-    if (started) runSysexTransfer('Export ' + name.replace(/^Prophecy /, ''));
+    if (started && started.error) showSysexMessage('Export', started.error, true);
+    else if (started === true) runSysexTransfer('Export ' + name.replace(/^Prophecy /, ''));
   }
+  const sxSkippedList = lines => (Array.isArray(lines) && lines.length)
+    ? '<ul>' + lines.map(l => '<li>' + sxEsc(l) + '</li>').join('') + '</ul>' : '';
 
   async function sysexImport(preferredSlot){
     const summary = await nativeAsync('sysexImport');
     if (!summary) return; // file dialog cancelled
-    if (!summary.ok) { showSysexMessage('Import ' + (summary.file || ''), summary.error || 'The file could not be read.', true); return; }
+    if (!summary.ok){
+      const skipped = sxSkippedList(summary.skipped);
+      showSysexCard('<h2>Import ' + sxEsc(summary.file || '') + '</h2><p class="sxerr">' +
+        sxEsc(summary.error || 'The file could not be read.') + '</p>' +
+        (skipped ? '<p>The file holds:</p>' + skipped : ''),
+        [{label: 'OK', cls: 'primary', fn: closeSysexCard}]);
+      return;
+    }
     const items = summary.items || [];
     const single = items.length === 1 ? items[0] : null;
     const shared = 'It changes the synth’s memory, which the standalone app and every project share.';
@@ -2947,8 +2965,8 @@
       if (items.length > 8) html += '<li>and ' + (items.length - 8) + ' more</li>';
       html += '</ul>';
     }
-    if (summary.ignored) html += '<p>' + summary.ignored + ' other message' + (summary.ignored > 1 ? 's' : '') +
-      ' in the file ' + (summary.ignored > 1 ? 'are' : 'is') + ' not Prophecy data and will be skipped.</p>';
+    if (Array.isArray(summary.skipped) && summary.skipped.length)
+      html += '<p class="sxwarn">Skipped (not loaded):</p>' + sxSkippedList(summary.skipped);
     let options = null, defaultTarget = -2;
     const unit = single ? single.unit : null;
     if (unit === 'program' || unit === 'current'){
@@ -2987,9 +3005,9 @@
     showSysexCard(html, [
       {label: 'Cancel', fn: closeSysexCard},
       {label: 'Import', cls: 'danger', id: 'sxconfirm', fn: async () => {
-        const ok = await nativeAsync('sysexImportConfirm', target());
-        if (ok) runSysexTransfer('Import ' + summary.file);
-        else showSysexMessage('Import', 'The import could not start. Another transfer may be running.', true);
+        const r = await nativeAsync('sysexImportConfirm', target());
+        if (r && r.ok) runSysexTransfer('Import ' + summary.file);
+        else showSysexMessage('Import', (r && r.error) || 'The import could not start.', true);
       }}]);
     const update = () => {
       const t = target();
@@ -3021,17 +3039,33 @@
       }
       clearInterval(poll);
       sxBusy = false;
-      showSysexMessage(title, st.message || st.state, st.state === 'failed');
-      if (title.startsWith('Import') && st.state === 'succeeded'){
-        nativeAsync('getPatchNames').then(names => {
-          if (!Array.isArray(names)) return;
-          patchNames = names; updatePatchName();
-          if (browser.classList.contains('show')) buildBrowser(names);
-        });
-        clearTimeout(syncTimer); syncTimer = setTimeout(syncPatch, 300);
-      }
+      finishSysexTransfer(title, st);
     }, 150);
   }
+
+  // Show the outcome and bring the editor up to date with whatever the synth stored (a
+  // cancelled or failed import may still have stored some dumps).
+  function finishSysexTransfer(title, st){
+    native('sysexAck');
+    showSysexMessage(title, st.message || st.state, st.state === 'failed');
+    if (!title.startsWith('Import')) return;
+    nativeAsync('getPatchNames').then(names => {
+      if (!Array.isArray(names)) return;
+      patchNames = names; updatePatchName();
+      if (browser.classList.contains('show')) buildBrowser(names);
+    });
+    clearTimeout(syncTimer); syncTimer = setTimeout(syncPatch, 300);
+    if (st.patterns && arpStarted && !arpUnlocked) loadArpPattern(arpPattern);
+  }
+
+  // A transfer keeps running in the processor while the editor is closed: when it opens
+  // again, show its progress, or the outcome it has not shown yet.
+  nativeAsync('sysexStatus').then(st => {
+    if (!st || sxBusy) return;
+    const title = st.title || 'SysEx transfer';
+    if (st.state === 'running') runSysexTransfer(title);
+    else if (st.unseen) finishSysexTransfer(title, st);
+  });
 
   // ============================ param read-back ============================
   // Reflect the emulator's actual patch in the knobs: request the current-program dump, then read

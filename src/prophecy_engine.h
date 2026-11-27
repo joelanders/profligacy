@@ -196,11 +196,13 @@ public:
 	bool popSysexReply(std::vector<std::uint8_t> &out);
 	// Exclusive input stream for dumps larger than the immediate MIDI queue. While a
 	// stream is open the UART is fed only from it, so host or editor MIDI cannot land
-	// inside the dump; other input waits and resumes after closeSysexStream(). The
-	// stream engages only between complete messages already queued elsewhere.
-	// pushSysexStream() accepts as many bytes as currently fit and returns that count;
-	// sysexStreamPending() is the number not yet handed to the UART. Close the stream
-	// only once a complete message (through F7) has drained.
+	// inside the dump; other input is held, in order and without loss, and goes first
+	// after closeSysexStream(). The stream engages only between complete messages
+	// already queued elsewhere. pushSysexStream() accepts as many bytes as currently fit
+	// (the ring holds 4 KB) and returns that count; sysexStreamPending() is the number the
+	// MAME thread has not yet moved into the emulated UART's input queue, which then
+	// clocks them in at 31250 baud. Callers pace their pushes to that rate. Close the
+	// stream only once a complete message (through F7) has drained.
 	bool openSysexStream();
 	std::size_t pushSysexStream(const std::uint8_t *bytes, std::size_t n);
 	std::size_t sysexStreamPending() const;

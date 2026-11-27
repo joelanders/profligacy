@@ -31,6 +31,7 @@ struct EnginePort : SysexPort
 	ProphecyEngine &engine;
 	bool ready() override { return true; }
 	int channel() override { return engine.firmwareChannel(); }
+	double emulatedMs() override { return double(engine.producedFrames()) * 1000.0 / ProphecyEngine::kSampleRate; }
 	bool openStream() override { return engine.openSysexStream(); }
 	std::size_t pushStream(const std::uint8_t *b, std::size_t n) override { return engine.pushSysexStream(b, n); }
 	std::size_t streamPending() override { return engine.sysexStreamPending(); }
@@ -47,7 +48,7 @@ static double nowMs()
 
 static bool run(Transfer &t, EnginePort &port)
 {
-	while (t.busy())
+	while (t.needsTicks())
 	{
 		t.tick(port, nowMs());
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -70,6 +71,30 @@ static bool importDumps(EnginePort &port, std::vector<Dump> dumps)
 	Transfer t;
 	t.startImport(std::move(dumps));
 	return run(t, port);
+}
+
+// Ask for the identity reply again and wait for it; the engine takes the synth's channel
+// from it. Returns false if no reply arrives.
+static bool identify(ProphecyEngine &engine, int expected)
+{
+	const std::uint8_t identity[] = {0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7};
+	for (int attempt = 0; attempt < 3; ++attempt)
+	{
+		engine.pushMidi(identity, sizeof(identity));
+		for (int i = 0; i < 100; ++i)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			if (engine.firmwareChannel() == expected) return true;
+		}
+	}
+	return false;
+}
+
+static void setGlobalParameter(ProphecyEngine &engine, int param, int value)
+{
+	const auto msg = globalParameter(param, value, engine.firmwareChannel());
+	engine.pushMidi(msg.data(), msg.size());
+	std::this_thread::sleep_for(std::chrono::milliseconds(500));
 }
 
 static void setName(std::vector<std::uint8_t> &raw, std::size_t offset, const char *name)
@@ -203,21 +228,42 @@ int main()
 		const auto restored = exportUnit(port, Unit::AllPatterns, 0);
 		check(restored && restored->raw == patterns->raw, "all patterns restored");
 	}
-	// Global: the name changes; the channel the file asks for does not.
+	// Global channel at offset 176, checked against the channel the identity reply
+	// reports, before and after moving it with Global MIDI Channel (p184).
+	const int startChannel = engine.firmwareChannel();
+	const int movedChannel = (startChannel + 5) & 0x0F;
+	check(global->raw[kGlobalChannelOffset] == startChannel, "global offset 176 is the identified channel");
+	setGlobalParameter(engine, 184, movedChannel);
+	check(identify(engine, movedChannel), "p184 moves the channel the synth identifies on");
 	{
+		const auto moved = exportUnit(port, Unit::Global, 0);
+		check(moved && moved->raw[kGlobalChannelOffset] == movedChannel, "global offset 176 follows p184");
+	}
+	// Global: the name changes; the channel and the Program Change and select maps the
+	// file asks for do not. Offset 178 (SysEx switches) is preserved but not checked:
+	// it cannot be read back with transmit off, and receive off would end the test.
+	{
+		const auto before = exportUnit(port, Unit::Global, 0);
 		Dump g = *global;
 		setName(g.raw, 147, "RoundTrip Global");
-		g.raw[kGlobalChannelOffset] = 5;
+		g.raw[kGlobalChannelOffset] = std::uint8_t((movedChannel + 3) & 0x0F);
+		g.raw[kGlobalProgramChangeOffset] ^= 0x01;
+		g.raw[kGlobalBankMapOffset] = std::uint8_t((g.raw[kGlobalBankMapOffset] + 1) & 0x7F);
+		g.raw[kGlobalProgramMapOffset + 5] = std::uint8_t((g.raw[kGlobalProgramMapOffset + 5] + 9) & 0x7F);
 		check(importDumps(port, {g}), "import global");
+		check(identify(engine, movedChannel), "synth still identifies on its own channel");
 		const auto back = exportUnit(port, Unit::Global, 0);
-		check(back.has_value(), "global readable after import (channel kept)");
-		if (back)
+		check(before && back, "global readable before and after import");
+		if (before && back)
 		{
 			check(programName(back->raw.data() + 147) == "RoundTrip Global", "global name imported");
-			check(back->raw[kGlobalChannelOffset] == global->raw[kGlobalChannelOffset], "global channel kept");
-			check(back->raw[kGlobalSysexOffset] == global->raw[kGlobalSysexOffset], "global SysEx switches kept");
+			check(back->raw[kGlobalChannelOffset] == movedChannel, "global channel kept");
+			check(std::equal(before->raw.begin() + long(kGlobalSysexOffset), before->raw.begin() + long(kGlobalProgramMapEnd),
+				back->raw.begin() + long(kGlobalSysexOffset)), "SysEx, Program Change and select maps kept");
 		}
 	}
+	setGlobalParameter(engine, 184, startChannel);
+	check(identify(engine, startChannel), "channel moved back");
 	// All data puts everything back the way it started, protect included.
 	{
 		check(importDumps(port, {*all}), "import all data");

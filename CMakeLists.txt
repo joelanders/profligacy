@@ -515,6 +515,20 @@ if(BUILD_TESTING AND PROPHECY_USE_FAKE_ENGINE)
 	endif()
 	add_test(NAME plugin_timeline COMMAND $<TARGET_FILE:ProphecyPluginTimelineTest>)
 	set_tests_properties(plugin_timeline PROPERTIES TIMEOUT 30)
+
+	# SysEx transfers through the processor without firmware: saving, cancel and stalls.
+	add_executable(ProphecyPluginSysexFakeTest scripts/plugin_sysex_fake_test.cpp)
+	target_include_directories(ProphecyPluginSysexFakeTest PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/src ${JUCE_DIR}/modules)
+	target_compile_definitions(ProphecyPluginSysexFakeTest PRIVATE
+		JUCE_WEB_BROWSER=1 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
+	target_link_libraries(ProphecyPluginSysexFakeTest PRIVATE ProphecyPlugin)
+	if(WIN32)
+		target_compile_definitions(ProphecyPluginSysexFakeTest PRIVATE JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
+		target_link_libraries(ProphecyPluginSysexFakeTest PRIVATE juce::juce_webview2)
+	endif()
+	add_test(NAME plugin_sysex_fake COMMAND $<TARGET_FILE:ProphecyPluginSysexFakeTest>)
+	set_tests_properties(plugin_sysex_fake PROPERTIES TIMEOUT 90)
 endif()
 
 # Artifact-level VST3 smoke host. Unlike the timing and RT harnesses above, this

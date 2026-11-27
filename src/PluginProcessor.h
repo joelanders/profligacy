@@ -206,14 +206,19 @@ public:
 	// back. One transfer at a time; progress and the outcome come from sysexStatus().
 	// Message thread only. `index` is the program (0..127), bank (0..1) or pattern (0..9).
 	bool startSysexExport(prophecy::sysex::Unit unit, int index, const juce::File &dest);
-	// Read and validate a .syx file. Returns {ok, items:[{unit, index, label}], ignored}
-	// or {ok:false, error}; the dumps wait for confirmSysexImport().
+	// Read and validate a .syx file. Returns {ok, items:[{unit, index, label}], skipped:[...]}
+	// or {ok:false, error, skipped}; the dumps wait for confirmSysexImport().
 	juce::var prepareSysexImport(const juce::File &file);
 	// `target` retargets a file holding one program (-1 = edit buffer, 0..127 = slot),
 	// one bank (0..1) or one pattern (0..9); other files load as they are.
 	bool confirmSysexImport(int target);
 	void cancelSysexTransfer() { m_sysexTransfer.cancel(); }
+	// {state, title, phase, progress, message, settling, unseen, patterns}.
 	juce::var sysexStatus() const;
+	// The editor has shown the outcome of the last transfer.
+	void acknowledgeSysexResult() { m_sysexTransfer.acknowledge(); }
+	// Why a new transfer cannot start now, or empty.
+	juce::String sysexBusyReason() const { return m_sysexTransfer.busyReason(); }
 	juce::File sysexDirectory() const;
 	void setSysexDirectory(const juce::File &dir);
 
@@ -262,11 +267,17 @@ private:
 		bool startImport(std::vector<prophecy::sysex::Dump> dumps, const juce::String &what);
 		void cancel() { m_transfer.cancel(); }
 		bool busy() const { return m_transfer.busy(); }
+		juce::String busyReason() const;
 		juce::var status() const;
+		void acknowledge() { m_unseen = false; }
 	private:
 		void timerCallback() override;
+		void report();
+		void started(const juce::String &title);
 		bool ready() override;
 		int channel() override { return m_proc.m_engine.firmwareChannel(); }
+		double emulatedMs() override
+		{ return double(m_proc.m_engine.producedFrames()) * 1000.0 / double(ProphecyEngine::kSampleRate); }
 		bool openStream() override { return m_proc.m_engine.openSysexStream(); }
 		std::size_t pushStream(const std::uint8_t *b, std::size_t n) override
 		{ return m_proc.m_engine.pushSysexStream(b, n); }
@@ -278,11 +289,17 @@ private:
 		prophecy::sysex::Transfer m_transfer;
 		juce::File m_dest;          // export target
 		juce::String m_what;        // label for the final message
+		juce::String m_title;       // "Export Bank A", "Import x.syx": the editor's dialog title
 		juce::String m_finalMessage;
 		bool m_finalOk = false;
 		bool m_reported = true;     // final status already settled
+		bool m_unseen = false;      // the editor has not shown the final status yet
+		bool m_patternsStored = false; // an import stored arpeggio pattern data
 	};
 	SysexFileTransfer  m_sysexTransfer { *this };
+	// Set while a transfer owns the synth's MIDI input (including any cleanup still waiting
+	// for the synth after a stall). Read by getStateInformation on any thread.
+	std::atomic<bool>  m_sysexActive { false };
 	std::vector<prophecy::sysex::Dump> m_pendingImport;
 	juce::String       m_pendingImportName;
 	// Program names learned from SysEx transfers this session. The sysram file only

@@ -706,6 +706,17 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 	// hardware-like policy instead: only an explicit front-panel WRITE persists a patch.
 	std::vector<std::uint8_t> dump;
 	if (wrapperType != juce::AudioProcessor::wrapperType_Standalone
+			&& m_sysexActive.load(std::memory_order_acquire))
+	{
+		// A SysEx file transfer owns the synth's MIDI input, and a bank or all-data dump
+		// keeps it for up to 26 s: a dump request now would miss the deadline below and the
+		// project would lose its edit buffer. Save the editor's latest read-back instead.
+		std::uint8_t raw[prophecy::sysex::kProgramBytes];
+		if (m_engine.latestProgramData(raw, sizeof(raw), nullptr) == sizeof(raw))
+			dump = prophecy::sysex::build({prophecy::sysex::Unit::CurrentProgram, -1,
+				std::vector<std::uint8_t>(raw, raw + sizeof(raw))}, m_engine.firmwareChannel());
+	}
+	else if (wrapperType != juce::AudioProcessor::wrapperType_Standalone
 			&& m_engine.producedFrames() >= (std::uint64_t) ProphecyEngine::kSampleRate * 11)
 	{
 		std::uint8_t tmp[512];
@@ -1061,41 +1072,38 @@ juce::var ProphecyAudioProcessor::prepareSysexImport(const juce::File &file)
 	obj->setProperty("file", file.getFileName());
 	juce::MemoryBlock data;
 	// The largest dump (all data) is 80 KB; anything far beyond that is not a Prophecy file.
-	if (file.getSize() > 4 * 1024 * 1024 || !file.loadFileAsData(data))
+	if (file.getSize() > 4 * 1024 * 1024)
+	{
+		obj->setProperty("error", "The file is too large to be Prophecy SysEx (over 4 MB).");
+		return result;
+	}
+	if (!file.loadFileAsData(data))
 	{
 		obj->setProperty("error", "The file could not be read.");
 		return result;
 	}
-	const auto messages = prophecy::sysex::split(static_cast<const std::uint8_t *>(data.getData()), data.getSize());
-	int ignored = 0;
-	juce::String firstError;
-	juce::Array<juce::var> items;
-	for (const auto &msg : messages)
+	auto contents = prophecy::sysex::readFile(static_cast<const std::uint8_t *>(data.getData()), data.getSize());
+	juce::Array<juce::var> items, skipped;
+	for (const auto &dump : contents.dumps)
 	{
-		std::string why;
-		auto dump = prophecy::sysex::parse(msg, &why);
-		if (!dump)
-		{
-			++ignored;
-			if (firstError.isEmpty()) firstError = juce::String(why);
-			continue;
-		}
 		auto *item = new juce::DynamicObject();
-		item->setProperty("unit", juce::String(prophecy::sysex::unitKey(dump->unit)));
-		item->setProperty("index", dump->index);
-		item->setProperty("label", juce::String(prophecy::sysex::label(*dump)));
+		item->setProperty("unit", juce::String(prophecy::sysex::unitKey(dump.unit)));
+		item->setProperty("index", dump.index);
+		item->setProperty("label", juce::String(prophecy::sysex::label(dump)));
 		items.add(juce::var(item));
-		m_pendingImport.push_back(std::move(*dump));
 	}
+	for (const auto &line : contents.skipped())
+		skipped.add(juce::String(line));
 	obj->setProperty("items", items);
-	obj->setProperty("ignored", ignored);
-	if (m_pendingImport.empty())
+	obj->setProperty("skipped", skipped);
+	if (contents.dumps.empty())
 	{
-		obj->setProperty("error", messages.empty()
-			? juce::String("The file contains no SysEx messages.")
-			: "The file contains no Prophecy data (" + firstError + ").");
+		obj->setProperty("error", contents.hasMessages
+			? juce::String("The file has no Prophecy data that can be loaded.")
+			: juce::String("The file contains no SysEx messages."));
 		return result;
 	}
+	m_pendingImport = std::move(contents.dumps);
 	m_pendingImportName = file.getFileName();
 	obj->setProperty("ok", true);
 	return result;
@@ -1104,7 +1112,7 @@ juce::var ProphecyAudioProcessor::prepareSysexImport(const juce::File &file)
 bool ProphecyAudioProcessor::confirmSysexImport(int target)
 {
 	using prophecy::sysex::Unit;
-	if (m_pendingImport.empty() || m_sysexTransfer.busy()) return false;
+	if (m_pendingImport.empty() || sysexBusyReason().isNotEmpty()) return false;
 	std::vector<prophecy::sysex::Dump> dumps = std::move(m_pendingImport);
 	m_pendingImport.clear();
 	if (dumps.size() == 1)
@@ -1147,14 +1155,32 @@ void ProphecyAudioProcessor::learnProgramNames(const prophecy::sysex::Dump &dump
 	}
 }
 
+juce::String ProphecyAudioProcessor::SysexFileTransfer::busyReason() const
+{
+	if (m_transfer.busy()) return "A SysEx transfer is already running.";
+	if (m_transfer.settling())
+		return "The last SysEx transfer is still waiting for the synth to run again so it can "
+			"finish cleanly. Make sure the plugin is not bypassed.";
+	return {};
+}
+
+void ProphecyAudioProcessor::SysexFileTransfer::started(const juce::String &title)
+{
+	m_title = title;
+	m_reported = false;
+	m_unseen = false;
+	m_patternsStored = false;
+	m_proc.m_sysexActive.store(true, std::memory_order_release);
+	startTimer(10);
+}
+
 bool ProphecyAudioProcessor::SysexFileTransfer::startExport(prophecy::sysex::Unit unit, int index,
 	const juce::File &dest)
 {
 	if (!m_transfer.startExport(unit, index)) return false;
 	m_dest = dest;
 	m_what = juce::String(prophecy::sysex::label(prophecy::sysex::Dump{unit, index, {}}));
-	m_reported = false;
-	startTimer(10);
+	started("Export " + m_what);
 	return true;
 }
 
@@ -1164,8 +1190,7 @@ bool ProphecyAudioProcessor::SysexFileTransfer::startImport(std::vector<prophecy
 	if (!m_transfer.startImport(std::move(dumps))) return false;
 	m_dest = juce::File();
 	m_what = what;
-	m_reported = false;
-	startTimer(10);
+	started("Import " + what);
 	return true;
 }
 
@@ -1180,43 +1205,72 @@ bool ProphecyAudioProcessor::SysexFileTransfer::ready()
 
 void ProphecyAudioProcessor::SysexFileTransfer::timerCallback()
 {
-	using State = prophecy::sysex::Transfer::State;
 	m_transfer.tick(*this, juce::Time::getMillisecondCounterHiRes());
-	if (m_transfer.busy()) return;
+	if (!m_transfer.busy() && !m_reported) report();
+	if (m_transfer.needsTicks()) return;
 	stopTimer();
+	m_proc.m_sysexActive.store(false, std::memory_order_release);
+}
+
+// Settle the final status once the transfer has an outcome (cleanup after a stall may
+// still be running).
+void ProphecyAudioProcessor::SysexFileTransfer::report()
+{
+	using prophecy::sysex::Unit;
+	using State = prophecy::sysex::Transfer::State;
 	const auto &st = m_transfer.status();
 	m_finalOk = st.state == State::Succeeded;
 	m_finalMessage = juce::String(st.message);
-	if (m_finalOk && m_dest != juce::File())
+	if (m_dest != juce::File())
 	{
-		const auto &bytes = m_transfer.exported();
-		if (auto dump = prophecy::sysex::parse(bytes)) m_proc.learnProgramNames(*dump);
-		if (m_dest.replaceWithData(bytes.data(), bytes.size()))
-			m_finalMessage = "Saved " + m_what + " to " + m_dest.getFileName();
-		else
+		if (m_finalOk)
 		{
-			m_finalOk = false;
-			m_finalMessage = "Could not write " + m_dest.getFullPathName();
+			const auto &bytes = m_transfer.exported();
+			std::string why;
+			if (auto dump = prophecy::sysex::parse(bytes, &why))
+			{
+				m_proc.learnProgramNames(*dump);
+				if (m_dest.replaceWithData(bytes.data(), bytes.size()))
+					m_finalMessage = "Saved " + m_what + " to " + m_dest.getFileName();
+				else
+				{
+					m_finalOk = false;
+					m_finalMessage = "Could not write " + m_dest.getFullPathName();
+				}
+			}
+			else
+			{
+				m_finalOk = false;
+				m_finalMessage = "The synth sent a damaged dump (" + juce::String(why) + "). Nothing was saved.";
+			}
 		}
+		else m_finalMessage = juce::String(st.message) + " Nothing was saved.";
 	}
-	else if (m_finalOk)
+	else
 	{
-		// Program data may have replaced the edit buffer or the selected slot: refresh
-		// the editor's read-back.
-		using prophecy::sysex::Unit;
-		bool programs = false;
-		for (const auto &dump : m_transfer.imported())
+		// Whatever the outcome, the dumps the synth acknowledged are in its memory: learn
+		// their names, refresh the editor's read-back if program data may have changed, and
+		// tell the host when the edit buffer (which a project saves) was replaced.
+		bool programs = false, editBuffer = false;
+		const auto &dumps = m_transfer.imported();
+		for (std::size_t i : m_transfer.stored())
 		{
+			const auto &dump = dumps[i];
 			m_proc.learnProgramNames(dump);
 			programs = programs || (dump.unit != Unit::Global && dump.unit != Unit::Pattern
 				&& dump.unit != Unit::AllPatterns);
+			editBuffer = editBuffer || dump.unit == Unit::CurrentProgram;
+			m_patternsStored = m_patternsStored || dump.unit == Unit::Pattern
+				|| dump.unit == Unit::AllPatterns || dump.unit == Unit::AllData;
 		}
-		m_finalMessage = "Loaded " + m_what;
+		if (m_finalOk) m_finalMessage = "Loaded " + m_what + "."
+			+ (m_transfer.settling() ? " Memory protect will be turned back on when the synth runs again." : "");
 		if (programs) (void) m_proc.requestProgramDump();
+		if (editBuffer)
+			m_proc.updateHostDisplay(juce::AudioProcessorListener::ChangeDetails().withNonParameterStateChanged(true));
 	}
-	else if (st.state == State::Failed && m_dest != juce::File())
-		m_finalMessage = juce::String(st.message) + " Nothing was saved.";
 	m_reported = true;
+	m_unseen = true;
 }
 
 juce::var ProphecyAudioProcessor::SysexFileTransfer::status() const
@@ -1230,9 +1284,13 @@ juce::var ProphecyAudioProcessor::SysexFileTransfer::status() const
 	else if (st.state == State::Failed) state = "failed";
 	else if (st.state == State::Cancelled) state = "cancelled";
 	obj->setProperty("state", state);
+	obj->setProperty("title", m_title);
 	obj->setProperty("phase", juce::String(st.phase));
 	obj->setProperty("progress", st.progress);
 	obj->setProperty("message", state == "running" ? juce::String() : m_finalMessage);
+	obj->setProperty("settling", m_transfer.settling());
+	obj->setProperty("unseen", state != "running" && state != "idle" && m_unseen);
+	obj->setProperty("patterns", m_patternsStored);
 	return juce::var(obj);
 }
 
@@ -1505,6 +1563,15 @@ void ProphecyAudioProcessor::WriteSequence::timerCallback()
 //  WebView editor: an HTML/CSS/JS panel (embedded via BinaryData). The JS calls the
 //  registered native function "selectPatch"; C++ -> JS events come later for LCD/params.
 //============================================================
+// {ok: false, error} for a SysEx request the editor should explain.
+static juce::var sysexRefusal(const juce::String &why)
+{
+	auto *obj = new juce::DynamicObject();
+	obj->setProperty("ok", false);
+	obj->setProperty("error", why);
+	return juce::var(obj);
+}
+
 class ProphecyEditor : public juce::AudioProcessorEditor, private juce::Timer
 {
 public:
@@ -2010,6 +2077,7 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 					const int index = args.size() > 1 ? (int) args[1] : 0;
 					const juce::String suggested = args.size() > 2 ? args[2].toString() : juce::String("Prophecy");
 					if (!chosen) { complete(juce::var(false)); return; }
+					if (const auto why = m_proc.sysexBusyReason(); why.isNotEmpty()) { complete(sysexRefusal(why)); return; }
 					const juce::File start = m_proc.sysexDirectory()
 						.getChildFile(juce::File::createLegalFileName(suggested) + ".syx");
 					m_sysexChooser = std::make_unique<juce::FileChooser>("Export SysEx", start, "*.syx");
@@ -2020,15 +2088,38 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 						{
 							juce::File dest = fc.getResult();
 							if (dest == juce::File()) { complete(juce::var(false)); return; }
-							if (!dest.hasFileExtension("syx")) dest = dest.withFileExtension("syx");
-							m_proc.setSysexDirectory(dest.getParentDirectory());
-							complete(juce::var(m_proc.startSysexExport(unit, index, dest)));
+							auto begin = [this, unit, index, complete](const juce::File &file)
+							{
+								m_proc.setSysexDirectory(file.getParentDirectory());
+								if (m_proc.startSysexExport(unit, index, file)) { complete(juce::var(true)); return; }
+								const auto why = m_proc.sysexBusyReason();
+								complete(sysexRefusal(why.isNotEmpty() ? why : juce::String("The export could not start.")));
+							};
+							if (dest.hasFileExtension("syx")) { begin(dest); return; }
+							// The dialog confirmed overwriting the name it was given, not the
+							// name with .syx added, so ask again if that one exists.
+							dest = dest.withFileExtension("syx");
+							if (!dest.exists()) { begin(dest); return; }
+							m_sysexOverwriteBox = juce::NativeMessageBox::showScopedAsync(juce::MessageBoxOptions()
+									.withIconType(juce::MessageBoxIconType::WarningIcon)
+									.withTitle("Export SysEx")
+									.withMessage(dest.getFileName() + " already exists. Do you want to replace it?")
+									.withButton("Replace")
+									.withButton("Cancel")
+									.withAssociatedComponent(this),
+								[begin, dest, complete](int result)
+								{
+									// Alert-window numbering: the first button is 1, the last 0.
+									if (result == 1) begin(dest);
+									else complete(juce::var(false));
+								});
 						});
 				})
 			.withNativeFunction("sysexImport",
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
 				{
 					juce::ignoreUnused(args);
+					if (const auto why = m_proc.sysexBusyReason(); why.isNotEmpty()) { complete(sysexRefusal(why)); return; }
 					m_sysexChooser = std::make_unique<juce::FileChooser>("Import SysEx",
 						m_proc.sysexDirectory(), "*.syx;*.SYX");
 					m_sysexChooser->launchAsync(juce::FileBrowserComponent::openMode
@@ -2045,13 +2136,29 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
 				{
 					const int target = args.size() > 0 ? (int) args[0] : -2;
-					complete(juce::var(m_proc.confirmSysexImport(target)));
+					if (m_proc.confirmSysexImport(target))
+					{
+						auto *obj = new juce::DynamicObject();
+						obj->setProperty("ok", true);
+						complete(juce::var(obj));
+						return;
+					}
+					const auto why = m_proc.sysexBusyReason();
+					complete(sysexRefusal(why.isNotEmpty() ? why
+						: juce::String("The import could not start. Choose the file again.")));
 				})
 			.withNativeFunction("sysexStatus",
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
 				{
 					juce::ignoreUnused(args);
 					complete(m_proc.sysexStatus());
+				})
+			.withNativeFunction("sysexAck",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					juce::ignoreUnused(args);
+					m_proc.acknowledgeSysexResult();
+					complete(juce::var());
 				})
 			.withNativeFunction("sysexCancel",
 				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
@@ -2109,6 +2216,7 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 	};
 	std::unique_ptr<juce::FileChooser> m_chooser;
 	std::unique_ptr<juce::FileChooser> m_sysexChooser;
+	juce::ScopedMessageBox m_sysexOverwriteBox; // dismissed with the editor
 };
 
 juce::AudioProcessorEditor *ProphecyAudioProcessor::createEditor()

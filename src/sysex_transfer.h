@@ -16,9 +16,16 @@
 // Everything here is JUCE- and MAME-free so the plugin and the ROM-backed round-trip
 // test drive the same state machine. The synth is reached through SysexPort.
 //
+// Timing. Every wait that depends on the firmware (replies, acknowledgements, settle
+// pauses) is measured on the emulated clock, so a slow emulator never fails a load that
+// is still arriving. Wall time is used only to notice that the emulator has stopped
+// altogether (no audio blocks: the plugin bypassed, or the host not processing its
+// track) and to bound the wait for other editor traffic before a transfer starts.
+//
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -38,12 +45,35 @@ constexpr int kProgramsPerBank = 64;
 constexpr int kProgramCount = 128;
 constexpr int kPatternCount = 10;
 constexpr std::size_t kNameLength = 16; // a program record starts with its name
-// Global record fields an import must not change: losing the channel or SysEx receive
-// would cut the editor off from the synth, and memory protect is managed around loads.
-constexpr std::size_t kGlobalProtectOffset = 163; // bit0 program, bit1 pattern memory
-constexpr std::size_t kGlobalChannelOffset = 176;
-constexpr std::size_t kGlobalSysexOffset = 178;   // bit0 transmit, bit1 receive
+// Global record fields an import must not change. Losing the channel or SysEx receive
+// would cut the editor off from the synth; the plugin selects programs with Bank Select
+// (MSB 0, LSB = bank) and Program Change, so Program Change receive and the bank and
+// program select maps must stay as they are; memory protect is managed around loads.
+// Offsets 163 and 179-377 are verified in src/editor/deep_editor_manifest.tsv (p170/p171,
+// p190-p389). 176 (p184) and 178 (p188/p189) are not swept there: they sit between the
+// verified Local/Omni/Clock byte (177) and Program Change byte (179), and the ROM round
+// trip checks 176 against the channel the firmware reports, but 178 is unproven.
+constexpr std::size_t kGlobalProtectOffset = 163;       // program and pattern memory protect
+constexpr std::size_t kGlobalChannelOffset = 176;       // global MIDI channel
+constexpr std::size_t kGlobalSysexOffset = 178;         // SysEx transmit/receive switches
+constexpr std::size_t kGlobalProgramChangeOffset = 179; // Program Change transmit/receive
+constexpr std::size_t kGlobalBankMapOffset = 180;       // bank A-C select LSB/MSB, 180-185
+constexpr std::size_t kGlobalProgramMapOffset = 186;    // program select map A00-C63
+constexpr std::size_t kGlobalProgramMapEnd = 378;       // one past the map's last entry
+// [first, last] byte ranges an import keeps from the synth's current global record.
+inline constexpr std::pair<std::size_t, std::size_t> kPreservedGlobalRanges[] = {
+	{kGlobalProtectOffset, kGlobalProtectOffset},
+	{kGlobalChannelOffset, kGlobalChannelOffset},
+	{kGlobalSysexOffset, kGlobalProgramMapEnd - 1}};
 constexpr double kUartBytesPerMs = 3.125;         // 31250 baud, 10 bits per byte
+
+// Transfer pacing and timeouts. "Emulated" values are on the synth's own clock.
+constexpr double kStreamLeadBytes = 1024.0;     // how far a dump may run ahead of the emulated UART
+constexpr std::size_t kMaxStreamPending = 2048; // keeps room for a terminating F7 in the 4 KB ring
+constexpr double kStallMs = 5000.0;             // wall: no emulated progress means it has stopped
+constexpr double kReadyWaitMs = 10000.0;        // wall: other editor traffic before starting
+constexpr double kAckTimeoutMs = 4000.0 + kStreamLeadBytes / kUartBytesPerMs; // emulated
+constexpr double kCutOffAckTimeoutMs = 2000.0;  // emulated: answer to a dump ended early
 
 enum class Unit { CurrentProgram, Program, Bank, AllPrograms, Pattern, AllPatterns, Global, AllData };
 
@@ -255,24 +285,79 @@ inline std::optional<Dump> parse(const std::vector<std::uint8_t> &msg, std::stri
 	return dump;
 }
 
-// Split a .syx file into complete F0..F7 messages. Bytes outside a message are ignored,
-// a new F0 restarts an unterminated one, and a trailing unterminated message is dropped.
-inline std::vector<std::vector<std::uint8_t>> split(const std::uint8_t *data, std::size_t n)
+// MIDI real-time messages (F8-FF: clock, start/stop, active sensing, reset) are single
+// bytes that may legally appear anywhere, including inside SysEx.
+inline bool isRealtime(std::uint8_t b) { return b >= 0xF8; }
+
+inline std::vector<std::uint8_t> withoutRealtime(const std::vector<std::uint8_t> &msg)
 {
-	std::vector<std::vector<std::uint8_t>> out;
+	std::vector<std::uint8_t> out;
+	out.reserve(msg.size());
+	for (std::uint8_t b : msg)
+		if (!isRealtime(b)) out.push_back(b);
+	return out;
+}
+
+// True when a message (complete or not) starts like a Prophecy data dump.
+inline bool isProphecyDumpHeader(const std::vector<std::uint8_t> &msg)
+{
+	if (msg.size() < 5 || msg[0] != 0xF0 || msg[1] != 0x42 || (msg[2] & 0xF0) != 0x30 || msg[3] != 0x41)
+		return false;
+	switch (msg[4])
+	{
+		case 0x40: case 0x4C: case 0x50: case 0x51: case 0x69: return true;
+		default: return false;
+	}
+}
+
+struct Scan
+{
+	std::vector<std::vector<std::uint8_t>> messages;   // complete F0..F7 messages
+	std::vector<std::vector<std::uint8_t>> incomplete; // began with F0 but never reached F7
+};
+
+// Split a .syx file into SysEx messages. Real-time bytes are dropped wherever they are.
+// A message cut off by a new F0, by another status byte (which ends SysEx in MIDI), or by
+// the end of the file goes to `incomplete`. Other bytes outside messages are ignored.
+inline Scan scan(const std::uint8_t *data, std::size_t n)
+{
+	Scan out;
 	std::vector<std::uint8_t> cur;
 	bool in = false;
 	for (std::size_t i = 0; i < n; ++i)
 	{
 		const std::uint8_t b = data[i];
-		if (b == 0xF0) { cur.assign(1, b); in = true; }
-		else if (in)
+		if (isRealtime(b)) continue;
+		if (b == 0xF0)
+		{
+			if (in) out.incomplete.push_back(std::move(cur));
+			cur.assign(1, b);
+			in = true;
+		}
+		else if (!in) continue;
+		else if (b == 0xF7)
 		{
 			cur.push_back(b);
-			if (b == 0xF7) { out.push_back(std::move(cur)); cur.clear(); in = false; }
+			out.messages.push_back(std::move(cur));
+			cur.clear();
+			in = false;
 		}
+		else if (b & 0x80)
+		{
+			out.incomplete.push_back(std::move(cur));
+			cur.clear();
+			in = false;
+		}
+		else cur.push_back(b);
 	}
+	if (in) out.incomplete.push_back(std::move(cur));
 	return out;
+}
+
+// The complete messages of a .syx file (see scan()).
+inline std::vector<std::vector<std::uint8_t>> split(const std::uint8_t *data, std::size_t n)
+{
+	return scan(data, n).messages;
 }
 
 inline std::string programSlot(int program)
@@ -340,14 +425,69 @@ inline bool storesToMemory(Unit unit)
 
 inline bool carriesGlobal(Unit unit) { return unit == Unit::Global || unit == Unit::AllData; }
 
-// Keep the synth's own channel, SysEx switches and memory-protect state in an imported
-// global record (the first kGlobalBytes of a Global or All Data dump).
+// Keep the synth's own kPreservedGlobalRanges (channel, SysEx and Program Change
+// switches, bank and program select maps, memory protect) in an imported global record
+// (the first kGlobalBytes of a Global or All Data dump).
 inline void preserveGlobalMidi(Dump &dump, const std::vector<std::uint8_t> &currentGlobal)
 {
 	if (!carriesGlobal(dump.unit) || currentGlobal.size() < kGlobalBytes || dump.raw.size() < kGlobalBytes)
 		return;
-	for (std::size_t offset : {kGlobalProtectOffset, kGlobalChannelOffset, kGlobalSysexOffset})
-		dump.raw[offset] = currentGlobal[offset];
+	for (const auto &[first, last] : kPreservedGlobalRanges)
+		std::copy(currentGlobal.begin() + long(first), currentGlobal.begin() + long(last) + 1,
+			dump.raw.begin() + long(first));
+}
+
+// What a .syx file holds: the dumps that can be loaded, and what will be skipped.
+struct FileContents
+{
+	std::vector<Dump> dumps;
+	int foreign = 0;           // complete messages that are not Prophecy data dumps
+	int damaged = 0;           // Prophecy dumps that fail validation
+	std::string damagedReason; // why the first damaged dump failed
+	int cutOffDumps = 0;       // Prophecy dumps that end without F7 (a truncated file)
+	int cutOffOther = 0;       // other messages that end without F7
+	bool hasMessages = false;  // any F0 at all
+
+	// One line per kind of skipped data, for the import dialog.
+	std::vector<std::string> skipped() const
+	{
+		auto count = [](int n, const char *one, const char *many) {
+			return std::to_string(n) + " " + (n == 1 ? one : many);
+		};
+		std::vector<std::string> out;
+		if (damaged > 0)
+			out.push_back(count(damaged, "damaged Prophecy dump", "damaged Prophecy dumps")
+				+ " (" + (damaged > 1 ? "the first: " : "") + damagedReason + ")");
+		if (cutOffDumps > 0)
+			out.push_back(count(cutOffDumps, "Prophecy dump", "Prophecy dumps")
+				+ " cut off before the end, so the file may be truncated");
+		if (cutOffOther > 0)
+			out.push_back(count(cutOffOther, "other message", "other messages") + " cut off before the end");
+		if (foreign > 0)
+			out.push_back(count(foreign, "message that is not a Prophecy data dump",
+				"messages that are not Prophecy data dumps"));
+		return out;
+	}
+};
+
+inline FileContents readFile(const std::uint8_t *data, std::size_t n)
+{
+	FileContents out;
+	Scan s = scan(data, n);
+	out.hasMessages = !s.messages.empty() || !s.incomplete.empty();
+	for (const auto &msg : s.messages)
+	{
+		std::string why;
+		if (auto dump = parse(msg, &why)) out.dumps.push_back(std::move(*dump));
+		else if (isProphecyDumpHeader(msg))
+		{
+			if (out.damaged++ == 0) out.damagedReason = why;
+		}
+		else ++out.foreign;
+	}
+	for (const auto &msg : s.incomplete)
+		++(isProphecyDumpHeader(msg) ? out.cutOffDumps : out.cutOffOther);
+	return out;
 }
 
 // The synth side of a transfer. Message thread only.
@@ -356,6 +496,9 @@ struct SysexPort
 	virtual ~SysexPort() = default;
 	virtual bool ready() = 0; // booted, and no other editor SysEx in flight
 	virtual int channel() = 0;
+	// The synth's own clock in milliseconds. It stands still while the emulator does: the
+	// plugin bypassed, or the host not processing its track.
+	virtual double emulatedMs() = 0;
 	virtual bool openStream() = 0;
 	virtual std::size_t pushStream(const std::uint8_t *bytes, std::size_t n) = 0;
 	virtual std::size_t streamPending() = 0;
@@ -364,11 +507,17 @@ struct SysexPort
 	virtual void clearReplies() = 0;
 };
 
+inline constexpr const char *kStalledMessage =
+	"The synth stopped running: no audio was processed for 5 seconds. The plugin may be "
+	"bypassed, or the host may not be processing its track.";
+
 // One export or import at a time, advanced by tick() every few milliseconds. A transfer
-// is a fixed list of steps; every byte goes through the exclusive stream so nothing else
-// reaches the UART mid-dump. Loads to program or pattern memory are bracketed by
-// unprotect/re-protect, matching WRITE. The re-protect steps sit after `cleanupFrom`
-// and also run after a failure or cancel, which jump straight to them.
+// is a fixed list of steps. Every byte goes through the exclusive stream, so nothing else
+// reaches the UART mid-dump, and it is paced to the emulated UART, so a cancel can still
+// cut a dump short. Loads to program or pattern memory are bracketed by unprotect and
+// re-protect, matching WRITE. The re-protect steps sit after `cleanupFrom`; a failure or
+// cancel skips ahead to them, but only after the synth has answered any dump that has
+// gone out (the firmware ignores SysEx, the re-protect included, while it stores one).
 class Transfer
 {
 public:
@@ -382,16 +531,26 @@ public:
 	};
 
 	bool busy() const { return m_status.state == State::Running; }
+	// After a stall the outcome is reported at once, but ending a cut-off message and
+	// restoring memory protect wait until the synth runs again. Keep calling tick() while
+	// this is true; no new transfer starts until it is false.
+	bool settling() const { return m_settling; }
+	bool needsTicks() const { return busy() || m_settling; }
 	const Status &status() const { return m_status; }
-	// The reply of a successful export; the dumps of a successful import (after any
-	// global preservation), for refreshing program names.
+	// The reply of a successful export, without real-time bytes.
 	const std::vector<std::uint8_t> &exported() const { return m_exported; }
+	// The dumps of an import (after any global preservation), and the indices of those the
+	// synth acknowledged as stored.
 	const std::vector<Dump> &imported() const { return m_dumps; }
+	const std::vector<std::size_t> &stored() const { return m_stored; }
 
 	bool startExport(Unit unit, int index)
 	{
-		if (busy()) return false;
+		const int count = unit == Unit::Program ? kProgramCount : unit == Unit::Bank ? 2
+			: unit == Unit::Pattern ? kPatternCount : 1;
+		if (needsTicks() || (count > 1 && (index < 0 || index >= count))) return false;
 		reset();
+		m_export = true;
 		const double wireMs = double(messageBytes(unit)) / kUartBytesPerMs;
 		m_steps.push_back(send([unit, index](int ch) { return request(unit, index, ch); },
 			"Receiving " + label(Dump{unit, index, {}})));
@@ -403,7 +562,7 @@ public:
 
 	bool startImport(std::vector<Dump> dumps)
 	{
-		if (busy() || dumps.empty()) return false;
+		if (needsTicks() || dumps.empty()) return false;
 		reset();
 		m_dumps = std::move(dumps);
 		bool memory = false, global = false;
@@ -424,52 +583,79 @@ public:
 		if (memory) protect(0, "Preparing import");
 		if (global)
 		{
+			const double wireMs = double(messageBytes(Unit::Global)) / kUartBytesPerMs;
 			m_steps.push_back(send([](int ch) { return request(Unit::Global, 0, ch); },
 				"Reading current global settings"));
-			m_steps.push_back(await(Step::Kind::AwaitGlobal, 3000.0, Unit::Global, -1));
-			m_estimateMs += double(messageBytes(Unit::Global)) / kUartBytesPerMs;
+			m_steps.push_back(await(Step::Kind::AwaitGlobal, 3000.0 + wireMs, Unit::Global, -1));
+			m_estimateMs += wireMs + 100.0;
 		}
 		for (std::size_t i = 0; i < m_dumps.size(); ++i)
 		{
 			const double wireMs = double(messageBytes(m_dumps[i].unit)) / kUartBytesPerMs;
-			m_steps.push_back(send([this, i](int ch) {
+			Step s = send([this, i](int ch) {
 				preserveGlobalMidi(m_dumps[i], m_currentGlobal);
 				return build(m_dumps[i], ch);
-			}, "Sending " + label(m_dumps[i])));
-			m_steps.push_back(await(Step::Kind::AwaitAck, 4000.0 + wireMs, m_dumps[i].unit, -1));
+			}, "Sending " + label(m_dumps[i]));
+			s.dump = int(i);
+			m_steps.push_back(std::move(s));
+			Step a = await(Step::Kind::AwaitAck, kAckTimeoutMs, m_dumps[i].unit, -1);
+			a.dump = int(i);
+			m_steps.push_back(std::move(a));
 			m_steps.push_back(pause(200.0));
-			m_estimateMs += wireMs + 200.0;
+			m_estimateMs += wireMs + 400.0;
 		}
 		m_cleanupFrom = m_steps.size();
-		if (memory) protect(1, "Restoring memory protect");
+		if (memory)
+		{
+			m_steps.push_back(pause(200.0));
+			protect(1, "Restoring memory protect");
+		}
 		return true;
 	}
 
+	// Takes effect on the next tick, at any point of the transfer.
 	void cancel() { if (busy()) m_cancelRequested = true; }
 
-	void tick(SysexPort &port, double nowMs)
+	// `wallMs` is the host's clock. Everything else is timed on port.emulatedMs().
+	void tick(SysexPort &port, double wallMs)
 	{
-		if (!busy()) return;
-		if (m_startMs < 0)
+		if (!needsTicks()) return;
+		const double emu = port.emulatedMs();
+		if (m_lastProgressWallMs < 0 || std::abs(emu - m_lastEmuMs) > 1e-9)
+		{
+			m_lastEmuMs = emu;
+			m_lastProgressWallMs = wallMs;
+		}
+		const bool stalled = wallMs - m_lastProgressWallMs > kStallMs;
+		if (busy() && m_startEmuMs < 0)
 		{
 			// Wait for any editor command or patch load before taking the UART.
-			if (m_cancelRequested) { finish(State::Cancelled, "Cancelled"); return; }
+			if (m_cancelRequested) { finish(State::Cancelled, "Cancelled. Nothing was sent."); return; }
 			if (!port.ready())
 			{
-				if (m_firstTickMs < 0) m_firstTickMs = nowMs;
-				if (nowMs - m_firstTickMs > 10000.0)
-					finish(State::Failed, "The synth is busy or not running. Try again in a moment.");
+				if (m_firstTickWallMs < 0) m_firstTickWallMs = wallMs;
+				if (stalled) finish(State::Failed, std::string(kStalledMessage) + " Nothing was sent.");
+				else if (wallMs - m_firstTickWallMs > kReadyWaitMs)
+					finish(State::Failed, "The synth is busy with another editor command. Try again in a moment.");
 				return;
 			}
-			m_startMs = nowMs;
+			m_startEmuMs = emu;
 			port.clearReplies();
 		}
-		// Never cancel mid-stream or while the firmware stores a dump: it drops SysEx
-		// (including the re-protect) until it has acknowledged the load.
-		const bool storing = m_next < m_steps.size() && m_steps[m_next].kind == Step::Kind::AwaitAck;
-		if (m_cancelRequested && !m_streaming && !storing) stop(State::Cancelled, "Cancelled");
-		while (busy() && advance(port, nowMs)) {}
-		if (busy()) m_status.progress = std::clamp((nowMs - m_startMs) / m_estimateMs, 0.0, 0.99);
+		if (busy())
+		{
+			if (m_cancelRequested && !m_stopping) stop(State::Cancelled, "Cancelled.");
+			if (stalled && !m_stopping && m_next < m_cleanupFrom) stop(State::Failed, kStalledMessage);
+		}
+		while (needsTicks() && advance(port, emu)) {}
+		if (busy() && stalled)
+		{
+			// Report now; whatever cleanup is left resumes when the synth runs again.
+			m_settling = true;
+			finish(m_result, outcome(true));
+		}
+		else if (busy())
+			m_status.progress = std::clamp((emu - m_startEmuMs) / std::max(m_estimateMs, 1.0), 0.0, 0.99);
 	}
 
 private:
@@ -480,9 +666,11 @@ private:
 		std::string phase;    // shown while this step runs, if set
 		Unit unit = Unit::CurrentProgram;
 		int index = -1;       // AwaitDump: the reply to match
-		double ms = 0.0;      // Await timeout, or Pause length
+		int dump = -1;        // Send and AwaitAck of an import: which dump
+		double ms = 0.0;      // emulated: Await timeout, or Pause length
 	};
 	enum class Reply { Waiting, Arrived, Stopped };
+	enum class Answer { None, Stored, Refused };
 
 	static Step send(std::function<std::vector<std::uint8_t>(int)> message, std::string phase)
 	{
@@ -510,12 +698,16 @@ private:
 		m_dumps.clear();
 		m_exported.clear();
 		m_currentGlobal.clear();
-		m_next = m_cleanupFrom = 0;
 		m_out.clear();
-		m_outPos = 0;
-		m_stepStartMs = m_startMs = m_firstTickMs = -1.0;
-		m_estimateMs = 0.0;
-		m_streaming = m_cancelRequested = false;
+		m_stored.clear();
+		m_next = m_cleanupFrom = m_outPos = 0;
+		m_stepStartEmuMs = m_streamStartEmuMs = m_estimateMs = m_lastEmuMs = 0.0;
+		m_startEmuMs = m_lastProgressWallMs = m_firstTickWallMs = -1.0;
+		m_export = m_stepStarted = m_streaming = m_cutOff = false;
+		m_cancelRequested = m_stopping = m_settling = false;
+		m_awaitingAnswer = m_answerCutOff = false;
+		m_answerDump = -1;
+		m_answer = Answer::None;
 		m_result = State::Succeeded;
 		m_message.clear();
 	}
@@ -527,23 +719,80 @@ private:
 		if (state == State::Succeeded) m_status.progress = 1.0;
 	}
 
-	// Record the outcome (the first failure wins) and skip to the cleanup steps.
+	// Record the outcome (the first one wins) and wind down: the next step boundary skips
+	// to the cleanup steps, after hearing the answer to any dump already sent.
 	void stop(State state, const std::string &message)
 	{
 		if (m_result == State::Succeeded) { m_result = state; m_message = message; }
-		if (m_next < m_cleanupFrom) { m_next = m_cleanupFrom; m_stepStartMs = -1.0; }
+		m_stopping = true;
+		if (state == State::Cancelled) m_status.phase = "Cancelling";
 	}
 
-	// Stream m_out to the synth. Returns true once it has drained into the UART.
-	bool stream(SysexPort &port)
+	bool skipToCleanup()
+	{
+		m_next = std::max(m_next, m_cleanupFrom);
+		m_stepStarted = false;
+		return true;
+	}
+
+	// The message for the final status.
+	std::string outcome(bool stalledNow) const
+	{
+		std::string msg = m_result == State::Succeeded ? (m_export ? "Export complete." : "Import complete.")
+			: m_message;
+		const bool interrupted = m_result == State::Cancelled || (stalledNow && m_result != State::Succeeded);
+		if (!m_export && interrupted)
+		{
+			if (m_answerDump >= 0)
+			{
+				const std::string what = label(m_dumps[std::size_t(m_answerDump)]);
+				if (m_awaitingAnswer)
+					msg += " " + what + " was on its way to the synth when it stopped.";
+				else if (m_answerCutOff)
+					msg += m_answer == Answer::Refused ? " The synth rejected the incomplete " + what + "."
+						: m_answer == Answer::Stored ? " The synth still stored the incomplete " + what + "; check it."
+						: " The synth did not answer the incomplete " + what + "; check it.";
+				else
+					msg += m_answer == Answer::Stored ? " " + what + " had already been sent in full and was stored."
+						: m_answer == Answer::Refused ? " The synth refused " + what + "."
+						: " " + what + " had already been sent in full, but the synth did not confirm it.";
+			}
+			else if (m_stored.empty()) msg += " Nothing was loaded.";
+			if (m_dumps.size() > 1)
+				msg += " " + std::to_string(m_stored.size()) + " of " + std::to_string(m_dumps.size())
+					+ " dumps were loaded.";
+		}
+		if (stalledNow)
+		{
+			bool protectLeft = false;
+			for (std::size_t i = std::max(m_next, m_cleanupFrom); i < m_steps.size(); ++i)
+				protectLeft = protectLeft || m_steps[i].kind == Step::Kind::Send;
+			if (protectLeft) msg += " Memory protect will be turned back on when the synth runs again.";
+		}
+		return msg;
+	}
+
+	// Stream m_out to the synth. Returns true once it has all been handed to the UART.
+	bool stream(SysexPort &port, double emu)
 	{
 		if (!m_streaming)
 		{
 			if (!port.openStream()) return false;
 			m_streaming = true;
+			m_streamStartEmuMs = emu;
 		}
 		if (m_outPos < m_out.size())
-			m_outPos += port.pushStream(m_out.data() + m_outPos, m_out.size() - m_outPos);
+		{
+			// Stay at most kStreamLeadBytes ahead of the emulated UART, so bytes not yet
+			// sent can still be held back by a cancel.
+			const double due = kStreamLeadBytes + (emu - m_streamStartEmuMs) * kUartBytesPerMs;
+			std::size_t n = due > double(m_outPos) ? std::size_t(due) - m_outPos : 0;
+			const std::size_t pending = port.streamPending();
+			n = std::min({n, m_out.size() - m_outPos,
+				pending < kMaxStreamPending ? kMaxStreamPending - pending : std::size_t(0)});
+			if (m_cutOff && m_outPos + 1 == m_out.size()) n = 1; // the closing F7 of a cut-off dump
+			if (n > 0) m_outPos += port.pushStream(m_out.data() + m_outPos, n);
+		}
 		if (m_outPos < m_out.size() || port.streamPending() != 0) return false;
 		port.closeStream();
 		m_streaming = false;
@@ -552,83 +801,137 @@ private:
 
 	Reply awaitReply(SysexPort &port, const Step &step)
 	{
-		std::vector<std::uint8_t> reply;
-		while (port.popReply(reply))
+		std::vector<std::uint8_t> raw;
+		while (port.popReply(raw))
 		{
+			const std::vector<std::uint8_t> reply = withoutRealtime(raw);
+			if (reply.size() < 6) continue;
 			if (step.kind == Step::Kind::AwaitAck)
 			{
+				const std::string what = label(m_dumps[std::size_t(step.dump)]);
 				switch (reply[4])
 				{
-					case 0x23: return Reply::Arrived;
+					case 0x23:
+						m_awaitingAnswer = false;
+						m_answer = Answer::Stored;
+						m_stored.push_back(std::size_t(step.dump));
+						return Reply::Arrived;
 					case 0x24:
 					{
+						m_awaitingAnswer = false;
+						m_answer = Answer::Refused;
 						const int code = reply.size() > 6 ? reply[5] & 7 : 0;
-						stop(State::Failed, code == 1 ? "The synth refused the data: program memory is protected."
-							: code == 2 ? "The synth refused the data: pattern memory is protected."
-							: "The synth reported a data load error.");
+						stop(State::Failed, code == 1 ? "The synth refused " + what + ": program memory is protected."
+							: code == 2 ? "The synth refused " + what + ": pattern memory is protected."
+							: "The synth reported an error loading " + what + ".");
 						return Reply::Stopped;
 					}
 					case 0x26:
-						stop(State::Failed, "The synth rejected the data as badly formatted.");
+						m_awaitingAnswer = false;
+						m_answer = Answer::Refused;
+						stop(State::Failed, "The synth rejected " + what + " as badly formatted.");
 						return Reply::Stopped;
 					default: continue;
 				}
 			}
 			if (!matches(reply, step)) continue;
-			if (step.kind == Step::Kind::AwaitGlobal)
+			std::string why;
+			std::optional<Dump> dump = parse(reply, &why);
+			if (!dump)
 			{
-				std::optional<Dump> current = parse(reply);
-				if (!current) { stop(State::Failed, "The synth sent an unreadable global dump."); return Reply::Stopped; }
-				m_currentGlobal = std::move(current->raw);
+				stop(State::Failed, "The synth sent a damaged " + label(Dump{step.unit, step.index, {}})
+					+ " dump (" + why + ").");
+				return Reply::Stopped;
 			}
-			else m_exported = std::move(reply);
+			if (step.kind == Step::Kind::AwaitGlobal) m_currentGlobal = std::move(dump->raw);
+			else m_exported = reply;
 			return Reply::Arrived;
 		}
 		return Reply::Waiting;
 	}
 
-	// Run the current step; true when it finished (or the transfer jumped to cleanup).
-	bool advance(SysexPort &port, double nowMs)
+	// Run the current step; true when it finished (or the transfer skipped ahead).
+	bool advance(SysexPort &port, double emu)
 	{
 		if (m_next >= m_steps.size())
 		{
-			if (m_result != State::Succeeded) finish(m_result, m_message);
-			else finish(State::Succeeded, m_exported.empty() ? "Import complete" : "Export complete");
+			if (m_settling) m_settling = false; // the outcome went out at the stall
+			else finish(m_result, outcome(false));
 			return false;
 		}
 		Step &step = m_steps[m_next];
-		if (m_stepStartMs < 0)
+		const bool interruptible = m_next < m_cleanupFrom;
+		if (!m_stepStarted)
 		{
-			m_stepStartMs = nowMs;
-			if (!step.phase.empty()) m_status.phase = step.phase;
-			if (step.kind == Step::Kind::Send) { m_out = step.message(port.channel()); m_outPos = 0; }
+			// Winding down skips everything before cleanup except hearing how the synth
+			// answered a dump that has (wholly or partly) gone out.
+			if (m_stopping && interruptible && !(step.kind == Step::Kind::AwaitAck && m_awaitingAnswer))
+				return skipToCleanup();
+			m_stepStarted = true;
+			m_stepStartEmuMs = emu;
+			if (step.kind == Step::Kind::AwaitAck && m_stopping)
+				m_status.phase = "Waiting for the synth to answer " + label(m_dumps[std::size_t(step.dump)]);
+			else if (!step.phase.empty()) m_status.phase = step.phase;
+			if (step.kind == Step::Kind::Send)
+			{
+				m_out = step.message(port.channel());
+				m_outPos = 0;
+				m_cutOff = false;
+			}
 		}
 		switch (step.kind)
 		{
 			case Step::Kind::Send:
-				if (!stream(port)) return false;
+			{
+				if (m_stopping && interruptible && !m_cutOff && m_outPos < m_out.size())
+				{
+					if (m_outPos == 0)
+					{
+						if (m_streaming) { port.closeStream(); m_streaming = false; }
+						return skipToCleanup();
+					}
+					// End the message where it stands, so the synth sees a short dump rather
+					// than a SysEx that swallows whatever comes next.
+					m_out.resize(m_outPos);
+					m_out.push_back(0xF7);
+					m_cutOff = true;
+				}
+				const bool sent = stream(port, emu);
+				if (step.dump >= 0 && m_outPos > 0)
+				{
+					m_awaitingAnswer = true;
+					m_answerDump = step.dump;
+					m_answerCutOff = m_cutOff;
+					m_answer = Answer::None;
+				}
+				if (!sent) return false;
 				break;
+			}
 			case Step::Kind::Pause:
-				if (nowMs - m_stepStartMs < step.ms) return false;
+				if (m_stopping && interruptible) return skipToCleanup();
+				if (emu - m_stepStartEmuMs < step.ms) return false;
 				break;
 			case Step::Kind::AwaitDump:
 			case Step::Kind::AwaitGlobal:
+				if (m_stopping && interruptible) return skipToCleanup();
+				[[fallthrough]];
 			case Step::Kind::AwaitAck:
 			{
-				const Reply r = awaitReply(port, step);
-				if (r == Reply::Stopped) return true;
-				if (r == Reply::Waiting)
+				if (awaitReply(port, step) != Reply::Waiting) break;
+				const bool ack = step.kind == Step::Kind::AwaitAck;
+				if (emu - m_stepStartEmuMs <= (ack && m_answerCutOff ? kCutOffAckTimeoutMs : step.ms))
+					return false;
+				if (ack)
 				{
-					if (nowMs - m_stepStartMs <= step.ms) return false;
-					stop(State::Failed, step.kind == Step::Kind::AwaitAck ? "The synth did not confirm the load."
-						: "The synth did not send the requested data.");
-					return true;
+					m_awaitingAnswer = false;
+					stop(State::Failed, "The synth did not confirm " + label(m_dumps[std::size_t(step.dump)]) + ".");
 				}
+				else stop(State::Failed, "The synth did not send the requested data.");
 				break;
 			}
 		}
 		++m_next;
-		m_stepStartMs = -1.0;
+		m_stepStarted = false;
 		return true;
 	}
 
@@ -654,9 +957,17 @@ private:
 	std::vector<Step> m_steps;
 	std::vector<Dump> m_dumps;
 	std::vector<std::uint8_t> m_exported, m_currentGlobal, m_out;
+	std::vector<std::size_t> m_stored;
 	std::size_t m_next = 0, m_cleanupFrom = 0, m_outPos = 0;
-	double m_stepStartMs = -1.0, m_startMs = -1.0, m_firstTickMs = -1.0, m_estimateMs = 0.0;
-	bool m_streaming = false, m_cancelRequested = false;
+	double m_stepStartEmuMs = 0.0, m_streamStartEmuMs = 0.0, m_estimateMs = 0.0, m_lastEmuMs = 0.0;
+	double m_startEmuMs = -1.0, m_lastProgressWallMs = -1.0, m_firstTickWallMs = -1.0;
+	bool m_export = false, m_stepStarted = false, m_streaming = false, m_cutOff = false;
+	bool m_cancelRequested = false, m_stopping = false, m_settling = false;
+	// The most recent dump that went out: is its answer still awaited, was it cut off,
+	// and how did the synth answer.
+	bool m_awaitingAnswer = false, m_answerCutOff = false;
+	int m_answerDump = -1;
+	Answer m_answer = Answer::None;
 	State m_result = State::Succeeded; // outcome so far; cleanup still runs after a failure
 	std::string m_message;
 };

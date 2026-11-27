@@ -706,6 +706,27 @@ static void host_led_impl(uint8_t bank, uint8_t data)
 // only there, which keeps it from splitting a message popped across two calls.
 static bool g_host_midi_cycle_start = true;
 static bool g_host_sysex_stream_engaged = false;
+// Host and editor MIDI that arrives while the stream is engaged. A dump is paced to the
+// UART, so a bank or all-data dump holds it for up to 26 s, longer than the 4 KB host
+// rings can absorb. Their messages (always enqueued whole) wait here instead, in order,
+// and go to the UART first once the stream closes.
+static std::deque<uint8_t> g_host_midi_held;
+
+static std::uint64_t host_midi_frame(double emu_seconds)
+{
+	return (std::uint64_t)std::llround(emu_seconds * (double)ProphecyEngine::kSampleRate);
+}
+
+static void hold_host_midi(double emu_seconds)
+{
+	uint8_t bytes[256];
+	size_t got;
+	while ((got = g_host_midi_ring.pop(bytes, sizeof(bytes))) > 0)
+		g_host_midi_held.insert(g_host_midi_held.end(), bytes, bytes + got);
+	const auto frame = host_midi_frame(emu_seconds);
+	while ((got = g_host_timed_midi_ring.popDue(bytes, sizeof(bytes), frame)) > 0)
+		g_host_midi_held.insert(g_host_midi_held.end(), bytes, bytes + got);
+}
 
 static bool host_midi_pop_impl(uint8_t *out, size_t cap, size_t *n, double emu_seconds)
 {
@@ -721,6 +742,7 @@ static bool host_midi_pop_impl(uint8_t *out, size_t cap, size_t *n, double emu_s
 		g_host_sysex_stream_engaged = true;
 	if (g_host_sysex_stream_engaged)
 	{
+		hold_host_midi(emu_seconds);
 		*n = g_host_sysex_stream_ring.pop(out, cap);
 		if (*n == 0 && !streamRequested)
 			g_host_sysex_stream_engaged = false; // closed and drained: resume other input
@@ -730,13 +752,17 @@ static bool host_midi_pop_impl(uint8_t *out, size_t cap, size_t *n, double emu_s
 			return *n > 0;
 		}
 	}
+	if (!g_host_midi_held.empty())
+	{
+		*n = std::min(cap, g_host_midi_held.size());
+		std::copy_n(g_host_midi_held.begin(), *n, out);
+		g_host_midi_held.erase(g_host_midi_held.begin(), g_host_midi_held.begin() + long(*n));
+		g_host_midi_cycle_start = false;
+		return true;
+	}
 	*n = g_host_midi_ring.pop(out, cap);
 	if (*n == 0)
-	{
-		const auto frame = (std::uint64_t)std::llround(
-			emu_seconds * (double)ProphecyEngine::kSampleRate);
-		*n = g_host_timed_midi_ring.popDue(out, cap, frame);
-	}
+		*n = g_host_timed_midi_ring.popDue(out, cap, host_midi_frame(emu_seconds));
 	g_host_midi_cycle_start = *n == 0;
 	return *n > 0;
 }
@@ -1084,6 +1110,7 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 	g_host_sysex_stream_requested.store(false, std::memory_order_release);
 	g_host_sysex_stream_engaged = false; // the new machine's MAME thread has not started
 	g_host_midi_cycle_start = true;
+	g_host_midi_held.clear();
 	g_sysex_reply_queue.reset();
 	g_host_panel_ring.reset();
 	g_host_adin_ui_ring.reset();

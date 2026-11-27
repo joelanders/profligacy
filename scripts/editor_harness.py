@@ -97,9 +97,10 @@ const INTERACTIVE_PREVIEW = __HARNESS_PREVIEW__;
       else if (fn === "setGlobalParam") { console.log("setGlobalParam", JSON.stringify(params)); }
       // SysEx files: a canned bank-file summary and a transfer that takes six seconds.
       else if (fn === "sysexExport") { MOCK.sx = {start: Date.now(), phase: "Receiving Bank A", done: "Saved Bank A to Prophecy Bank A.syx"}; result = true; }
-      else if (fn === "sysexImport") result = {ok: true, file: "Prophecy Bank A.syx", ignored: 1,
+      else if (fn === "sysexImport") result = {ok: true, file: "Prophecy Bank A.syx",
+        skipped: ["1 message that is not a Prophecy data dump"],
         items: [{unit: "bank", index: 0, label: "Bank A"}]};
-      else if (fn === "sysexImportConfirm") { MOCK.sx = {start: Date.now(), phase: "Sending Bank A", done: "Loaded Bank A from Prophecy Bank A.syx"}; result = true; }
+      else if (fn === "sysexImportConfirm") { MOCK.sx = {start: Date.now(), phase: "Sending Bank A", done: "Loaded Bank A from Prophecy Bank A.syx."}; result = {ok: true}; }
       else if (fn === "sysexStatus") {
         const sx = MOCK.sx, p = sx ? (Date.now() - sx.start) / 6000 : 0;
         result = !sx ? {state: "idle"} : p < 1 ? {state: "running", phase: sx.phase, progress: p}
