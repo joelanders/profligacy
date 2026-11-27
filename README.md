@@ -78,7 +78,7 @@ I can test macOS on ARM and Intel processors (currently not building a release f
 Linux/x64 builds from source (VST3 and Standalone; there is no Linux release yet). Tested on Ubuntu 25.10 with gcc 15, and by [@eufex](https://github.com/joelanders/profligacy/issues/23) on Debian 12 with gcc 12 (VST3 in Ardour, REAPER, Bespoke Synth and Carla):
 
 ```sh
-sudo apt install build-essential cmake git python3 pkg-config \
+sudo apt install build-essential cmake git python3 python3-numpy pkg-config \
   libsdl2-dev libsdl2-ttf-dev libpulse-dev libx11-dev libxext-dev libxi-dev \
   libxinerama-dev libxrandr-dev libxcursor-dev libxcomposite-dev \
   libfontconfig1-dev libfreetype-dev libasound2-dev libgl-dev \
@@ -94,7 +94,7 @@ Linux build notes:
 
 - The MAME build needs about 2 GB of RAM per job, so `build_mame_core.sh` picks one job per 2 GB on Linux; override with `JOBS=n`. If a compile was killed for running out of memory (`Killed signal terminated program cc1plus`), it can leave an empty `.o` that `make` considers up to date and the link fails later with undefined references. Delete `extern/mame/build/linux_gcc` and rerun with `--regen`.
 - With gcc 12 (e.g. Debian 12), some MAME warnings are errors; build with `NOWERROR=1 scripts/build_mame_core.sh --regen`.
-- The binary links the system's SDL2, PulseAudio, GTK 3 and WebKitGTK, so run it on the distribution it was built on, or a newer one.
+- The binary links the system's SDL2, SDL2_ttf, PulseAudio, ALSA, X11, fontconfig and FreeType, so run it on the distribution it was built on, or a newer one. GTK 3 and WebKitGTK are not linked: JUCE loads them at runtime for the editor, by the unversioned library names that `libgtk-3-dev` and `libwebkit2gtk-4.1-dev` install. Without them the plugin still loads, but its editor is blank.
 
 ## License
 

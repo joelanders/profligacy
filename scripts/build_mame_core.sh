@@ -16,7 +16,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MAME_DIR="${MAME_DIR:-$ROOT_DIR/extern/mame}"
 # MAME names its output directory after the host toolchain. On Linux the
 # archives are linked into the VST3 shared object, so they must be PIC.
-EXTRA_MAKE_ARGS=()
+NEEDS_PIC=0
 DEFAULT_JOBS=16
 case "$(uname -s)" in
 	Darwin)
@@ -29,7 +29,7 @@ case "$(uname -s)" in
 			exit 1
 		fi
 		MAME_TOOLCHAIN_DIR=linux_gcc
-		EXTRA_MAKE_ARGS+=("ARCHOPTS=-fPIC")
+		NEEDS_PIC=1
 		# MAME's emumem_* files need ~1.5 GB per cc1plus, and an OOM-killed compile
 		# can leave an empty .o that make later treats as up to date. Default to
 		# one job per 2 GB of RAM, capped at the CPU count.
@@ -59,7 +59,22 @@ export PATH="$SHIMDIR:$PATH"
 
 # korgprophecy_build.sh recognizes --regen only as its first argument. Preserve
 # the caller's option ordering; make variable assignments remain valid after it.
-(cd "$MAME_DIR" && JOBS="${JOBS:-$DEFAULT_JOBS}" ./scripts/korgprophecy_build.sh "$@" ${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"} PYTHON_EXECUTABLE="$PYBIN")
+# When PIC is needed, append -fPIC to the caller's ARCHOPTS (a make argument,
+# else the environment) instead of replacing it: make keeps only the last
+# ARCHOPTS= on its command line, and that one overrides the environment.
+MAKE_ARGS=()
+ARCHOPTS_GIVEN=0
+for arg in "$@"; do
+	if [[ "$NEEDS_PIC" == 1 && "$arg" == ARCHOPTS=* ]]; then
+		arg="$arg -fPIC"
+		ARCHOPTS_GIVEN=1
+	fi
+	MAKE_ARGS+=("$arg")
+done
+if [[ "$NEEDS_PIC" == 1 && "$ARCHOPTS_GIVEN" == 0 ]]; then
+	MAKE_ARGS+=("ARCHOPTS=${ARCHOPTS:+$ARCHOPTS }-fPIC")
+fi
+(cd "$MAME_DIR" && JOBS="${JOBS:-$DEFAULT_JOBS}" ./scripts/korgprophecy_build.sh ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"} PYTHON_EXECUTABLE="$PYBIN")
 
 REV="$(git -C "$MAME_DIR" rev-parse HEAD)"
 DIRTY=""

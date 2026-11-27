@@ -60,7 +60,7 @@ static int prophecy_setenv(const char *name, const char *value, int overwrite)
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #endif
-#if defined(__linux__)
+#if defined(__linux__) && defined(__GLIBC__)
 #include <link.h>
 #endif
 
@@ -91,10 +91,11 @@ void* retain_current_module()
 			reinterpret_cast<LPCWSTR>(&retain_current_module), &module))
 		return nullptr;
 	return module;
-#elif defined(__linux__)
+#elif defined(__linux__) && defined(__GLIBC__)
 	// glibc refuses to dlopen a PIE executable, so when the engine is linked into
 	// the main program (Standalone, test hosts) take the main-program handle; that
-	// image can never be unloaded anyway.
+	// image can never be unloaded anyway. dladdr1 is a glibc extension; other C
+	// libraries (musl) use the plain dladdr path below.
 	Dl_info info{};
 	link_map *map = nullptr;
 	if (!dladdr1(reinterpret_cast<const void*>(&retain_current_module), &info,
