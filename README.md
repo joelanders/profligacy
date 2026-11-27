@@ -35,6 +35,12 @@ First rule of emulation development is that I can't help you get the firmware. T
 
 On first launch a folder picker opens. Point it at a directory containing `korgprop/ic12_v17.bin` and `korgprop/ic22_v17.bin` *or* `korgprop.zip` containing those two bin files.
 
+### SysEx files
+
+The **SysEx** button (top right), the **SYSEX** menu in the program browser, or a right-click on a program exports or imports `.syx` files in the Prophecy's own dump formats: the edit buffer, one program, Bank A or B, all programs, one or all arpeggio patterns, the global settings, or all data. Files from a real Prophecy load the same way. A single program, bank or pattern can be loaded into a different slot, and an imported global dump keeps the synth's MIDI channel and SysEx settings.
+
+Transfers run at real MIDI speed, so a bank takes about 13 seconds and all data about 26. Imported programs, patterns and globals go into the synth's memory, which the standalone app and every project share; a DAW project itself only stores the current edit buffer.
+
 
 ## Technical stuff
 

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <utility>
 
 struct ProphecyEngine::Impl
 {
@@ -32,6 +33,7 @@ struct ProphecyEngine::Impl
 	std::atomic<std::size_t> immediate_midi_bytes{0};
 	std::atomic<std::size_t> audio_adin_events{0};
 	std::atomic<std::uint32_t> lcd_version{0};
+	std::atomic<bool> sysex_open{false};
 };
 
 ProphecyEngine::ProphecyEngine() : m_impl(std::make_shared<Impl>()) { }
@@ -186,8 +188,50 @@ bool ProphecyEngine::latestLcd(char *line1, char *line2, std::size_t cap) const
 	line1[0] = line2[0] = '\0';
 	return false;
 }
-std::size_t ProphecyEngine::latestProgramData(std::uint8_t *, std::size_t, std::uint32_t *version) const { if (version) *version = 0; return 0; }
+// PROPHECY_FAKE_PROGRAM_DUMP=1 gives the stub a deterministic edit-buffer read-back.
+std::size_t ProphecyEngine::latestProgramData(std::uint8_t *out, std::size_t cap, std::uint32_t *version) const
+{
+	if (std::getenv("PROPHECY_FAKE_PROGRAM_DUMP") == nullptr || !running())
+	{
+		if (version) *version = 0;
+		return 0;
+	}
+	static constexpr char name[] = "Fake Edit Buffer";
+	constexpr std::size_t bytes = 535;
+	const std::size_t n = std::min(cap, bytes);
+	for (std::size_t i = 0; out != nullptr && i < n; ++i)
+		out[i] = i < 16 ? std::uint8_t(name[i]) : std::uint8_t((i * 37u) & 0xff);
+	if (version) *version = 1;
+	return n;
+}
 std::size_t ProphecyEngine::latestArpeggioPatternData(std::uint8_t *, std::size_t, std::uint32_t *version, int *pattern) const { if (version) *version = 0; if (pattern) *pattern = -1; return 0; }
+void ProphecyEngine::clearSysexReplies() {}
+bool ProphecyEngine::popSysexReply(std::vector<std::uint8_t> &) { return false; }
+// The stub accepts the SysEx stream at once and never answers, like a synth that ignores
+// SysEx; transfers then run their emulated-time timeouts.
+static std::vector<std::uint8_t> g_fake_sysex_stream; // message thread only
+
+// Test seam for the fake build: the bytes accepted on the SysEx stream since the last call.
+std::vector<std::uint8_t> prophecyFakeTakeSysexStream()
+{
+	return std::exchange(g_fake_sysex_stream, {});
+}
+
+bool ProphecyEngine::openSysexStream()
+{
+	if (!running() || m_impl->sysex_open.load()) return false;
+	m_impl->sysex_open.store(true);
+	return true;
+}
+std::size_t ProphecyEngine::pushSysexStream(const std::uint8_t *bytes, std::size_t n)
+{
+	if (!running() || !m_impl->sysex_open.load() || bytes == nullptr) return 0;
+	g_fake_sysex_stream.insert(g_fake_sysex_stream.end(), bytes, bytes + n);
+	return n;
+}
+std::size_t ProphecyEngine::sysexStreamPending() const { return 0; }
+void ProphecyEngine::closeSysexStream() { m_impl->sysex_open.store(false); }
+int ProphecyEngine::firmwareChannel() const { return 0; }
 std::size_t ProphecyEngine::available() const { return running() ? ringFrames() : 0; }
 std::size_t ProphecyEngine::ringFrames() const { return 2048; }
 std::uint64_t ProphecyEngine::producedFrames() const { return m_impl->produced.load(); }
