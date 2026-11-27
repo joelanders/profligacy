@@ -186,3 +186,83 @@ jobs:
           scripts/test_alpha_release_policy.py
           scripts/test_build_ci_probe_roms.py
           scripts/test_run_ci_rom_e2e.py
+
+  shell-linux-x64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Check out pinned JUCE only
+        run: git submodule update --init --depth 1 extern/JUCE
+      - name: Install the README's Linux build packages
+        # The README's apt list, plus xvfb for the artifact host below.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git python3 python3-numpy pkg-config \
+            libsdl2-dev libsdl2-ttf-dev libpulse-dev libx11-dev libxext-dev libxi-dev \
+            libxinerama-dev libxrandr-dev libxcursor-dev libxcomposite-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev libgl-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev \
+            xvfb
+      - name: Configure product shell
+        run: >-
+          cmake -S . -B build -G "Unix Makefiles"
+          -DCMAKE_BUILD_TYPE=Release
+          -DPROPHECY_USE_FAKE_ENGINE=ON
+          -DPROPHECY_COPY_PLUGIN_AFTER_BUILD=OFF
+          -DBUILD_TESTING=ON
+      - name: Build VST3, standalone, and artifact host
+        run: >-
+          cmake --build build --parallel 4 --target
+          ProphecyPlugin_VST3
+          ProphecyPlugin_Standalone
+          ProphecyArtifactHost
+          ProphecyPluginTimelineTest
+          ProphecyAudioTimelineTest
+          ProphecyLatencySequenceTest
+          ProphecySysexTransferTest
+          ProphecyPluginSysexFakeTest
+      - name: Verify processor sample timeline
+        run: ctest --test-dir build --output-on-failure -R '^(audio_timeline|plugin_timeline|latency_sequence|sysex_transfer|plugin_sysex_fake)$'
+      - name: Check the VST3 exports only its entry points
+        run: |
+          set -o pipefail
+          shopt -s nullglob
+          sos=(build/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3/Contents/*-linux/Profligacy.so)
+          if [ "${#sos[@]}" -ne 1 ]; then
+            echo "::error::expected one VST3 shared object, found ${#sos[@]}"
+            exit 1
+          fi
+          exports="$RUNNER_TEMP/vst3-exports.txt"
+          nm -D --defined-only "${sos[0]}" | awk 'NF >= 3 { print $3 }' | sort -u > "$exports"
+          echo "${sos[0]} exports $(wc -l < "$exports") symbols:"
+          cat "$exports"
+          status=0
+          for entry in GetPluginFactory ModuleEntry ModuleExit; do
+            if ! grep -qx "$entry" "$exports"; then
+              echo "::error::VST3 entry point $entry is not exported"
+              status=1
+            fi
+          done
+          # --exclude-libs keeps the static archives' symbols local. prophecy_engine
+          # and ProphecyData are built with default visibility, so without it the
+          # ProphecyEngine and BinaryData symbols show up here even in this
+          # fake-engine build; the MAME build would add its bundled libraries'.
+          leaked="$(grep -E '^(jpeg_|inflate|deflate|XML_|lua_|luaL_|sqlite3_|FLAC__|ZSTD_)|ProphecyEngine|BinaryData|4juce[0-9]' "$exports" || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::the VST3 exports symbols from its static archives:"
+            echo "$leaked"
+            status=1
+          fi
+          exit "$status"
+      - name: Load and process the packaged VST3 without ROMs
+        env:
+          PROPHECY_FORCE_NO_ROM: "1"
+        run: >-
+          xvfb-run -a
+          build/ProphecyArtifactHost_artefacts/Release/ProphecyArtifactHost
+          --plugin build/ProphecyPlugin_artefacts/Release/VST3/Profligacy.vst3
+          --receipt "$RUNNER_TEMP/product-shell-linux-x64.json"
+          --wav "$RUNNER_TEMP/product-shell-linux-x64.wav"
+          --seconds 1
