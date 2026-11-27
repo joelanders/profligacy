@@ -365,6 +365,19 @@ juce_add_plugin(ProphecyPlugin
 	${PROPHECY_WEBVIEW2_TARGET_ARGS}
 	COPY_PLUGIN_AFTER_BUILD ${PROPHECY_COPY_PLUGIN_AFTER_BUILD})
 
+if(UNIX AND NOT APPLE)
+	# Keep every symbol from the static archives (prophecy_engine, ProphecyData, and
+	# MAME with its bundled zlib, expat, Lua, libjpeg, sqlite3 and FLAC) out of the
+	# VST3's dynamic symbol table. ELF looks exported symbols up in the host's
+	# global scope first, so a host that already loaded, say, libjpeg-turbo would
+	# take over MAME's libjpeg 9 calls, and libraries the plugin pulls in
+	# (fontconfig -> expat) would bind to MAME's copies. The VST3 entry points
+	# stay exported: JUCE compiles juce_audio_plugin_client_VST3.cpp into
+	# ProphecyPlugin_VST3 itself, not into an archive. The Standalone is an
+	# executable, which exports nothing.
+	target_link_options(ProphecyPlugin_VST3 PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
+
 if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
 	# juce_add_plugin may instantiate module targets lazily, so repeat the
 	# runtime alignment after the plugin has created its module dependencies.
