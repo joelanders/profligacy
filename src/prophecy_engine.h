@@ -33,6 +33,12 @@ public:
 		Unavailable,
 		Stopped
 	};
+	enum class MultiCoreDspStatus : std::uint8_t
+	{
+		Off,         // DSPs run on the emulation thread
+		Active,      // DSPs run on their own worker thread
+		Unavailable  // requested, but the worker thread could not be started
+	};
 
 	// One byte observed on the firmware's physical MIDI OUT UART. `emuSeconds` is the
 	// MAME-machine time at which the byte's stop bit was sampled, not host wall time.
@@ -79,6 +85,13 @@ public:
 	// limitation instead of presenting an apparently-live silent synth.
 	bool ownsMachineSlot() const;
 	InstanceStatus instanceStatus() const;
+
+	// Process-wide multi-core DSP preference. Any thread may change it at any time;
+	// a running machine applies it between emulation slices. Audio and MIDI output
+	// are identical either way; only CPU placement and headroom change.
+	static void setMultiCoreDsp(bool enabled);
+	static bool multiCoreDsp();
+	static MultiCoreDspStatus multiCoreDspStatus();
 
 	// Pull up to `frames` stereo frames as planar float in [-1, 1]. Returns the
 	// number of frames actually delivered (< frames on underrun). Non-blocking and
