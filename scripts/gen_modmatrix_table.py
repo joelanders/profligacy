@@ -114,7 +114,6 @@ def main():
             "sec":   r["section"],
             "sub":   r["subsection"],
             "kind":  kind,
-            "ampOrder": r["section"] == "Amplitude" and "Amplitude Mod.EG" in n,
             "sel": {"p": int(r["param"]), "off": first_off(r["verified_offsets"])},
             "amt": ({"p": int(amt["param"]), "off": first_off(amt["verified_offsets"]),
                      "min": amt_lo, "max": amt_hi} if amt else None),

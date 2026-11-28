@@ -25,7 +25,21 @@ zero probe errors. The durable research receipts have SHA-256 digests
 `9338912bf77b79e0cbca9ce038958cd3b3adb103d7a678422f0a953479d8c5d8`.
 
 Trailing empty TSV fields were normalized to avoid trailing whitespace; the
-normalized source SHA-256 is
+normalized source SHA-256 was
 `69522429fea7dd7fe06568052bae106aa3d9f85570136bf22e2a51ca0697af62`.
+
+Corrections since that snapshot (19 rows), checked against the firmware's
+parameter descriptor table and the 128 factory programs:
+
+- PE Nob2 Value (636) is at offset 526 (between PE Nob1 at 525 and Nob3 at
+  527, and in its own sweep list). The snapshot had 172, the first OSC1 type
+  byte; the sweep's other offsets for it are now side effects.
+- The 18 EG / LFO select rows (enums `EG1|...|A.EG`, `LFO1|...|LFO4`) are
+  stored and transmitted as mod-source numbers (EG1-4, P.EG, A.EG = 1-6;
+  LFO1-4 = 7-10), not as 0-based enum indices; noted on each row. The editor
+  converts at the boundary.
+
+The corrected source SHA-256 is
+`da35c83a869c5f870378b5b16518e2700c9fa6f5e428136c2843af08edda89ed`.
 Run `python3 scripts/gen_deep_editor_manifest.py` from the repository root to
 regenerate the JavaScript asset.

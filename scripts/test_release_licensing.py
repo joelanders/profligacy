@@ -45,7 +45,7 @@ class ReleaseLicensingTests(unittest.TestCase):
     def test_deep_editor_catalogue_has_reproducible_public_source(self) -> None:
         source = ROOT / "src/editor/deep_editor_manifest.tsv"
         self.assertEqual(
-            "69522429fea7dd7fe06568052bae106aa3d9f85570136bf22e2a51ca0697af62",
+            "da35c83a869c5f870378b5b16518e2700c9fa6f5e428136c2843af08edda89ed",
             hashlib.sha256(source.read_bytes()).hexdigest(),
         )
         provenance = (ROOT / "src/editor/DATA_PROVENANCE.md").read_text(encoding="utf-8")
